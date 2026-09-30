@@ -1,0 +1,51 @@
+{
+  "manifest_version": 3,
+  "name": "ÖRNEK Portal Extension",
+  "version": "1.6.0",
+  "description": "WhatsApp Web toplu mesaj ve IT destek talep oluşturma eklentisi",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://web.whatsapp.com/*",
+    "https://portal.ornekfirma.com/*"
+  ],
+  "externally_connectable": {
+    "matches": [
+      "https://portal.ornekfirma.com/*",
+      "http://localhost/*"
+    ]
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://web.whatsapp.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.svg",
+      "48": "icons/icon48.svg",
+      "128": "icons/icon128.svg"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.svg",
+    "48": "icons/icon48.svg",
+    "128": "icons/icon128.svg"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["content.js"],
+      "matches": ["https://web.whatsapp.com/*"]
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+<?php error_reporting(E_ALL); ini_set("display_errors", 1); session_start(); $user = ["departman_id" => 1, "kullanici_id" => 1, "name" => "Admin", "email" => "admin@ornekfirma.com"]; require "admin/db.php"; require "admin/includes/header.php"; echo "OK"; ?>

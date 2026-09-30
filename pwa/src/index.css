@@ -1,0 +1,291 @@
+:root {
+  --birincil: #0d6efd;
+  --birincil-koyu: #0b5ed7;
+  --ok: #198754;
+  --hata: #dc3545;
+  --metin: #212529;
+  --gri: #6c757d;
+  --acik: #f5f6f8;
+  --cizgi: #dee2e6;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  background: var(--acik);
+  color: var(--metin);
+}
+
+/* ---- Butonlar ---- */
+.btn {
+  border: none;
+  border-radius: 10px;
+  padding: 14px 18px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  width: 100%;
+}
+.btn-birincil {
+  background: var(--birincil);
+  color: #fff;
+}
+.btn-birincil:active {
+  background: var(--birincil-koyu);
+}
+.btn-birincil:disabled {
+  opacity: 0.6;
+}
+.btn-ikincil {
+  background: #fff;
+  color: var(--metin);
+  border: 1px solid var(--cizgi);
+}
+.btn-buyuk {
+  padding: 22px;
+  font-size: 20px;
+}
+.btn-metin {
+  background: none;
+  border: none;
+  color: var(--gri);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+/* ---- Uyari / bildirim ---- */
+.uyari {
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 14px;
+  margin: 12px 0;
+}
+.uyari-hata {
+  background: #f8d7da;
+  color: #842029;
+}
+.uyari-ok {
+  background: #d1e7dd;
+  color: #0f5132;
+}
+
+/* ---- Giris ---- */
+.giris-sayfa {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.kart {
+  background: #fff;
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
+}
+.giris-kart {
+  width: 100%;
+  max-width: 380px;
+}
+.giris-baslik {
+  margin: 0 0 20px;
+  text-align: center;
+}
+.alan {
+  display: block;
+  margin-bottom: 16px;
+}
+.alan span {
+  display: block;
+  font-size: 13px;
+  color: var(--gri);
+  margin-bottom: 6px;
+}
+.alan input {
+  width: 100%;
+  padding: 12px 14px;
+  font-size: 16px;
+  border: 1px solid var(--cizgi);
+  border-radius: 10px;
+  outline: none;
+}
+.alan input:focus {
+  border-color: var(--birincil);
+}
+
+/* ---- Anasayfa ---- */
+.anasayfa {
+  max-width: 480px;
+  margin: 0 auto;
+  padding: 16px;
+}
+.ust-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0 16px;
+}
+.ust-ad {
+  font-weight: 600;
+}
+.kayit-liste {
+  margin-top: 24px;
+}
+.kayit-liste h2 {
+  font-size: 16px;
+  color: var(--gri);
+}
+.kayit-satir {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #fff;
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+}
+.etiket {
+  font-size: 12px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 20px;
+  color: #fff;
+}
+.etiket-giris {
+  background: var(--ok);
+}
+.etiket-cikis {
+  background: var(--gri);
+}
+.etiket-mola-giris {
+  background: #fd7e14;
+}
+.etiket-mola-cikis {
+  background: #0dcaf0;
+}
+.kayit-bilgi {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.kayit-zaman {
+  font-size: 14px;
+  color: var(--metin);
+}
+.kayit-lokasyon {
+  font-size: 12px;
+  color: var(--gri);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.btn-cikis-yap {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--birincil);
+  border: none;
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+.btn-cikis-yap:disabled {
+  opacity: 0.6;
+}
+.bos {
+  color: var(--gri);
+  font-size: 14px;
+}
+
+/* ---- Kurulum Kapisi ---- */
+.kurulum-kapi {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: linear-gradient(160deg, var(--birincil), var(--birincil-koyu));
+}
+.kurulum-kart {
+  background: #fff;
+  border-radius: 20px;
+  padding: 32px 24px;
+  max-width: 400px;
+  width: 100%;
+  text-align: center;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+}
+.kurulum-ikon {
+  font-size: 56px;
+  line-height: 1;
+  margin-bottom: 12px;
+}
+.kurulum-kart h1 {
+  margin: 0 0 8px;
+  font-size: 22px;
+}
+.kurulum-aciklama {
+  color: var(--gri);
+  font-size: 15px;
+  margin: 0 0 20px;
+}
+.kurulum-adimlar {
+  text-align: left;
+  margin: 0 0 20px;
+  padding-left: 20px;
+  color: var(--metin);
+  font-size: 15px;
+  line-height: 1.9;
+}
+.ios-ikon {
+  display: inline-block;
+  border: 1px solid var(--cizgi);
+  border-radius: 6px;
+  padding: 0 6px;
+}
+.kurulum-atla {
+  display: block;
+  margin: 16px auto 0;
+  text-decoration: underline;
+}
+
+/* ---- QR Tarayici ---- */
+.tarayici {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.tarayici-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.tarayici-cerceve {
+  position: absolute;
+  width: 240px;
+  height: 240px;
+  border: 3px solid rgba(255, 255, 255, 0.9);
+  border-radius: 16px;
+  box-shadow: 0 0 0 4000px rgba(0, 0, 0, 0.4);
+}
+.tarayici-kapat {
+  position: absolute;
+  bottom: 32px;
+  width: auto;
+  padding: 12px 32px;
+}

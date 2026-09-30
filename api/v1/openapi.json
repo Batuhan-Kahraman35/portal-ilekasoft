@@ -1,0 +1,433 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Örnek Portal — Banka Hareketleri API",
+    "version": "1.0.0",
+    "description": "Banka hesapları ve hesap hareketlerine salt okunur erişim sağlar.\n\n**Yetkilendirme:** Her istekte `Authorization: Bearer <token>` başlığı zorunludur.\n\n**Kapsam:** Her token'ın firma, banka ve hareket tipi erişimi ayrı ayrı tanımlanır. Kapsam dışındaki kayıtlar sonuçlarda hiç görünmez — ilgili filtre parametresi elle gönderilse bile. Token'ınızın gördüğü firma ve bankaları `/firmalar` ve `/bankalar` uçlarından öğrenebilirsiniz.\n\n**Limit:** Varsayılan saatlik 1000 istek. Kalan hak `X-RateLimit-Remaining` başlığında döner.",
+    "contact": {
+      "name": "Örnek Soft",
+      "url": "https://portal.ornekfirma.com"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://portal.ornekfirma.com/api/v1",
+      "description": "Canlı"
+    }
+  ],
+  "security": [{ "bearerAuth": [] }, { "apiKeyAuth": [] }],
+  "tags": [
+    { "name": "Hareketler", "description": "Banka hesap hareketleri" },
+    { "name": "Hesaplar", "description": "Banka hesapları ve bakiyeler" },
+    { "name": "Tanımlar", "description": "Erişilebilir firma ve banka listeleri" }
+  ],
+  "paths": {
+    "/hareketler": {
+      "get": {
+        "tags": ["Hareketler"],
+        "summary": "Hareket listesi",
+        "description": "Hareketleri cursor tabanlı sayfalama ile döner.\n\n**Artımlı çekim:** Son aldığınız kaydın `id` değerini `sonraki_id` olarak gönderin; yalnızca ondan sonraki kayıtlar artan sırada döner. Periyodik senkronizasyon için önerilen yöntem budur.\n\n**Geriye gezinme:** `sonraki_id` verilmezse kayıtlar en yeniden eskiye (id azalan) döner; sonraki sayfa için yanıttaki `meta.sonraki_cursor.onceki_id` değerini gönderin.",
+        "parameters": [
+          { "$ref": "#/components/parameters/FirmaId" },
+          { "$ref": "#/components/parameters/BankaId" },
+          {
+            "name": "hesap_id",
+            "in": "query",
+            "description": "Banka hesabı kimliği",
+            "schema": { "type": "integer" }
+          },
+          {
+            "name": "iban",
+            "in": "query",
+            "description": "IBAN (tam eşleşme)",
+            "schema": { "type": "string" },
+            "example": "TR000006400000100000000002"
+          },
+          {
+            "name": "baslangic_tarih",
+            "in": "query",
+            "description": "İşlem tarihi başlangıcı (dahil)",
+            "schema": { "type": "string", "format": "date" },
+            "example": "2026-01-01"
+          },
+          {
+            "name": "bitis_tarih",
+            "in": "query",
+            "description": "İşlem tarihi bitişi (dahil)",
+            "schema": { "type": "string", "format": "date" },
+            "example": "2026-08-18"
+          },
+          {
+            "name": "tip",
+            "in": "query",
+            "description": "A = alacak (para girişi), B = borç (para çıkışı).\n\nToken'ınız tek bir hareket tipiyle sınırlandırılmışsa bu parametre kapsamınızı genişletemez — sınırınız dışındaki tip istenirse sonuç boş döner.",
+            "schema": { "type": "string", "enum": ["A", "B"] }
+          },
+          {
+            "name": "para_birimi",
+            "in": "query",
+            "schema": { "type": "string" },
+            "example": "TRY"
+          },
+          {
+            "name": "min_tutar",
+            "in": "query",
+            "schema": { "type": "number" }
+          },
+          {
+            "name": "max_tutar",
+            "in": "query",
+            "schema": { "type": "number" }
+          },
+          {
+            "name": "arama",
+            "in": "query",
+            "description": "Açıklama, karşı taraf adı ve referans numarasında arar",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "sonraki_id",
+            "in": "query",
+            "description": "Bu kimlikten büyük kayıtlar, artan sırada (artımlı senkronizasyon)",
+            "schema": { "type": "integer" }
+          },
+          {
+            "name": "onceki_id",
+            "in": "query",
+            "description": "Bu kimlikten küçük kayıtlar, azalan sırada (geriye gezinme)",
+            "schema": { "type": "integer" }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Sayfa başına kayıt (1–500)",
+            "schema": { "type": "integer", "default": 100, "maximum": 500, "minimum": 1 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Başarılı",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "const": true },
+                    "data": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/Hareket" }
+                    },
+                    "meta": { "$ref": "#/components/schemas/SayfalamaMeta" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/GecersizIstek" },
+          "401": { "$ref": "#/components/responses/Yetkisiz" },
+          "429": { "$ref": "#/components/responses/LimitAsildi" }
+        }
+      }
+    },
+    "/hareketler/{id}": {
+      "get": {
+        "tags": ["Hareketler"],
+        "summary": "Tek hareket",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Başarılı",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "const": true },
+                    "data": { "$ref": "#/components/schemas/Hareket" }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Yetkisiz" },
+          "404": { "$ref": "#/components/responses/Bulunamadi" }
+        }
+      }
+    },
+    "/hareketler/{id}/dekont": {
+      "get": {
+        "tags": ["Hareketler"],
+        "summary": "Dekont dosyası",
+        "description": "Harekete ait dekontu indirir. Bu uç nokta yalnızca dekont erişimi açık istemcilere yanıt verir.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Dosya içeriği",
+            "content": {
+              "application/pdf": { "schema": { "type": "string", "format": "binary" } },
+              "image/jpeg": { "schema": { "type": "string", "format": "binary" } },
+              "image/png": { "schema": { "type": "string", "format": "binary" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Yetkisiz" },
+          "403": {
+            "description": "Dekont erişim yetkisi yok",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Hata" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Bulunamadi" }
+        }
+      }
+    },
+    "/hesaplar": {
+      "get": {
+        "tags": ["Hesaplar"],
+        "summary": "Banka hesapları ve bakiyeler",
+        "parameters": [
+          { "$ref": "#/components/parameters/FirmaId" },
+          { "$ref": "#/components/parameters/BankaId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Başarılı",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "const": true },
+                    "data": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/Hesap" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Yetkisiz" }
+        }
+      }
+    },
+    "/firmalar": {
+      "get": {
+        "tags": ["Tanımlar"],
+        "summary": "Erişilebilir firmalar",
+        "description": "Token'ınızın eriştiği firmaları döner. Filtre parametrelerinde kullanılacak `id` değerleri buradan alınır.",
+        "responses": {
+          "200": {
+            "description": "Başarılı",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "const": true },
+                    "data": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/Tanim" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Yetkisiz" }
+        }
+      }
+    },
+    "/bankalar": {
+      "get": {
+        "tags": ["Tanımlar"],
+        "summary": "Erişilebilir bankalar",
+        "responses": {
+          "200": {
+            "description": "Başarılı",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "const": true },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "allOf": [
+                          { "$ref": "#/components/schemas/Tanim" },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "logo_url": { "type": ["string", "null"] }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Yetkisiz" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Örnek Portal yönetim panelinden üretilen API token'ı."
+      },
+      "apiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Api-Key",
+        "description": "Alternatif yöntem. `Authorization` başlığının aracı sunucular tarafından düşürüldüğü ortamlarda aynı token bu başlıkla gönderilebilir."
+      }
+    },
+    "parameters": {
+      "FirmaId": {
+        "name": "firma_id",
+        "in": "query",
+        "description": "Firma kimliği. Yetkiniz dışındaki bir firma verilirse sonuç boş döner.",
+        "schema": { "type": "integer" }
+      },
+      "BankaId": {
+        "name": "banka_id",
+        "in": "query",
+        "description": "Banka kimliği. Yetkiniz dışındaki bir banka verilirse sonuç boş döner.",
+        "schema": { "type": "integer" }
+      }
+    },
+    "schemas": {
+      "Hareket": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "description": "Hareket kimliği; sayfalama cursor'ı olarak kullanılır" },
+          "hesap_id": { "type": "integer" },
+          "iban": { "type": ["string", "null"] },
+          "karsi_taraf": { "type": ["string", "null"], "description": "İşlemin karşı tarafı" },
+          "islem_tarihi": { "type": ["string", "null"], "format": "date-time", "description": "Bankadaki işlem tarihi (Europe/Istanbul)" },
+          "kayit_tarihi": { "type": ["string", "null"], "format": "date-time", "description": "Portala kaydedildiği tarih" },
+          "tutar": { "type": ["number", "null"] },
+          "tip": { "type": ["string", "null"], "enum": ["A", "B", null], "description": "A = alacak, B = borç" },
+          "para_birimi": { "type": ["string", "null"] },
+          "aciklama": { "type": ["string", "null"] },
+          "kalan_bakiye": { "type": ["number", "null"], "description": "İşlem sonrası hesap bakiyesi" },
+          "referans_no": { "type": ["string", "null"], "description": "Bankanın işlem referansı" },
+          "vkn_tckn": { "type": ["string", "null"], "description": "Karşı tarafın vergi kimlik numarası (10 hane) veya T.C. kimlik numarası (11 hane). Cari eşleştirme için kullanılır. Banka bu bilgiyi her harekette göndermez; gönderilmediğinde `null` döner." },
+          "masraf_mi": { "type": "boolean" },
+          "dekont_var": { "type": "boolean" },
+          "hesap": {
+            "type": "object",
+            "properties": {
+              "no": { "type": ["string", "null"] },
+              "aciklama": { "type": ["string", "null"] }
+            }
+          },
+          "firma": { "$ref": "#/components/schemas/Tanim" },
+          "banka": { "$ref": "#/components/schemas/Tanim" }
+        }
+      },
+      "Hesap": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "hesap_no": { "type": ["string", "null"] },
+          "iban": { "type": ["string", "null"] },
+          "aciklama": { "type": ["string", "null"] },
+          "sube_adi": { "type": ["string", "null"] },
+          "bakiye": { "type": ["number", "null"] },
+          "kullanilabilir_bakiye": { "type": ["number", "null"] },
+          "bloke": { "type": ["number", "null"] },
+          "son_senkron": { "type": ["string", "null"], "format": "date-time" },
+          "firma": { "$ref": "#/components/schemas/Tanim" },
+          "banka": { "$ref": "#/components/schemas/Tanim" }
+        }
+      },
+      "Tanim": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "ad": { "type": ["string", "null"] }
+        }
+      },
+      "SayfalamaMeta": {
+        "type": "object",
+        "properties": {
+          "limit": { "type": "integer" },
+          "donen_kayit": { "type": "integer" },
+          "devam_var": { "type": "boolean", "description": "true ise sonraki sayfa mevcuttur" },
+          "siralama": { "type": "string", "enum": ["id_artan", "id_azalan"] },
+          "sonraki_cursor": {
+            "type": ["object", "null"],
+            "description": "Sonraki sayfa için doğrudan sorgu parametresi olarak gönderilir",
+            "properties": {
+              "sonraki_id": { "type": "integer" },
+              "onceki_id": { "type": "integer" }
+            }
+          }
+        }
+      },
+      "Hata": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "const": false },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "integer" },
+              "message": { "type": "string" },
+              "detail": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "GecersizIstek": {
+        "description": "Parametre hatalı",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Hata" } }
+        }
+      },
+      "Yetkisiz": {
+        "description": "Token eksik, geçersiz veya süresi dolmuş",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Hata" } }
+        }
+      },
+      "Bulunamadi": {
+        "description": "Kayıt bulunamadı veya erişim yetkisi yok",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Hata" } }
+        }
+      },
+      "LimitAsildi": {
+        "description": "Saatlik istek limiti aşıldı",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Hata" } }
+        }
+      }
+    }
+  }
+}

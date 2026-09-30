@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ÖRNEK Portal Extension</title>
+  <style>
+    * { box-sizing: border-box; }
+    
+    body {
+      width: 400px;
+      padding: 0;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      margin: 0;
+      background: #f5f5f5;
+    }
+    
+    .header {
+      text-align: center;
+      padding: 15px;
+      background: linear-gradient(135deg, #075E54 0%, #128C7E 100%);
+      color: white;
+    }
+    
+    .header h2 {
+      margin: 0;
+      font-size: 16px;
+    }
+    
+    .header p {
+      margin: 5px 0 0 0;
+      font-size: 11px;
+      opacity: 0.9;
+    }
+    
+    /* TABS */
+    .tabs {
+      display: flex;
+      background: #fff;
+      border-bottom: 2px solid #e0e0e0;
+    }
+    
+    .tab-btn {
+      flex: 1;
+      padding: 12px;
+      border: none;
+      background: transparent;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      color: #666;
+      transition: all 0.2s;
+    }
+    
+    .tab-btn:hover {
+      background: #f0f0f0;
+    }
+    
+    .tab-btn.active {
+      color: #075E54;
+      border-bottom: 3px solid #075E54;
+      margin-bottom: -2px;
+    }
+    
+    .tab-content {
+      display: none;
+      padding: 15px;
+      background: #fff;
+      min-height: 350px;
+    }
+    
+    .tab-content.active {
+      display: block;
+    }
+    
+    /* WHATSAPP TAB */
+    .status {
+      background: #f8f9fa;
+      padding: 12px;
+      border-radius: 8px;
+      margin-bottom: 12px;
+      border: 1px solid #e9ecef;
+    }
+    
+    .status-item {
+      display: flex;
+      justify-content: space-between;
+      margin: 4px 0;
+      font-size: 13px;
+    }
+    
+    .status-label { color: #666; }
+    .status-value { font-weight: bold; color: #075E54; }
+    
+    .progress-bar {
+      width: 100%;
+      height: 18px;
+      background: #e0e0e0;
+      border-radius: 9px;
+      overflow: hidden;
+      margin: 8px 0;
+    }
+    
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #25D366 0%, #128C7E 100%);
+      transition: width 0.3s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-size: 11px;
+      font-weight: bold;
+    }
+    
+    .buttons {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    
+    button {
+      flex: 1;
+      padding: 10px;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: bold;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+    }
+    
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none !important;
+    }
+    
+    .btn-start { background: #25D366; color: white; }
+    .btn-stop { background: #dc3545; color: white; }
+    .btn-portal { background: #007bff; color: white; }
+    .btn-primary { background: #0d6efd; color: white; }
+    .btn-success { background: #198754; color: white; }
+    .btn-warning { background: #ffc107; color: #212529; }
+    .btn-secondary { background: #6c757d; color: white; }
+    
+    /* IT TALEP TAB */
+    .form-group {
+      margin-bottom: 12px;
+    }
+    
+    .form-group label {
+      display: block;
+      font-size: 12px;
+      font-weight: 500;
+      color: #333;
+      margin-bottom: 4px;
+    }
+    
+    .form-group label .required {
+      color: #dc3545;
+    }
+    
+    .form-control {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #ced4da;
+      border-radius: 4px;
+      font-size: 13px;
+      transition: border-color 0.2s;
+    }
+    
+    .form-control:focus {
+      outline: none;
+      border-color: #0d6efd;
+      box-shadow: 0 0 0 2px rgba(13, 110, 253, 0.15);
+    }
+    
+    textarea.form-control {
+      resize: vertical;
+      min-height: 80px;
+    }
+    
+    select.form-control {
+      cursor: pointer;
+    }
+    
+    .row {
+      display: flex;
+      gap: 10px;
+    }
+    
+    .row .form-group {
+      flex: 1;
+    }
+    
+    .chat-info {
+      background: #e8f5e9;
+      border: 1px solid #a5d6a7;
+      padding: 10px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+    }
+    
+    .chat-info-title {
+      font-weight: bold;
+      color: #2e7d32;
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+    
+    .chat-info-item {
+      font-size: 12px;
+      color: #33691e;
+      margin: 3px 0;
+    }
+    
+    .chat-info-item strong {
+      display: inline-block;
+      width: 50px;
+    }
+    
+    .message-preview {
+      background: #fff3e0;
+      border: 1px solid #ffcc80;
+      padding: 10px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    
+    .message-preview-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    
+    .message-preview-title {
+      font-weight: bold;
+      color: #e65100;
+      font-size: 12px;
+    }
+    
+    .message-select-actions {
+      display: flex;
+      gap: 6px;
+    }
+    
+    .message-select-actions button {
+      padding: 3px 8px;
+      font-size: 10px;
+      border: 1px solid #e65100;
+      background: white;
+      color: #e65100;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    
+    .message-select-actions button:hover {
+      background: #e65100;
+      color: white;
+    }
+    
+    .message-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    
+    .message-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 6px;
+      background: white;
+      border-radius: 4px;
+      border: 1px solid #ffe0b2;
+    }
+    
+    .message-item.selected {
+      background: #fff8e1;
+      border-color: #e65100;
+    }
+    
+    .message-item input[type="checkbox"] {
+      margin-top: 2px;
+      cursor: pointer;
+      accent-color: #e65100;
+    }
+    
+    .message-item-content {
+      flex: 1;
+      font-size: 11px;
+      color: #333;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    
+    .message-item-meta {
+      font-size: 10px;
+      color: #666;
+      margin-bottom: 2px;
+    }
+    
+    .message-preview-content {
+      font-size: 11px;
+      color: #333;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    
+    .no-chat {
+      background: #ffebee;
+      border: 1px solid #ef9a9a;
+      padding: 15px;
+      border-radius: 6px;
+      text-align: center;
+      color: #c62828;
+      font-size: 13px;
+    }
+    
+    .api-settings {
+      background: #f5f5f5;
+      border: 1px solid #e0e0e0;
+      padding: 10px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+    }
+    
+    .api-settings-title {
+      font-weight: bold;
+      color: #333;
+      font-size: 12px;
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    
+    .api-status {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
+    
+    .api-status.connected {
+      background: #c8e6c9;
+      color: #2e7d32;
+    }
+    
+    .api-status.disconnected {
+      background: #ffcdd2;
+      color: #c62828;
+    }
+    
+    .info {
+      background: #fff3cd;
+      border: 1px solid #ffc107;
+      padding: 10px;
+      border-radius: 6px;
+      margin-top: 12px;
+      font-size: 11px;
+      color: #856404;
+    }
+    
+    .info strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+    
+    .success-message {
+      background: #d4edda;
+      border: 1px solid #c3e6cb;
+      padding: 12px;
+      border-radius: 6px;
+      color: #155724;
+      margin-bottom: 12px;
+      font-size: 13px;
+    }
+    
+    .error-message {
+      background: #f8d7da;
+      border: 1px solid #f5c6cb;
+      padding: 12px;
+      border-radius: 6px;
+      color: #721c24;
+      margin-bottom: 12px;
+      font-size: 13px;
+    }
+    
+    .loading {
+      text-align: center;
+      padding: 20px;
+      color: #666;
+    }
+    
+    .loading-spinner {
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #075E54;
+      border-radius: 50%;
+      width: 30px;
+      height: 30px;
+      animation: spin 1s linear infinite;
+      margin: 0 auto 10px;
+    }
+    
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h2>🚀 ÖRNEK Portal Extension</h2>
+    <p>WhatsApp Mesaj & IT Talep Yönetimi</p>
+  </div>
+  
+  <!-- TABS -->
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="whatsapp">📱 WhatsApp Mesaj</button>
+    <button class="tab-btn" data-tab="it-talep">🎫 IT Talep</button>
+  </div>
+  
+  <!-- WHATSAPP TAB -->
+  <div class="tab-content active" id="tab-whatsapp">
+    <div class="status">
+      <div class="status-item">
+        <span class="status-label">Durum:</span>
+        <span class="status-value" id="status">Hazır</span>
+      </div>
+      <div class="status-item">
+        <span class="status-label">Kişi Sayısı:</span>
+        <span class="status-value" id="totalContacts">0</span>
+      </div>
+      <div class="status-item">
+        <span class="status-label">Gönderilen:</span>
+        <span class="status-value" id="sentCount">0</span>
+      </div>
+      
+      <div class="progress-bar">
+        <div class="progress-fill" id="progressBar" style="width: 0%">0%</div>
+      </div>
+    </div>
+    
+    <div class="buttons">
+      <button class="btn-start" id="startBtn">▶️ Başlat</button>
+      <button class="btn-stop" id="stopBtn">⏸️ Durdur</button>
+    </div>
+    
+    <div class="buttons">
+      <button class="btn-portal" id="portalBtn">🌐 Portala Git</button>
+    </div>
+    
+    <div class="info">
+      <strong>📌 Nasıl Kullanılır?</strong>
+      1. Portal sayfasından kişileri yükleyin<br>
+      2. WhatsApp Web'de giriş yapın<br>
+      3. "Başlat" butonuna tıklayın
+    </div>
+  </div>
+  
+  <!-- IT TALEP TAB -->
+  <div class="tab-content" id="tab-it-talep">
+    
+    <!-- API Ayarları -->
+    <div class="api-settings">
+      <div class="api-settings-title">
+        ⚙️ API Ayarları
+        <span class="api-status disconnected" id="apiStatus">Bağlı Değil</span>
+      </div>
+      <div class="form-group" style="margin-bottom: 0;">
+        <input type="password" class="form-control" id="apiKey" placeholder="API Key giriniz...">
+      </div>
+      <div class="buttons" style="margin-top: 8px;">
+        <button class="btn-secondary" id="saveApiKeyBtn">💾 Kaydet</button>
+        <button class="btn-primary" id="testApiBtn">🔗 Test Et</button>
+      </div>
+    </div>
+    
+    <!-- Sohbet Yükle Butonu (her zaman görünür) -->
+    <div class="buttons" style="margin-bottom: 12px;">
+      <button class="btn-warning" id="refreshChatBtn" style="flex: 1;">🔄 Sohbet Bilgilerini Al</button>
+    </div>
+    
+    <!-- Mesaj Yükleniyor -->
+    <div class="loading hidden" id="loadingChat">
+      <div class="loading-spinner"></div>
+      <span>Sohbet bilgileri alınıyor...</span>
+    </div>
+    
+    <!-- Sohbet Yok Uyarısı -->
+    <div class="no-chat hidden" id="noChat">
+      ❌ Aktif sohbet bulunamadı!<br>
+      <small>Bir kişiyle sohbet açın.</small>
+    </div>
+    
+    <!-- Önemli Uyarı (her zaman görünür) -->
+    <div class="info" style="background: #e3f2fd; border-color: #90caf9; color: #1565c0; margin-bottom: 12px;">
+      <strong>⚠️ Önemli:</strong>
+      WhatsApp Web'de sol taraftan bir kişiye tıklayıp <b>sohbeti açmalısınız</b>. 
+      Sohbet ekranı açıkken "Sohbet Bilgilerini Al" butonuna basın.
+    </div>
+    
+    <!-- Sohbet Bilgisi -->
+    <div class="chat-info hidden" id="chatInfo">
+      <div class="chat-info-title">💬 Aktif Sohbet</div>
+      <div class="chat-info-item"><strong>İsim:</strong> <span id="chatName">-</span></div>
+      <div class="chat-info-item"><strong>Telefon:</strong> <span id="chatPhone">-</span></div>
+    </div>
+    
+    <!-- Mesaj Önizleme -->
+    <div class="message-preview hidden" id="messagePreview">
+      <div class="message-preview-header">
+        <div class="message-preview-title">📝 Mesajlar (<span id="selectedCount">0</span>/<span id="messageCount">0</span> seçili)</div>
+        <div class="message-select-actions">
+          <button type="button" id="selectAllMessages">Tümünü Seç</button>
+          <button type="button" id="deselectAllMessages">Hiçbirini Seçme</button>
+        </div>
+      </div>
+      <div class="message-list" id="messageList"></div>
+    </div>
+    
+    <!-- IT Talep Formu -->
+    <div id="talepForm" class="hidden">
+      <div class="form-group">
+        <label>Talep Başlığı <span class="required">*</span></label>
+        <input type="text" class="form-control" id="talepBaslik" placeholder="Kısa açıklama yazın..." maxlength="255">
+      </div>
+      
+      <div class="row">
+        <div class="form-group">
+          <label>Kategori <span class="required">*</span></label>
+          <select class="form-control" id="talepKategori">
+            <option value="">Seçiniz...</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Aciliyet <span class="required">*</span></label>
+          <select class="form-control" id="talepAciliyet">
+            <option value="">Seçiniz...</option>
+          </select>
+        </div>
+      </div>
+      
+      <div class="form-group">
+        <label>Talep Kaynağı <span class="required">*</span></label>
+        <select class="form-control" id="talepKaynak">
+          <option value="">Seçiniz...</option>
+        </select>
+      </div>
+      
+      <div class="form-group">
+        <label>Talep Sahibi Adı <span class="required">*</span></label>
+        <input type="text" class="form-control" id="talepDisAd" placeholder="WhatsApp'tan otomatik alınır">
+      </div>
+      
+      <div class="row">
+        <div class="form-group">
+          <label>E-posta</label>
+          <input type="email" class="form-control" id="talepDisEmail" placeholder="Opsiyonel">
+        </div>
+        <div class="form-group">
+          <label>Telefon</label>
+          <input type="tel" class="form-control" id="talepDisTelefon" placeholder="Opsiyonel">
+        </div>
+      </div>
+      
+      <div class="form-group">
+        <label>Ek Açıklama</label>
+        <textarea class="form-control" id="talepEkAciklama" placeholder="Mesajlara ek not ekleyebilirsiniz..."></textarea>
+      </div>
+      
+      <div class="buttons">
+        <button class="btn-success" id="createTalepBtn" style="flex: 1;">✅ Talep Oluştur</button>
+      </div>
+    </div>
+    
+    <!-- Başarı/Hata Mesajları -->
+    <div class="success-message hidden" id="successMessage"></div>
+    <div class="error-message hidden" id="errorMessage"></div>
+    
+    <div class="info">
+      <strong>📌 IT Talep Nasıl Oluşturulur?</strong>
+      1. WhatsApp Web'de destek istenen kişiyle sohbeti açın<br>
+      2. "🔄 Sohbet Bilgilerini Al" butonuna tıklayın<br>
+      3. Formu doldurup "Talep Oluştur"a basın
+    </div>
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>

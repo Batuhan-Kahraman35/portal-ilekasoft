@@ -1,0 +1,3 @@
+node_modules/
+dist/
+# .env bilerek dahil: private repo tam yedektir (bkz. kök .gitignore)

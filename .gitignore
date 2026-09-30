@@ -1,0 +1,25 @@
+# Gerçek ayarlar (örnekleri: config/*.example.php)
+config/*
+!config/*.example.php
+.env*
+!.env.example
+
+# Çalışma zamanı dosyaları
+logs/
+**/logs/
+*.log
+uploads/
+admin/assets/uploads/
+temp/
+
+# Bağımlılıklar ve derleme çıktıları
+vendor/
+node_modules/
+dist/
+
+# IDE / işletim sistemi
+.vs/
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

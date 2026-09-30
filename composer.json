@@ -1,0 +1,19 @@
+{
+    "name": "ornekfirma/portal",
+    "description": "Örnek Soft Portal - Kurumsal Yönetim Sistemi",
+    "type": "project",
+    "require": {
+        "php": ">=7.4",
+        "phpmailer/phpmailer": "^6.9"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "admin/"
+        }
+    },
+    "config": {
+        "platform": {
+            "php": "7.4"
+        }
+    }
+}
