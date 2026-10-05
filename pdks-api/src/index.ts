@@ -4,6 +4,7 @@ import { config } from './config';
 import { authRouter } from './routes/auth.routes';
 import { attendanceRouter } from './routes/attendance.routes';
 import { ayarlarRouter } from './routes/ayarlar.routes';
+import { masaustuRouter } from './routes/masaustu.routes';
 
 const app = express();
 app.use(cors());
@@ -17,6 +18,7 @@ app.get('/api/health', (_req, res) => {
 app.use('/api', ayarlarRouter);
 app.use('/api/auth', authRouter);
 app.use('/api/attendance', attendanceRouter);
+app.use('/api/masaustu', masaustuRouter);
 
 app.listen(config.port, () => {
   console.log(`API calisiyor: http://localhost:${config.port}`);

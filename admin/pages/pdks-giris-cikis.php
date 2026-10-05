@@ -118,6 +118,7 @@ $listeSorgusu = function (array $filtre) use ($kapsamKosulu) {
                 g.kayit_id, g.kullanici_id, g.sube_id, g.tip,
                 CONVERT(VARCHAR(19), g.zaman, 120) as zaman,
                 g.enlem, g.boylam, g.qr_kod, g.cihaz_modeli, g.cihaz_id, g.ip_adresi,
+                CAST(g.otomatik AS INT) as otomatik,
                 k.kullanici_ad + ' ' + k.kullanici_soyad as personel_adi,
                 s.sube_adi
             FROM Personel_GirisCikis g
@@ -139,6 +140,11 @@ $listeSorgusu = function (array $filtre) use ($kapsamKosulu) {
         $sql .= " AND g.tip = ?";
         $params[] = $filtre['tip'];
     }
+    // Kayıt şekli: 1 = hareketsizlikten sistemin yazdığı, 0 = personelin yaptığı
+    if (in_array($filtre['otomatik'] ?? '', ['0', '1'], true)) {
+        $sql .= " AND g.otomatik = ?";
+        $params[] = (int)$filtre['otomatik'];
+    }
     if (!empty($filtre['start_date'])) {
         $sql .= " AND CONVERT(date, g.zaman) >= ?";
         $params[] = $filtre['start_date'];
@@ -155,7 +161,7 @@ $listeSorgusu = function (array $filtre) use ($kapsamKosulu) {
         $params[] = $arama;
         $params[] = $arama;
     }
-    $sql .= " ORDER BY g.zaman DESC";
+    $sql .= " ORDER BY g.zaman DESC, g.kayit_id DESC";
 
     return [$sql, $params];
 };
@@ -190,7 +196,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'excel
     echo '</head><body>';
     echo '<table border="1">';
     echo '<thead><tr style="background-color: #0d6efd; color: white; font-weight: bold;">';
-    foreach (['Kayıt No', 'Personel', 'Şube', 'Tip', 'Tarih', 'Saat', 'Cihaz Modeli', 'Cihaz ID', 'IP Adresi', 'Enlem', 'Boylam', 'QR Kod'] as $baslik) {
+    foreach (['Kayıt No', 'Personel', 'Şube', 'Tip', 'Otomatik', 'Tarih', 'Saat', 'Cihaz Modeli', 'Cihaz ID', 'IP Adresi', 'Enlem', 'Boylam', 'QR Kod'] as $baslik) {
         echo '<th>' . $baslik . '</th>';
     }
     echo '</tr></thead><tbody>';
@@ -205,6 +211,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'excel
         echo '<td>' . htmlspecialchars($k['personel_adi'] ?? ('ID: ' . ($k['kullanici_id'] ?? ''))) . '</td>';
         echo '<td>' . htmlspecialchars($k['sube_adi'] ?? '') . '</td>';
         echo '<td>' . htmlspecialchars($hareketTipleri[$k['tip']]['ad'] ?? ($k['tip'] ?? '')) . '</td>';
+        echo '<td>' . (!empty($k['otomatik']) ? 'Evet' : 'Hayır') . '</td>';
         echo '<td>' . $tarih . '</td>';
         echo '<td>' . $saat . '</td>';
         echo '<td>' . htmlspecialchars($k['cihaz_modeli'] ?? '') . '</td>';
@@ -237,11 +244,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $giris   = $db->fetchOne($statSql . " AND g.tip = 'giris'", $statParams)['c'] ?? 0;
                 $cikis   = $db->fetchOne($statSql . " AND g.tip = 'cikis'", $statParams)['c'] ?? 0;
                 $mola    = $db->fetchOne($statSql . " AND g.tip = 'mola_giris'", $statParams)['c'] ?? 0;
+                $otomatik = $db->fetchOne($statSql . " AND g.otomatik = 1", $statParams)['c'] ?? 0;
                 $bugunKayit = $db->fetchOne(
                     $statSql . " AND CONVERT(date, g.zaman) = ?",
                     array_merge($statParams, [$bugun])
                 )['c'] ?? 0;
-                echo json_encode(['success' => true, 'data' => compact('toplam', 'giris', 'cikis', 'mola', 'bugunKayit')]);
+                echo json_encode(['success' => true, 'data' => compact('toplam', 'giris', 'cikis', 'mola', 'otomatik', 'bugunKayit')]);
                 break;
 
             case 'list':
@@ -363,6 +371,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     </div>
                     <div class="col-12 col-sm-6 col-lg">
                         <div class="info-box">
+                            <span class="info-box-icon text-bg-dark shadow-sm"><i class="bi bi-robot"></i></span>
+                            <div class="info-box-content">
+                                <span class="info-box-text">Otomatik</span>
+                                <span class="info-box-number" id="stat-otomatik">0</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-12 col-sm-6 col-lg">
+                        <div class="info-box">
                             <span class="info-box-icon text-bg-info shadow-sm"><i class="bi bi-calendar-day"></i></span>
                             <div class="info-box-content">
                                 <span class="info-box-text">Bugün</span>
@@ -405,6 +422,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                         <?php foreach ($hareketTipleri as $kod => $bilgi): ?>
                                             <option value="<?= $kod ?>"><?= htmlspecialchars($bilgi['ad']) ?></option>
                                         <?php endforeach; ?>
+                                    </select>
+                                </div>
+                                <div class="col-md-2">
+                                    <label class="form-label">Kayıt Şekli</label>
+                                    <select class="form-select" id="filter_otomatik" name="otomatik">
+                                        <option value="">Tümü</option>
+                                        <option value="0">Personel</option>
+                                        <option value="1">Otomatik</option>
                                     </select>
                                 </div>
                                 <div class="col-md-2">
@@ -453,7 +478,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                         <th width="60">#</th>
                                         <th>Personel</th>
                                         <th>Şube</th>
-                                        <th width="80">Tip</th>
+                                        <th width="120">Tip</th>
                                         <th width="140">Zaman</th>
                                         <th>Cihaz</th>
                                         <th width="120">IP Adresi</th>
@@ -514,6 +539,13 @@ function tipRozet(tip, ekSinif = '') {
          + `<i class="bi ${bilgi.ikon} me-1"></i>${bilgi.ad}</span>`;
 }
 
+/** Hareketsizlikten sistemin yazdığı kayıtlar için ek rozet. */
+function otomatikRozet(otomatik, ekSinif = '') {
+    if (!Number(otomatik)) return '';
+    return ` <span class="badge text-bg-dark ${ekSinif}" title="Klavye/fare hareketsizliği nedeniyle masaüstü uygulaması tarafından son hareket saatiyle yazıldı">`
+         + '<i class="bi bi-robot me-1"></i>Otomatik</span>';
+}
+
 function loadStats() {
     $.post('', { action: 'stats' }, r => {
         if (r.success) {
@@ -521,6 +553,7 @@ function loadStats() {
             $('#stat-giris').text(r.data.giris);
             $('#stat-mola').text(r.data.mola);
             $('#stat-cikis').text(r.data.cikis);
+            $('#stat-otomatik').text(r.data.otomatik);
             $('#stat-bugun').text(r.data.bugunKayit);
         }
     });
@@ -537,7 +570,7 @@ function loadList() {
             return;
         }
         r.data.forEach(item => {
-            const tipBadge = tipRozet(item.tip);
+            const tipBadge = tipRozet(item.tip) + otomatikRozet(item.otomatik);
 
             const konumBtn = (item.enlem && item.boylam)
                 ? `<a href="https://maps.google.com/?q=${item.enlem},${item.boylam}" target="_blank" class="btn btn-sm btn-outline-info map-link" title="Haritada göster"><i class="bi bi-geo-alt"></i></a>`
@@ -572,7 +605,7 @@ function showDetay(id) {
             return;
         }
         const d = r.data;
-        const tipBadge = tipRozet(d.tip, 'fs-6');
+        const tipBadge = tipRozet(d.tip, 'fs-6') + otomatikRozet(d.otomatik, 'fs-6');
 
         const konumHtml = (d.enlem && d.boylam)
             ? `<a href="https://maps.google.com/?q=${d.enlem},${d.boylam}" target="_blank" class="btn btn-sm btn-outline-info">
@@ -641,11 +674,13 @@ $('#filterForm').on('submit', function(e) {
         kullanici_id: $('#filter_kullanici_id').val(),
         sube_id: $('#filter_sube_id').val(),
         tip: $('#filter_tip').val(),
+        otomatik: $('#filter_otomatik').val(),
         start_date: $('#filter_start_date').val(),
         end_date: $('#filter_end_date').val(),
         search: $('#filter_search').val()
     };
-    Object.keys(currentFilters).forEach(k => { if (!currentFilters[k]) delete currentFilters[k]; });
+    // "0" (Personel) geçerli bir filtre değeridir, boş sayılmaz.
+    Object.keys(currentFilters).forEach(k => { if (!currentFilters[k] && currentFilters[k] !== '0') delete currentFilters[k]; });
     loadList();
 });
 
@@ -655,7 +690,7 @@ $('#excelIndir').on('click', function() {
     form.append($('<input>', { type: 'hidden', name: 'action', value: 'excel_indir' }));
 
     Object.keys(currentFilters).forEach(key => {
-        if (currentFilters[key]) {
+        if (currentFilters[key] || currentFilters[key] === '0') {
             form.append($('<input>', { type: 'hidden', name: key, value: currentFilters[key] }));
         }
     });
@@ -669,13 +704,13 @@ $('#excelIndir').on('click', function() {
 
 $('#clearFilters').on('click', () => {
     $('#filterForm')[0].reset();
-    $('#filter_kullanici_id, #filter_sube_id, #filter_tip').val('').trigger('change.select2');
+    $('#filter_kullanici_id, #filter_sube_id, #filter_tip, #filter_otomatik').val('').trigger('change.select2');
     currentFilters = {};
     loadList();
 });
 
 $(document).ready(() => {
-    $('#filter_kullanici_id, #filter_sube_id, #filter_tip').select2({
+    $('#filter_kullanici_id, #filter_sube_id, #filter_tip, #filter_otomatik').select2({
         theme: 'bootstrap-5', placeholder: 'Tümü', allowClear: true,
         language: { noResults: () => 'Sonuç bulunamadı', searching: () => 'Aranıyor...' }
     });

@@ -182,7 +182,7 @@ attendanceRouter.post('/scan', async (req: AuthRequest, res) => {
       .query(`SELECT TOP 1 tip FROM dbo.Personel_GirisCikis
               WHERE kullanici_id = @kullaniciId
                 AND CAST(zaman AS DATE) = CAST(SYSDATETIME() AS DATE)
-              ORDER BY zaman DESC`);
+              ORDER BY zaman DESC, kayit_id DESC`);
     const sonTip: string | undefined = son.recordset[0]?.tip;
 
     const karar = tipBelirle(qrTuru, sonTip);
@@ -266,7 +266,7 @@ attendanceRouter.post('/cikis', async (req: AuthRequest, res) => {
       .query(`SELECT TOP 1 tip, sube_id, qr_kod FROM dbo.Personel_GirisCikis
               WHERE kullanici_id = @kullaniciId
                 AND CAST(zaman AS DATE) = CAST(SYSDATETIME() AS DATE)
-              ORDER BY zaman DESC`);
+              ORDER BY zaman DESC, kayit_id DESC`);
     const sonKayit = son.recordset[0];
     const karar = tipBelirle('mesai', sonKayit?.tip);
     if ('hata' in karar || karar.tip !== 'cikis') {

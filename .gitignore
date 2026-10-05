@@ -1,25 +1,77 @@
-# Gerçek ayarlar (örnekleri: config/*.example.php)
-config/*
-!config/*.example.php
-.env*
-!.env.example
+# ============================================================
+# PRIVATE REPO (OrnekHoldingYazilim) — TAM YEDEK
+# Şifreler, config dosyaları, banka belgeleri ve sürüm geçmişi
+# BİLEREK repoya dahildir. Burada yalnız yeniden üretilebilen,
+# çok büyük veya ayrı yedeklenen dosyalar dışarıda bırakılır.
+#
+# Public repo (Batuhan-Kahraman35) bu listeyi KULLANMAZ;
+# ona giden kopya .publicignore + içerik taramasıyla hazırlanır.
+# ============================================================
 
-# Çalışma zamanı dosyaları
+# Veritabanı yedekleri (çok büyük; ayrı DB yedeğiyle alınır)
+*.bak
+*.mdf
+*.ldf
+
+# Arşivler (eski site yedekleri; 100 MB GitHub sınırını aşıyor, Plesk yedeğinde kalır)
+*.zip
+*.rar
+*.7z
+
+# Derlenmiş .NET çıktıları (kaynaktan yeniden üretilir; 110 MB'lık .so dosyaları var)
+admin/Banka Bilgileri/**/bin/
+admin/Banka Bilgileri/**/obj/
+admin/Banka Bilgileri/**/runtimes/
+*.so
+*.dylib
+*.dep
+
+# Log dosyaları (admin/cron/logs tek başına 820 MB; yedek değeri yok, her gün büyür)
 logs/
 **/logs/
 *.log
-uploads/
-admin/assets/uploads/
-temp/
 
-# Bağımlılıklar ve derleme çıktıları
-vendor/
+# Kullanıcı yüklemeleri (686 MB, sürekli büyüyor; ayrı yedeklenir)
+assets/uploads/
+admin/assets/uploads/
+
+# Bağımlılıklar ve derleme çıktıları (package.json / composer.json'dan yeniden kurulur)
 node_modules/
 dist/
+dist-ssr/
 
-# IDE / işletim sistemi
+# Editör geçmişi (git geçmişi bunun yerini tutar)
+.lh/
+.history/
+
+# Ayrı repo (kendi .git'i var)
+mobile/
+
+# Public temiz kopya (kendi .git'i var, Batuhan-Kahraman35'e gider)
+.public/
+
+# Geçici dosyalar (debug, test, SQL)
+temp/
+
+# IDE önbellekleri
 .vs/
 .idea/
-.vscode/
+*.suo
+*.userosscache
+*.sln.docstates
+
+# İşletim sistemi
 Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
 .DS_Store
+
+# Editör geçici dosyaları
+*.tmp
+*.swp
+*.swo
+*~
+
+# Masaüstü uygulaması güncelleme paketleri (pdks-masaustu/araclar/yayinla.ps1 üretir, ~400 MB)
+indir/pdks-masaustu/*
+!indir/pdks-masaustu/web.config
