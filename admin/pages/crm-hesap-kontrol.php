@@ -345,6 +345,37 @@ function kurumsalEposta($ad, $soyad, $alan) {
     return implode('.', $kelimeler) . '@' . ltrim($alan, '@');
 }
 
+/**
+ * Hesap açmada kullanılacak e-posta: ekrandan elle girilmişse o, yoksa otomatik üretilen.
+ * Elle girilen adres geçerli olmalı ve sistemin alan adıyla bitmeli.
+ * Dönüş: ['email' => ..., 'hata' => null|string]
+ */
+function hesapEpostasi($personel, $alan, $girilen) {
+    $girilen = nrmEmail($girilen);
+    if ($girilen === '') {
+        $uretilen = kurumsalEposta($personel['kullanici_ad'], $personel['kullanici_soyad'], $alan);
+        return ['email' => $uretilen, 'hata' => $uretilen === '' ? 'Kurumsal e-posta üretilemedi. Personelin ad ve soyad alanları dolu olmalı, sistemin e-posta alan adı tanımlı olmalı.' : null];
+    }
+
+    if (!filter_var($girilen, FILTER_VALIDATE_EMAIL)) {
+        return ['email' => '', 'hata' => 'Girilen CRM e-postası geçerli değil!'];
+    }
+
+    $alan = mb_strtolower(ltrim(trim((string)$alan), '@'), 'UTF-8');
+    if ($alan !== '' && substr($girilen, -strlen('@' . $alan)) !== '@' . $alan) {
+        return ['email' => '', 'hata' => 'CRM e-postası @' . $alan . ' ile bitmeli!'];
+    }
+
+    return ['email' => $girilen, 'hata' => null];
+}
+
+/** Sistemin giriş linki (tanımdaki URL, şema yoksa https eklenir) */
+function sistemGirisUrl($sistem) {
+    $url = trim((string)($sistem['CRM_Sistemleri_url'] ?? ''));
+    if ($url === '') return null;
+    return preg_match('#^https?://#i', $url) ? $url : 'https://' . $url;
+}
+
 /** Hedef CRM'de bu e-postayı kullanan kayıt var mı */
 function crmEpostaSahibi($conn, $sistem, $kolon, $eposta) {
     if (!$kolon['email']) return null;
@@ -953,19 +984,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ? trim((string)($_POST['alan'] ?? $sistem['CRM_Sistemleri_eposta_alan']))
                     : $sistem['CRM_Sistemleri_eposta_alan'];
 
-                $kurumsal = kurumsalEposta(
-                    $personel['kullanici_ad'],
-                    $personel['kullanici_soyad'],
-                    $alan
-                );
-
-                if ($kurumsal === '') {
-                    echo json_encode([
-                        'success' => false,
-                        'message' => 'Kurumsal e-posta üretilemedi. Personelin ad ve soyad alanları dolu olmalı, sistemin e-posta alan adı tanımlı olmalı.'
-                    ]);
+                $ep = hesapEpostasi($personel, $alan, $_POST['email'] ?? '');
+                if ($ep['hata']) {
+                    echo json_encode(['success' => false, 'message' => $ep['hata']]);
                     break;
                 }
+                $kurumsal = $ep['email'];
 
                 if (googleMi($sistem)) {
                     $g = googleIstemci($sistem, $user['kullanici_id']);
@@ -1112,11 +1136,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         break;
                     }
 
-                    $kurumsal = kurumsalEposta($personel['kullanici_ad'], $personel['kullanici_soyad'], $alan);
-                    if ($kurumsal === '') {
-                        echo json_encode(['success' => false, 'message' => 'Kurumsal e-posta üretilemedi. Ad ve soyad dolu olmalı.']);
+                    $ep = hesapEpostasi($personel, $alan, $_POST['email'] ?? '');
+                    if ($ep['hata']) {
+                        echo json_encode(['success' => false, 'message' => $ep['hata']]);
                         break;
                     }
+                    $kurumsal = $ep['email'];
 
                     $adSoyad = trim($personel['kullanici_ad'] . ' ' . $personel['kullanici_soyad']);
                     $mevcut = $gw->kullaniciGetir($kurumsal);
@@ -1165,6 +1190,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'islem'            => $islem,
                         'crm_kullanici_id' => $googleId,
                         'email'            => $kurumsal,
+                        'giris_url'        => sistemGirisUrl($sistem),
                         'sifre'            => $sifre,
                         'uyari'            => $uyari,
                         'message'          => $islem === 'YENIDEN_AKTIF'
@@ -1179,19 +1205,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     break;
                 }
 
-                $kurumsal = kurumsalEposta(
-                    $personel['kullanici_ad'],
-                    $personel['kullanici_soyad'],
-                    $sistem['CRM_Sistemleri_eposta_alan']
-                );
-
-                if ($kurumsal === '') {
-                    echo json_encode([
-                        'success' => false,
-                        'message' => 'Kurumsal e-posta üretilemedi. Ad, soyad ve sistemin e-posta alan adı dolu olmalı.'
-                    ]);
+                $ep = hesapEpostasi($personel, $sistem['CRM_Sistemleri_eposta_alan'], $_POST['email'] ?? '');
+                if ($ep['hata']) {
+                    echo json_encode(['success' => false, 'message' => $ep['hata']]);
                     break;
                 }
+                $kurumsal = $ep['email'];
 
                 $baglanti = crmBaglan($sistem);
                 if ($baglanti['conn'] === false) {
@@ -1265,6 +1284,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'success'  => true,
                         'islem'    => 'YENIDEN_AKTIF',
                         'crm_kullanici_id' => (int)$kayit['crm_id'],
+                        'email'    => $kolon['email'] ? $kurumsal : nrmEmail($kayit['crm_email']),
+                        'giris_url' => sistemGirisUrl($sistem),
                         'sifre'    => $sifre,
                         'message'  => 'Mevcut hesap yeniden aktif edildi ve şifresi sıfırlandı.'
                     ]);
@@ -1350,6 +1371,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'success'  => true,
                     'islem'    => 'HESAP_ACILDI',
                     'crm_kullanici_id' => $yeniId,
+                    'email'    => $kurumsal,
+                    'giris_url' => sistemGirisUrl($sistem),
                     'sifre'    => $sifre,
                     'message'  => 'Hesap oluşturuldu.'
                 ]);
@@ -1696,8 +1719,13 @@ $sistemListesi = crmSistemleri($db);
 
                             <div class="col-12">
                                 <label class="form-label">CRM E-postası</label>
-                                <input type="text" class="form-control font-monospace" id="ha_crm_eposta" readonly placeholder="Personel ve sistem seçilince üretilir">
-                                <small class="text-muted">Ad ve soyaddan <code>isim.soyisim@alan</code> düzeninde otomatik üretilir; portaldaki kişisel e-posta CRM'e yazılmaz.</small>
+                                <div class="input-group">
+                                    <input type="email" class="form-control font-monospace" id="ha_crm_eposta" name="email" placeholder="Personel ve sistem seçilince üretilir" autocomplete="off">
+                                    <button type="button" class="btn btn-outline-secondary" id="ha_eposta_sifirla" title="Otomatik üretilen adrese dön">
+                                        <i class="bi bi-arrow-counterclockwise"></i>
+                                    </button>
+                                </div>
+                                <small class="text-muted">Ad ve soyaddan <code>isim.soyisim@alan</code> düzeninde otomatik üretilir, gerekirse değiştirilebilir (alan adı aynı kalmalı); portaldaki kişisel e-posta CRM'e yazılmaz.</small>
                             </div>
 
                             <div class="col-12">
@@ -1987,6 +2015,8 @@ $sistemListesi = crmSistemleri($db);
         let hesapAcVeriYuklendi = false;
         let sonOnizleme = null;
         let onizlemeIstekNo = 0;
+        let epostaElle = false;          // CRM e-postası elle değiştirildi mi
+        let epostaZamanlayici = null;
 
         function nrmMetin(v) {
             const harita = { 'İ':'i','I':'i','ı':'i','Ş':'s','ş':'s','Ğ':'g','ğ':'g','Ü':'u','ü':'u','Ö':'o','ö':'o','Ç':'c','ç':'c' };
@@ -2097,7 +2127,8 @@ $sistemListesi = crmSistemleri($db);
 
             sonOnizleme = null;
             $('#ha_kaydet').prop('disabled', true);
-            $('#ha_crm_eposta').val('');
+            if (!epostaElle) $('#ha_crm_eposta').val('');
+            const email = epostaElle ? $.trim($('#ha_crm_eposta').val()) : '';
 
             if (!sistemId || !personelId) { kutu.empty(); return; }
 
@@ -2110,7 +2141,7 @@ $sistemListesi = crmSistemleri($db);
             // Seçim hızlı değişirse eski yanıt yenisinin üzerine yazmasın
             const istekNo = ++onizlemeIstekNo;
 
-            $.post('', { action: 'hesap_onizleme', sistem_id: sistemId, kullanici_id: personelId, alan: alan }, function (response) {
+            $.post('', { action: 'hesap_onizleme', sistem_id: sistemId, kullanici_id: personelId, alan: alan, email: email }, function (response) {
                 if (istekNo !== onizlemeIstekNo) return;
 
                 if (!response.success) {
@@ -2119,7 +2150,7 @@ $sistemListesi = crmSistemleri($db);
                 }
 
                 sonOnizleme = response;
-                $('#ha_crm_eposta').val(response.email || '');
+                if (!epostaElle) $('#ha_crm_eposta').val(response.email || '');
 
                 if (response.durum === 'AKTIF_VAR') {
                     kutu.html(
