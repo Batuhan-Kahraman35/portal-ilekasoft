@@ -87,7 +87,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             case 'list':
                 $data = $db->fetchAll("
-                    SELECT pdks_ayar_id, pdks_ayar_anahtar, pdks_ayar_deger, pdks_ayar_baslik,
+                    SELECT pdks_ayar_id, pdks_ayar_anahtar, pdks_ayar_baslik,
+                           -- gizli tip (API anahtarı vb.) tarayıcıya hiç gönderilmez; yalnız tanımlı olup olmadığı döner
+                           CASE WHEN pdks_ayar_tip = 'gizli' THEN NULL ELSE pdks_ayar_deger END as pdks_ayar_deger,
+                           CASE WHEN pdks_ayar_tip = 'gizli' AND ISNULL(pdks_ayar_deger, '') <> '' THEN 1 ELSE 0 END as gizli_tanimli,
                            pdks_ayar_aciklama, pdks_ayar_tip, pdks_ayar_min, pdks_ayar_max,
                            pdks_ayar_birim,
                            CONVERT(VARCHAR(19), pdks_ayar_guncelleme_tarihi, 120) as guncelleme_tarihi
@@ -125,6 +128,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         continue;
                     }
                     $deger = trim((string)$gelen[$anahtar]);
+
+                    // Gizli alan boş bırakıldıysa mevcut değer korunur
+                    if ($t['pdks_ayar_tip'] === 'gizli' && $deger === '') {
+                        continue;
+                    }
 
                     if ($t['pdks_ayar_tip'] === 'sayi') {
                         if ($deger === '' || !ctype_digit($deger)) {
@@ -302,10 +310,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <?php include __DIR__ . '/../includes/footer.php'; ?>
 </div>
 
-<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.8/dist/umd/popper.min.js" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/js/bootstrap.min.js" crossorigin="anonymous"></script>
-<script src="/admin/assets/js/adminlte.min.js"></script>
+<?php include __DIR__ . '/../includes/scripts.php'; ?>
 <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js"></script>
 <script src="/admin/assets/js/custom.js"></script>
 <script>
@@ -332,7 +337,7 @@ function loadStats() {
     });
 }
 
-/** Ayar satırının tipine göre form alanını üretir (sayi / metin / bit). */
+/** Ayar satırının tipine göre form alanını üretir (sayi / metin / bit / gizli). */
 function ayarAlani(a) {
     const id = 'ayar_' + a.pdks_ayar_anahtar;
     const ad = `ayar[${a.pdks_ayar_anahtar}]`;
@@ -356,6 +361,12 @@ function ayarAlani(a) {
                 </div>
                 ${a.pdks_ayar_min !== null && a.pdks_ayar_max !== null
                     ? `<small class="text-muted">${a.pdks_ayar_min} - ${a.pdks_ayar_max} ${esc(a.pdks_ayar_birim || '')}</small>` : ''}`;
+    }
+    if (a.pdks_ayar_tip === 'gizli') {
+        // Değer sunucudan gelmez; boş bırakılırsa mevcut değer korunur
+        const yer = a.gizli_tanimli == 1 ? 'Tanımlı · değiştirmek için yeni değeri yazın' : 'Tanımlı değil';
+        return `<input type="password" class="form-control" id="${id}" name="${ad}" value=""
+                       placeholder="${yer}" autocomplete="new-password" ${kilit}>`;
     }
     return `<input type="text" class="form-control" id="${id}" name="${ad}" value="${esc(a.pdks_ayar_deger)}" ${kilit}>`;
 }

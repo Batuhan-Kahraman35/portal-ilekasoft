@@ -634,9 +634,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <?php include __DIR__ . '/../includes/footer.php'; ?>
     </div>
     
-    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.8/dist/umd/popper.min.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/js/bootstrap.min.js" crossorigin="anonymous"></script>
-    <script src="/admin/assets/js/adminlte.min.js"></script>
+    <?php include __DIR__ . '/../includes/scripts.php'; ?>
     
     <script>
         // Sayfa yetkileri

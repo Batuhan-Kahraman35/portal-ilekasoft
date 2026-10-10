@@ -510,13 +510,10 @@ if ($ticketId > 0 && !$yeniMi) {
             </div>
         </main>
         
-        <script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js" crossorigin="anonymous"></script>
+        <?php include __DIR__ . '/../includes/scripts.php'; ?>
         <?php include __DIR__ . '/../includes/footer.php'; ?>
     </div>
     
-    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.8/dist/umd/popper.min.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/js/bootstrap.min.js" crossorigin="anonymous"></script>
-    <script src="/admin/assets/js/adminlte.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
     <script>
     $(function () {

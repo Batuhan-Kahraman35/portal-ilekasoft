@@ -368,10 +368,6 @@ $anaMenuler = $db->fetchAll("
         .badge-parent {
             font-size: 0.75rem;
         }
-        .app-sidebar {
-            min-height: 100vh !important;
-            height: 100% !important;
-        }
     </style>
 </head>
 <body class="layout-fixed sidebar-expand-lg sidebar-open bg-body-tertiary">
@@ -886,12 +882,9 @@ $anaMenuler = $db->fetchAll("
         </div>
     </div>
 
-    <script src="https://code.jquery.com/jquery-3.7.1.min.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.8/dist/umd/popper.min.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/js/bootstrap.min.js" crossorigin="anonymous"></script>
+    <?php include __DIR__ . '/../includes/scripts.php'; ?>
     <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js"></script>
-    <script src="/admin/assets/js/adminlte.min.js"></script>
     <script src="/admin/assets/js/custom.js"></script>
     
     <script>

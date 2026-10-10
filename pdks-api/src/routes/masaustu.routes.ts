@@ -456,3 +456,121 @@ masaustuRouter.get('/ekip/gecmis', async (req: AuthRequest, res) => {
     res.status(500).json({ hata: 'Sunucu hatasi', detay: err.message });
   }
 });
+
+/** Uzak yonetim (destek) dis API'si: adres ve anahtar tanim_pdks_ayarlari'nda, yalniz sunucuda durur. */
+async function uzakYonetimAyarlari(): Promise<{ url: string; anahtar: string } | null> {
+  const pool = await getPool();
+  const r = await pool.request().query(`
+    SELECT pdks_ayar_anahtar, pdks_ayar_deger
+    FROM dbo.tanim_pdks_ayarlari
+    WHERE pdks_ayar_durum = 1
+      AND pdks_ayar_anahtar IN ('uzak_yonetim_api_url', 'uzak_yonetim_api_anahtar')`);
+  const harita = new Map<string, string>();
+  for (const s of r.recordset) harita.set(s.pdks_ayar_anahtar, String(s.pdks_ayar_deger ?? '').trim());
+  const url = harita.get('uzak_yonetim_api_url');
+  const anahtar = harita.get('uzak_yonetim_api_anahtar');
+  return url && anahtar ? { url, anahtar } : null;
+}
+
+/** Destek API'si saati DB saatiyle (Europe/Istanbul) 'YYYY-MM-DD HH:mm:ss' doner; ISO'ya cevrilir. */
+function istanbulSaati(deger: unknown): string | null {
+  if (typeof deger !== 'string' || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(deger)) return null;
+  return `${deger.replace(' ', 'T')}+03:00`;
+}
+
+/**
+ * PUT /api/masaustu/cihaz
+ * Govde: { anakartUuid, biosSeri? }
+ *
+ * Uygulamanin calistigi bilgisayari uzak yonetimdeki cihaz kaydiyla eslestirir:
+ * cihaz aciklamasina giris yapan personelin ad soyadi yazilir (deger ayniysa
+ * destek tarafinda yazilmaz) ve cihaz ozeti doner. Aciklama istemciden alinmaz.
+ * Ajan kurulu degilse 404.
+ */
+masaustuRouter.put('/cihaz', async (req: AuthRequest, res) => {
+  const kullaniciId = req.auth!.kullaniciId;
+  const ip = istekIp(req);
+  const anakartUuid = kirp(req.body?.anakartUuid, 64);
+  const biosSeri = kirp(req.body?.biosSeri, 100);
+
+  if (!anakartUuid) {
+    res.status(400).json({ hata: 'anakartUuid gerekli' });
+    return;
+  }
+
+  try {
+    const ayar = await uzakYonetimAyarlari();
+    if (!ayar) {
+      res.status(503).json({ hata: 'Uzak yonetim baglantisi tanimli degil' });
+      return;
+    }
+
+    const pool = await getPool();
+    const k = await pool
+      .request()
+      .input('kullaniciId', sql.Int, kullaniciId)
+      .query(`SELECT LTRIM(RTRIM(CONCAT(kullanici_ad, ' ', kullanici_soyad))) AS adSoyad
+              FROM dbo.kullanicilar WHERE kullanici_id = @kullaniciId`);
+    const adSoyad: string | undefined = k.recordset[0]?.adSoyad;
+    if (!adSoyad) {
+      res.status(404).json({ hata: 'Personel bulunamadi' });
+      return;
+    }
+
+    const yanit = await fetch(ayar.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-KEY': ayar.anahtar },
+      body: JSON.stringify({
+        action: 'aciklama_guncelle',
+        anakartUuid,
+        biosSeri,
+        aciklama: adSoyad,
+        personel: `${adSoyad} (#${kullaniciId})`,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const govde: any = await yanit.json().catch(() => null);
+
+    if (!yanit.ok || !govde?.basarili) {
+      // Ajan kurulu degil / UUID gecersiz: istemcinin bilmesi gereken durumlar aynen iletilir.
+      if (yanit.status === 404 || yanit.status === 400) {
+        res.status(yanit.status).json({ hata: govde?.mesaj ?? 'Cihaz bulunamadi' });
+        return;
+      }
+      await logYaz({
+        modul: 'PDKS', seviye: 'hata', islem: 'masaustu_cihaz', kullaniciId,
+        basarili: false, mesaj: `Uzak yonetim API hatasi (${yanit.status})`,
+        detay: { durum: yanit.status, hata: govde?.hata ?? null, mesaj: govde?.mesaj ?? null }, ip,
+      });
+      res.status(502).json({ hata: 'Uzak yonetim servisine ulasilamadi' });
+      return;
+    }
+
+    const v = govde.veri;
+    if (govde.degisti) {
+      await logYaz({
+        modul: 'PDKS', seviye: 'bilgi', islem: 'masaustu_cihaz', kullaniciId,
+        basarili: true, mesaj: `Cihaz aciklamasi guncellendi: ${v.bilgisayarAdi}`,
+        detay: { cihazId: v.cihazId, aciklama: v.aciklama }, ip, cihaz: v.bilgisayarAdi,
+      });
+    }
+
+    res.json({
+      bilgisayarAdi: v.bilgisayarAdi,
+      aciklama: v.aciklama,
+      grup: v.grup,
+      anyDeskId: v.anyDeskId,
+      rustDeskId: v.rustDeskId,
+      sonGorulme: istanbulSaati(v.sonGorulme),
+      cevrimici: v.cevrimici === true,
+    });
+  } catch (err: any) {
+    console.error('masaustu cihaz hatasi:', err);
+    await logYaz({
+      modul: 'PDKS', seviye: 'hata', islem: 'masaustu_cihaz', kullaniciId,
+      basarili: false, mesaj: err?.message ?? 'Bilinmeyen hata',
+      detay: { hata: hataDetayi(err) }, ip,
+    });
+    res.status(500).json({ hata: 'Sunucu hatasi', detay: err.message });
+  }
+});

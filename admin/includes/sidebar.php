@@ -265,6 +265,13 @@ foreach ($allPages as $page) {
 
 // Mevcut sayfa URL'sini belirle
 $currentPage = basename($_SERVER['PHP_SELF']);
+
+// Verilen sayfa listesinde mevcut sayfa var mı (menüyü açık getirmek için)
+$sayfaAktifMi = fn(array $sayfalar) => in_array(
+    $currentPage,
+    array_map(fn($p) => basename($p['sayfalar_sayfa_url']), $sayfalar),
+    true
+);
 ?>
 <!--begin::Sidebar-->
 <aside class="app-sidebar bg-body-secondary shadow" data-bs-theme="dark" style="min-height: 100vh;">
@@ -298,9 +305,16 @@ $currentPage = basename($_SERVER['PHP_SELF']);
                     if (!$hasSubItems) {
                         continue;
                     }
+
+                    // Mevcut sayfa bu menüde veya alt menülerinden birindeyse açık gelsin
+                    $menuAcik = $sayfaAktifMi($menu['pages']);
+                    foreach ($menu['children'] as $altMenu) {
+                        if ($menuAcik) break;
+                        $menuAcik = $sayfaAktifMi($altMenu['pages']);
+                    }
                     ?>
-                    
-                    <li class="nav-item <?= $hasSubItems ? 'has-treeview' : '' ?>">
+
+                    <li class="nav-item <?= $hasSubItems ? 'has-treeview' : '' ?> <?= $menuAcik ? 'menu-open' : '' ?>">
                         <?php if ($hasSubItems): ?>
                             <!-- Ana menü (alt öğeleri var) - URL'yi görmezden gel -->
                             <a href="#" class="nav-link" onclick="return false;">
@@ -342,7 +356,7 @@ $currentPage = basename($_SERVER['PHP_SELF']);
                                     
                                     <?php if ($hasSubPages): ?>
                                         <!-- Alt menü (sayfaları var) - URL'yi görmezden gel -->
-                                        <li class="nav-item has-treeview">
+                                        <li class="nav-item has-treeview <?= $sayfaAktifMi($subMenu['pages']) ? 'menu-open' : '' ?>">
                                             <a href="#" class="nav-link" onclick="return false;">
                                                 <i class="nav-icon <?= htmlspecialchars($subMenuIcon) ?>"></i>
                                                 <p>

@@ -163,10 +163,7 @@ $gibDurumlar = $db->fetchAll("SELECT DISTINCT Faturalar_GibDurum FROM Faturalar 
 </div>
 <div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">Iptal</button><button class="btn btn-primary" onclick="cariAtaKaydet()"><i class="bi bi-check2"></i> Kaydet</button></div>
 </div></div></div>
-<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.8/dist/umd/popper.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/js/bootstrap.min.js"></script>
-<script src="/admin/assets/js/adminlte.min.js"></script>
+<?php include __DIR__ . '/../includes/scripts.php'; ?>
 <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js"></script>
 <script src="/admin/assets/js/custom.js"></script>

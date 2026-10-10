@@ -563,11 +563,8 @@ Kişiye özel mesajlar için Dosya Yükle sekmesinden Excel yükleyebilirsin. {a
     <?php include '../includes/footer.php'; ?>
 </div>
 
-<!-- jQuery -->
-<script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+<?php include __DIR__ . '/../includes/scripts.php'; ?>
 
-<!-- Bootstrap Bundle JS -->
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 
 <!-- Select2 -->
 <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
@@ -578,8 +575,6 @@ Kişiye özel mesajlar için Dosya Yükle sekmesinden Excel yükleyebilirsin. {a
 <!-- SheetJS (Excel okuma için) -->
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
-<!-- AdminLTE -->
-<script src="/admin/assets/js/adminlte.min.js"></script>
 
 <!-- Custom JS -->
 <script src="/admin/assets/js/custom.js"></script>

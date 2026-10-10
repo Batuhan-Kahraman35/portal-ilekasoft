@@ -632,12 +632,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 <?php include __DIR__ . '/../includes/footer.php'; ?>
 
-<!-- jQuery -->
-<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-<!-- Bootstrap 5 -->
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
-<!-- AdminLTE -->
-<script src="/admin/assets/js/adminlte.min.js"></script>
+<?php include __DIR__ . '/../includes/scripts.php'; ?>
 <!-- SweetAlert2 -->
 <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js"></script>
 <!-- Select2 -->

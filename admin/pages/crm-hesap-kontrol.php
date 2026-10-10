@@ -419,6 +419,53 @@ function pasifPersoneller($db) {
 }
 
 /**
+ * Pasif personelde iade alınmamış zimmetler (Stok_Hareket / belge_tipi = 'ZIMMET').
+ * Ürün + seri no bazında net miktar: teslim (tipi=1) artı, iade (tipi=0) eksi.
+ * $personelId / $urunId / $seriNo verilirse tek kalem için kontrol yapılır.
+ */
+function pasifZimmetler($db, $personelId = null, $urunId = null, $seriNo = null) {
+    $kosul = '';
+    $params = [];
+    if ($personelId !== null) {
+        $kosul = " AND sh.stok_hareket_personel_id = ? AND sh.urun_hizmet_id = ? AND ISNULL(sh.stok_hareket_seri_no, '') = ?";
+        $params = [(int)$personelId, (int)$urunId, (string)$seriNo];
+    }
+
+    return $db->fetchAll("
+        SELECT
+            k.kullanici_id,
+            k.kullanici_ad,
+            k.kullanici_soyad,
+            k.kullanici_email,
+            k.kullanici_ise_cikis_tarihi,
+            uh.urun_hizmet_id,
+            uh.urun_hizmet_adi,
+            uh.urun_hizmet_kodu,
+            kat.kategori_adi,
+            z.seri_no,
+            z.net_miktar,
+            z.son_tarih
+        FROM (
+            SELECT
+                sh.stok_hareket_personel_id,
+                sh.urun_hizmet_id,
+                ISNULL(sh.stok_hareket_seri_no, '') AS seri_no,
+                SUM(CASE WHEN sh.stok_hareket_tipi = 1 THEN sh.stok_hareket_miktar ELSE -sh.stok_hareket_miktar END) AS net_miktar,
+                MAX(sh.stok_hareket_tarihi) AS son_tarih
+            FROM Stok_Hareket sh
+            WHERE sh.stok_hareket_belge_tipi = 'ZIMMET'
+              AND sh.stok_hareket_durum = 1{$kosul}
+            GROUP BY sh.stok_hareket_personel_id, sh.urun_hizmet_id, ISNULL(sh.stok_hareket_seri_no, '')
+            HAVING SUM(CASE WHEN sh.stok_hareket_tipi = 1 THEN sh.stok_hareket_miktar ELSE -sh.stok_hareket_miktar END) > 0
+        ) z
+        INNER JOIN kullanicilar k ON k.kullanici_id = z.stok_hareket_personel_id AND k.kullanici_durum = 0
+        INNER JOIN Urun_Hizmet uh ON uh.urun_hizmet_id = z.urun_hizmet_id
+        LEFT JOIN Kategoriler kat ON kat.kategori_id = uh.urun_hizmet_kategori_id
+        ORDER BY k.kullanici_ad, k.kullanici_soyad, z.son_tarih DESC
+    ", $params);
+}
+
+/**
  * Tüm CRM sistemlerini tarar, pasif personellerin hâlâ aktif olan
  * hesaplarını döndürür. Google Workspace'te askıdaki hesaplar da döner
  * (askida = true); silme işlemi bunlar üzerinden yapılır.
@@ -691,6 +738,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $etkilenenPersonel[$b['kullanici_id']] = true;
                 }
 
+                // İade alınmamış zimmetler aynı listeye eklenir; pasife almada iade kaydı oluşur
+                $zimmetSayi = 0;
+                $zimmetPersonel = [];
+                foreach (pasifZimmetler($db) as $z) {
+                    $zimmetSayi++;
+                    $zimmetPersonel[$z['kullanici_id']] = true;
+                    $sonuc['bulgular'][] = [
+                        'tip'             => 'ZIMMET',
+                        'satir_id'        => 'Z_' . $z['kullanici_id'] . '_' . $z['urun_hizmet_id'] . '_' . substr(md5($z['seri_no']), 0, 8),
+                        'sistem_id'       => null,
+                        'sistem_adi'      => 'Zimmet',
+                        'sistem_url'      => null,
+                        'kullanici_id'    => (int)$z['kullanici_id'],
+                        'personel_adi'    => trim($z['kullanici_ad'] . ' ' . $z['kullanici_soyad']),
+                        'personel_email'  => $z['kullanici_email'],
+                        'cikis_tarihi'    => tarihMetin($z['kullanici_ise_cikis_tarihi']),
+                        'crm_kullanici_id'=> $z['urun_hizmet_kodu'],
+                        'crm_adsoyad'     => $z['urun_hizmet_adi'],
+                        'crm_email'       => $z['seri_no'],
+                        'crm_songiris'    => tarihMetin($z['son_tarih']),
+                        'eslesme_tipi'    => 'ZIMMET',
+                        'askida'          => false,
+                        'urun_hizmet_id'  => (int)$z['urun_hizmet_id'],
+                        'kategori_adi'    => $z['kategori_adi'],
+                        'seri_no'         => $z['seri_no'],
+                        'net_miktar'      => (float)$z['net_miktar']
+                    ];
+                }
+
                 echo json_encode([
                     'success' => true,
                     'data'    => $sonuc['bulgular'],
@@ -700,7 +776,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'acik_hesap'         => $acikHesap,
                         'etkilenen_personel' => count($etkilenenPersonel),
                         'hatali_sistem'      => $hataliSistem,
-                        'toplam_sistem'      => count($sonuc['sistem_durumlari'])
+                        'toplam_sistem'      => count($sonuc['sistem_durumlari']),
+                        'zimmet'             => $zimmetSayi,
+                        'zimmet_personel'    => count($zimmetPersonel)
                     ]
                 ]);
                 break;
@@ -723,9 +801,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $sistemler[(int)$s['CRM_Sistemleri_id']] = $s;
                 }
 
+                $basarili = 0;
+                $basarisiz = 0;
+                $detaylar = [];
+
+                // Zimmet satırları: kalan net miktar için iade (tipi=0) kaydı oluşturulur.
+                // Miktar istemciden alınmaz, o an DB'den yeniden hesaplanır.
+                $iadeSayi = 0;
+                foreach ($secimler as $sec) {
+                    if (($sec['tip'] ?? '') !== 'ZIMMET') continue;
+
+                    $pid = (int)($sec['kullanici_id'] ?? 0);
+                    $uid = (int)($sec['urun_hizmet_id'] ?? 0);
+                    $seri = (string)($sec['seri_no'] ?? '');
+                    if ($pid <= 0 || $uid <= 0) continue;
+
+                    $acik = pasifZimmetler($db, $pid, $uid, $seri);
+                    if (!$acik) {
+                        $basarisiz++;
+                        $detaylar[] = 'Zimmet / ' . ($sec['crm_adsoyad'] ?? $uid) . ': açık zimmet yok veya personel pasif değil.';
+                        continue;
+                    }
+
+                    $tarih = date('Y-m-d H:i:s');
+                    $db->insert('Stok_Hareket', [
+                        'stok_hareket_fatura_no' => 'ZMT-' . date('Ymd') . '-' . str_pad((string)rand(1, 9999), 4, '0', STR_PAD_LEFT),
+                        'stok_hareket_tipi' => 0, // 0: Giriş (İade)
+                        'stok_hareket_belge_tipi' => 'ZIMMET',
+                        'stok_hareket_tarihi' => $tarih,
+                        'stok_hareket_cari_id' => null,
+                        'stok_hareket_personel_id' => $pid,
+                        'urun_hizmet_id' => $uid,
+                        'stok_hareket_miktar' => (float)$acik[0]['net_miktar'],
+                        'stok_hareket_birim' => 'ADET',
+                        'stok_hareket_birim_fiyat' => 0,
+                        'stok_hareket_kdv_id' => 1,
+                        'stok_hareket_kdv_tutari' => 0,
+                        'stok_hareket_ara_toplam' => 0,
+                        'stok_hareket_satir_toplam' => 0,
+                        'stok_hareket_seri_no' => $seri,
+                        'stok_hareket_aciklama' => 'CRM Hesap Kontrol: pasif personel, otomatik iade',
+                        'stok_hareket_durum' => 1,
+                        'stok_hareket_olusturan_kullanici_id' => $user['kullanici_id']
+                    ]);
+                    $iadeSayi++;
+                }
+
                 // Seçimleri sisteme göre grupla (her sisteme tek bağlantı)
                 $grup = [];
                 foreach ($secimler as $sec) {
+                    if (($sec['tip'] ?? '') === 'ZIMMET') continue;
                     $sid = (int)($sec['sistem_id'] ?? 0);
                     $cid = trim((string)($sec['crm_kullanici_id'] ?? ''));
                     if ($sid <= 0 || $cid === '' || !isset($sistemler[$sid])) continue;
@@ -733,10 +858,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if (!ctype_digit($cid) || (!googleMi($sistemler[$sid]) && (int)$cid <= 0)) continue;
                     $grup[$sid][] = $sec;
                 }
-
-                $basarili = 0;
-                $basarisiz = 0;
-                $detaylar = [];
 
                 foreach ($grup as $sid => $kayitlar) {
                     $s = $sistemler[$sid];
@@ -857,7 +978,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'basarili'  => $basarili,
                     'basarisiz' => $basarisiz,
                     'detaylar'  => array_slice($detaylar, 0, 20),
-                    'message'   => $basarili . ' hesap pasife alındı' . ($basarisiz > 0 ? ', ' . $basarisiz . ' işlem başarısız.' : '.')
+                    'iade'      => $iadeSayi,
+                    'message'   => implode(', ', array_filter([
+                                        ($basarili > 0 || $iadeSayi === 0) ? $basarili . ' hesap pasife alındı' : '',
+                                        $iadeSayi > 0 ? $iadeSayi . ' zimmet iade alındı' : '',
+                                        $basarisiz > 0 ? $basarisiz . ' işlem başarısız' : ''
+                                    ])) . '.'
                 ]);
                 break;
 
@@ -1470,7 +1596,7 @@ $sistemListesi = crmSistemleri($db);
 
                     <!-- Info Boxes -->
                     <div class="row mb-3">
-                        <div class="col-12 col-sm-6 col-md-3">
+                        <div class="col-12 col-sm-6 col-lg">
                             <div class="info-box">
                                 <span class="info-box-icon text-bg-secondary shadow-sm">
                                     <i class="bi bi-person-dash"></i>
@@ -1482,7 +1608,7 @@ $sistemListesi = crmSistemleri($db);
                             </div>
                         </div>
 
-                        <div class="col-12 col-sm-6 col-md-3">
+                        <div class="col-12 col-sm-6 col-lg">
                             <div class="info-box">
                                 <span class="info-box-icon text-bg-danger shadow-sm">
                                     <i class="bi bi-shield-exclamation"></i>
@@ -1494,7 +1620,7 @@ $sistemListesi = crmSistemleri($db);
                             </div>
                         </div>
 
-                        <div class="col-12 col-sm-6 col-md-3">
+                        <div class="col-12 col-sm-6 col-lg">
                             <div class="info-box">
                                 <span class="info-box-icon text-bg-warning shadow-sm">
                                     <i class="bi bi-people"></i>
@@ -1506,7 +1632,7 @@ $sistemListesi = crmSistemleri($db);
                             </div>
                         </div>
 
-                        <div class="col-12 col-sm-6 col-md-3">
+                        <div class="col-12 col-sm-6 col-lg">
                             <div class="info-box">
                                 <span class="info-box-icon text-bg-primary shadow-sm">
                                     <i class="bi bi-hdd-network"></i>
@@ -1514,6 +1640,18 @@ $sistemListesi = crmSistemleri($db);
                                 <div class="info-box-content">
                                     <span class="info-box-text">Taranan Sistem</span>
                                     <span class="info-box-number" id="stat-sistem">-</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="col-12 col-sm-6 col-lg">
+                            <div class="info-box">
+                                <span class="info-box-icon text-bg-info shadow-sm">
+                                    <i class="bi bi-box-seam"></i>
+                                </span>
+                                <div class="info-box-content">
+                                    <span class="info-box-text">İade Bekleyen Zimmet</span>
+                                    <span class="info-box-number" id="stat-zimmet">-</span>
                                 </div>
                             </div>
                         </div>
@@ -1549,6 +1687,7 @@ $sistemListesi = crmSistemleri($db);
                                             <?php foreach ($sistemListesi as $s): ?>
                                                 <option value="<?= htmlspecialchars($s['CRM_Sistemleri_ad']) ?>"><?= htmlspecialchars($s['CRM_Sistemleri_ad']) ?></option>
                                             <?php endforeach; ?>
+                                            <option value="Zimmet">Zimmet</option>
                                         </select>
                                     </div>
 
@@ -1559,6 +1698,7 @@ $sistemListesi = crmSistemleri($db);
                                             <option value="EMAIL">E-posta</option>
                                             <option value="TC">TC Kimlik</option>
                                             <option value="ADSOYAD">Ad Soyad</option>
+                                            <option value="ZIMMET">Zimmet</option>
                                         </select>
                                     </div>
 
@@ -1587,7 +1727,7 @@ $sistemListesi = crmSistemleri($db);
                     <!-- Liste Kartı -->
                     <div class="card card-primary card-outline">
                         <div class="card-header">
-                            <h3 class="card-title"><i class="bi bi-list-ul"></i> Açık Kalan CRM Hesapları</h3>
+                            <h3 class="card-title"><i class="bi bi-list-ul"></i> Açık Kalan CRM Hesapları ve Zimmetler</h3>
                             <div class="card-tools">
                                 <button type="button" class="btn btn-sm btn-secondary" data-bs-toggle="collapse" data-bs-target="#sistemDurumCard">
                                     <i class="bi bi-hdd-network"></i> Sistem Durumu
@@ -1622,10 +1762,10 @@ $sistemListesi = crmSistemleri($db);
                                         </th>
                                         <th>Personel</th>
                                         <th>İşten Çıkış</th>
-                                        <th>CRM Sistemi</th>
-                                        <th>CRM Hesabı</th>
-                                        <th>CRM E-posta</th>
-                                        <th>Son Giriş</th>
+                                        <th>CRM Sistemi / Zimmet</th>
+                                        <th>CRM Hesabı / Ürün</th>
+                                        <th>CRM E-posta / Seri No</th>
+                                        <th>Son Giriş / Son Hareket</th>
                                         <th>Eşleşme</th>
                                     </tr>
                                 </thead>
@@ -1746,10 +1886,7 @@ $sistemListesi = crmSistemleri($db);
         </div>
     </div>
 
-    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.8/dist/umd/popper.min.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/js/bootstrap.min.js" crossorigin="anonymous"></script>
-    <script src="/admin/assets/js/adminlte.min.js"></script>
+    <?php include __DIR__ . '/../includes/scripts.php'; ?>
     <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
@@ -1795,7 +1932,8 @@ $sistemListesi = crmSistemleri($db);
             const harita = {
                 EMAIL:   ['bg-success', 'E-posta'],
                 TC:      ['bg-primary', 'TC Kimlik'],
-                ADSOYAD: ['bg-warning text-dark', 'Ad Soyad']
+                ADSOYAD: ['bg-warning text-dark', 'Ad Soyad'],
+                ZIMMET:  ['bg-info text-dark', 'Zimmet']
             };
             const c = harita[tip] || ['bg-secondary', tip || '-'];
             return '<span class="badge ' + c[0] + '">' + c[1] + '</span>';
@@ -1822,17 +1960,29 @@ $sistemListesi = crmSistemleri($db);
                     '<strong>' + htmlKacis(b.personel_adi) + '</strong>' +
                     (b.personel_email ? '<br><small class="text-muted">' + htmlKacis(b.personel_email) + '</small>' : '');
 
-                const url = b.sistem_url
-                    ? (/^https?:\/\//i.test(b.sistem_url) ? b.sistem_url : 'https://' + b.sistem_url)
-                    : '';
-                const sistem = url
-                    ? '<a href="' + htmlKacis(url) + '" target="_blank" rel="noopener">' + htmlKacis(b.sistem_adi) + '</a>'
-                    : htmlKacis(b.sistem_adi);
+                let sistem, crmHesap;
 
-                const crmHesap =
-                    htmlKacis(b.crm_adsoyad || '-') +
-                    (b.askida ? ' <span class="badge bg-secondary">Askıda</span>' : '') +
-                    '<br><small class="text-muted">#' + htmlKacis(b.crm_kullanici_id) + '</small>';
+                if (b.tip === 'ZIMMET') {
+                    sistem = '<a href="/admin/zimmet-yonetimi" target="_blank"><i class="bi bi-box-seam"></i> Zimmet</a>';
+                    crmHesap =
+                        htmlKacis(b.crm_adsoyad) +
+                        ' <span class="badge text-bg-danger">' + b.net_miktar + ' adet</span>' +
+                        '<br><small class="text-muted">' +
+                        htmlKacis([b.crm_kullanici_id, b.kategori_adi].filter(Boolean).join(' · ') || '-') +
+                        '</small>';
+                } else {
+                    const url = b.sistem_url
+                        ? (/^https?:\/\//i.test(b.sistem_url) ? b.sistem_url : 'https://' + b.sistem_url)
+                        : '';
+                    sistem = url
+                        ? '<a href="' + htmlKacis(url) + '" target="_blank" rel="noopener">' + htmlKacis(b.sistem_adi) + '</a>'
+                        : htmlKacis(b.sistem_adi);
+
+                    crmHesap =
+                        htmlKacis(b.crm_adsoyad || '-') +
+                        (b.askida ? ' <span class="badge bg-secondary">Askıda</span>' : '') +
+                        '<br><small class="text-muted">#' + htmlKacis(b.crm_kullanici_id) + '</small>';
+                }
 
                 bulguTable.row.add([
                     secim,
@@ -1918,6 +2068,7 @@ $sistemListesi = crmSistemleri($db);
                 $('#stat-sistem').text(
                     (response.stats.toplam_sistem - response.stats.hatali_sistem) + ' / ' + response.stats.toplam_sistem
                 );
+                $('#stat-zimmet').text(response.stats.zimmet + ' / ' + response.stats.zimmet_personel + ' kişi');
 
                 sistemDurumGoster(response.sistemler || []);
                 filtreUygula();
@@ -1944,18 +2095,33 @@ $sistemListesi = crmSistemleri($db);
             }
 
             // Önizleme listesi
+            const zimmetSayi = secim.filter(b => b.tip === 'ZIMMET').length;
+            const hesapSayi = secim.length - zimmetSayi;
+
             let onizleme = '<div class="text-start" style="max-height:300px;overflow-y:auto">';
             onizleme += '<table class="table table-sm table-bordered mb-0"><thead><tr>' +
-                        '<th>Personel</th><th>CRM Sistemi</th><th>CRM Hesabı</th></tr></thead><tbody>';
+                        '<th>Personel</th><th>CRM Sistemi / Zimmet</th><th>CRM Hesabı / Ürün</th><th>İşlem</th></tr></thead><tbody>';
             secim.forEach(function (b) {
+                const zimmet = b.tip === 'ZIMMET';
+                const hesap = zimmet
+                    ? b.crm_adsoyad + (b.seri_no ? ' (' + b.seri_no + ')' : '') + ' · ' + b.net_miktar + ' adet'
+                    : (b.crm_adsoyad || ('#' + b.crm_kullanici_id));
                 onizleme += '<tr><td>' + htmlKacis(b.personel_adi) + '</td><td>' +
                             htmlKacis(b.sistem_adi) + '</td><td>' +
-                            htmlKacis(b.crm_adsoyad || ('#' + b.crm_kullanici_id)) + '</td></tr>';
+                            htmlKacis(hesap) + '</td><td>' +
+                            (zimmet ? '<span class="badge bg-info text-dark">İade alınacak</span>'
+                                    : '<span class="badge bg-danger">Pasife alınacak</span>') +
+                            '</td></tr>';
             });
             onizleme += '</tbody></table></div>';
 
+            const baslik = [
+                hesapSayi > 0 ? hesapSayi + ' hesap pasife alınacak' : '',
+                zimmetSayi > 0 ? zimmetSayi + ' zimmet iade alınacak' : ''
+            ].filter(Boolean).join(', ');
+
             Swal.fire({
-                title: secim.length + ' hesap pasife alınacak',
+                title: baslik,
                 html: onizleme,
                 icon: 'warning',
                 width: '48rem',
@@ -1967,6 +2133,15 @@ $sistemListesi = crmSistemleri($db);
                 if (!sonuc.isConfirmed) return;
 
                 const yuk = secim.map(function (b) {
+                    if (b.tip === 'ZIMMET') {
+                        return {
+                            tip: 'ZIMMET',
+                            kullanici_id: b.kullanici_id,
+                            urun_hizmet_id: b.urun_hizmet_id,
+                            seri_no: b.seri_no,
+                            crm_adsoyad: b.crm_adsoyad
+                        };
+                    }
                     return {
                         sistem_id: b.sistem_id,
                         crm_kullanici_id: b.crm_kullanici_id,
@@ -2200,7 +2375,9 @@ $sistemListesi = crmSistemleri($db);
                 sistem_id: $('#ha_sistem').val(),
                 kullanici_id: $('#ha_personel').val(),
                 departman_id: $('#ha_departman').val(),
-                alan: googleSeciliMi() ? $('#ha_alan').val() : ''
+                alan: googleSeciliMi() ? $('#ha_alan').val() : '',
+                // Önizlemede doğrulanan adres gönderilir
+                email: sonOnizleme.email || ''
             };
 
             Swal.fire({ title: 'İşleniyor...', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
@@ -2215,6 +2392,37 @@ $sistemListesi = crmSistemleri($db);
 
                 hesapAcModal.hide();
 
+                const sistemAdi = $('#ha_sistem option:selected').text().trim();
+                const ilkGirisNotu = 'İlk girişte şifrenizi değiştirmeniz gerekmektedir.';
+
+                // Personele gönderilecek bilgiler (etiket, değer, kutu id)
+                const alanlar = [
+                    ['Giriş Linki', response.giris_url || '', 'ha_kopya_url'],
+                    ['Kullanıcı Adı', response.email || '', 'ha_kopya_kadi'],
+                    ['Şifre', response.sifre || '', 'ha_kopya_sifre']
+                ].filter(a => a[1] !== '');
+
+                const satirlar = alanlar.map(a =>
+                    '<label class="form-label small mb-1">' + a[0] + '</label>' +
+                    '<div class="input-group mb-2">' +
+                    '<input type="text" class="form-control font-monospace" id="' + a[2] + '" value="' + htmlKacis(a[1]) + '" readonly>' +
+                    '<button type="button" class="btn btn-outline-secondary ha-kopyala" data-hedef="' + a[2] + '" data-etiket="' + a[0] + '">' +
+                    '<i class="bi bi-clipboard"></i></button>' +
+                    '</div>'
+                ).join('');
+
+                const tumMetin =
+                    (sistemAdi ? sistemAdi + ' hesap bilgileriniz:\n\n' : '') +
+                    alanlar.map(a => a[0] + ': ' + a[1]).join('\n') +
+                    '\n\n' + ilkGirisNotu;
+
+                const kopyala = function (metin, etiket) {
+                    navigator.clipboard.writeText(metin).then(
+                        () => showToast(etiket + ' kopyalandı', 'success'),
+                        () => showToast('Kopyalanamadı, elle seçin', 'warning')
+                    );
+                };
+
                 Swal.fire({
                     title: response.islem === 'YENIDEN_AKTIF' ? 'Hesap Yeniden Aktif Edildi' : 'Hesap Açıldı',
                     icon: 'success',
@@ -2222,23 +2430,22 @@ $sistemListesi = crmSistemleri($db);
                     html:
                         '<div class="text-start">' +
                         '<p class="mb-2">' + htmlKacis(response.message) + ' (Hesap #' + htmlKacis(response.crm_kullanici_id) + ')</p>' +
-                        (response.email ? '<p class="mb-2">Giriş adresi: <strong class="font-monospace">' + htmlKacis(response.email) + '</strong></p>' : '') +
                         (response.uyari ? '<div class="alert alert-danger mb-2"><i class="bi bi-exclamation-triangle"></i> ' + htmlKacis(response.uyari) + '</div>' : '') +
                         '<div class="alert alert-warning mb-2"><strong>Şifre yalnızca bir kez gösterilir</strong> — kapatmadan önce kopyalayın. Log kayıtlarına yazılmaz.</div>' +
-                        '<div class="input-group">' +
-                        '<input type="text" class="form-control font-monospace" id="ha_sifre_kutu" value="' + htmlKacis(response.sifre) + '" readonly>' +
-                        '<button type="button" class="btn btn-outline-secondary" id="ha_kopyala"><i class="bi bi-clipboard"></i> Kopyala</button>' +
-                        '</div>' +
-                        '<p class="mt-2 mb-0 small text-muted">Kullanıcı ilk girişte şifresini değiştirmek zorunda kalacak.</p>' +
+                        (response.giris_url ? '' : '<div class="alert alert-secondary py-1 px-2 mb-2 small">Sistem tanımında giriş linki (URL) yok, mesaja eklenmedi.</div>') +
+                        satirlar +
+                        '<div class="alert alert-info py-2 mb-2 small"><i class="bi bi-info-circle"></i> ' + ilkGirisNotu + '</div>' +
+                        '<button type="button" class="btn btn-primary w-100" id="ha_tumunu_kopyala">' +
+                        '<i class="bi bi-clipboard-check"></i> Tümünü Kopyala (personele gönderilecek mesaj)</button>' +
                         '</div>',
                     didOpen: function () {
-                        $('#ha_kopyala').on('click', function () {
-                            const kutu = document.getElementById('ha_sifre_kutu');
+                        $('.ha-kopyala').on('click', function () {
+                            const kutu = document.getElementById($(this).data('hedef'));
                             kutu.select();
-                            navigator.clipboard.writeText(kutu.value).then(
-                                () => showToast('Şifre kopyalandı', 'success'),
-                                () => showToast('Kopyalanamadı, elle seçin', 'warning')
-                            );
+                            kopyala(kutu.value, $(this).data('etiket'));
+                        });
+                        $('#ha_tumunu_kopyala').on('click', function () {
+                            kopyala(tumMetin, 'Hesap bilgileri');
                         });
                     }
                 });
@@ -2350,6 +2557,7 @@ $sistemListesi = crmSistemleri($db);
                             .prop('disabled', true).trigger('change');
                         $('#ha_portal_departman').val('');
                         $('#ha_crm_eposta').val('');
+                        epostaElle = false;
                         $('#ha_onizleme').empty();
                         $('#ha_kaydet').prop('disabled', true);
                         sonOnizleme = null;
@@ -2358,19 +2566,38 @@ $sistemListesi = crmSistemleri($db);
                     });
                 });
 
+                // Personel / sistem / alan değişince e-posta yeniden otomatik üretilir
                 $('#ha_personel').on('change', function () {
+                    epostaElle = false;
                     $('#ha_portal_departman').val($('option:selected', this).data('departman') || '');
                     if ($('#ha_sistem').val()) departmanlariYukle();
                     onizlemeYukle();
                 });
 
                 $('#ha_sistem').on('change', function () {
+                    epostaElle = false;
                     departmanlariYukle();
                     onizlemeYukle();
                 });
 
                 $('#ha_alan').on('change', function () {
+                    epostaElle = false;
                     if (googleSeciliMi()) onizlemeYukle();
+                });
+
+                // Elle değiştirilen e-posta: yazma bitince hedef sistemde yeniden kontrol edilir
+                $('#ha_crm_eposta').on('input', function () {
+                    epostaElle = $.trim($(this).val()) !== '';
+                    sonOnizleme = null;
+                    $('#ha_kaydet').prop('disabled', true);
+                    clearTimeout(epostaZamanlayici);
+                    epostaZamanlayici = setTimeout(onizlemeYukle, 600);
+                });
+
+                $('#ha_eposta_sifirla').on('click', function () {
+                    epostaElle = false;
+                    clearTimeout(epostaZamanlayici);
+                    onizlemeYukle();
                 });
 
                 $('#ha_departman').on('change', function () {
