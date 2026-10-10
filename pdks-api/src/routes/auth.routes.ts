@@ -12,9 +12,6 @@ function istekIp(req: any): string | null {
   return bilesik ? bilesik.split(',')[0].trim().slice(0, 64) : null;
 }
 
-/** Sifresi tanimsiz personelin ilk giriste kullanacagi varsayilan sifre. */
-const VARSAYILAN_SIFRE = '123456';
-
 /**
  * POST /api/auth/login
  * Govde: { email, sifre }  ("email" alani e-posta veya TC kimlik no olabilir)
@@ -66,11 +63,8 @@ authRouter.post('/login', async (req, res) => {
     // ($2y ve $2b ayni algoritmadir, sadece surum etiketi farkli).
     const hash = String(user.kullanici_sifre_hash ?? '').replace(/^\$2y\$/, '$2b$');
 
-    // Sifresi tanimsiz personel varsayilan sifre ile girer; hash varsa normal
-    // bcrypt dogrulamasi yapilir.
-    const eslesti = hash === ''
-      ? sifre === VARSAYILAN_SIFRE
-      : await bcrypt.compare(sifre, hash);
+    // Sifresi tanimsiz hesap giris yapamaz; sifre panelden atanir.
+    const eslesti = hash !== '' && await bcrypt.compare(String(sifre), hash);
 
     if (!eslesti) {
       await logYaz({
