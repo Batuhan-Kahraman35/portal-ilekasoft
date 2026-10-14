@@ -23,6 +23,10 @@ if (!$pagePermissions['has_access']) {
     PageAuth::accessDenied($pagePermissions['error'] ?? 'Bu sayfaya erişim yetkiniz bulunmamaktadır.');
 }
 
+// YETKİ: firma_gor açıksa yalnız kullanıcının firmasındaki personel görülür/işlenir
+$kisitFirmaId = PageAuth::firmaKisiti($pagePermissions, $user['kullanici_id']);
+[$firmaKisitSql, $firmaKisitParams] = PageAuth::firmaKisitSql($kisitFirmaId, 'k.kullanici_firma_id');
+
 // Mevcut sayfanın bilgilerini al
 $pageInfo = $db->fetchOne("
     SELECT 
@@ -110,11 +114,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $whereConditions[] = "k.kullanici_maas <= ?";
                 $params[] = intval($maasMax);
             }
-            
-            $whereClause = implode(" AND ", $whereConditions);
-            
+
+            $whereClause = implode(" AND ", $whereConditions) . $firmaKisitSql;
+            $params = array_merge($params, $firmaKisitParams);
+
             $kullanicilar = $db->fetchAll("
-                SELECT 
+                SELECT
                     k.kullanici_id,
                     k.kullanici_email,
                     k.kullanici_ad,
@@ -161,20 +166,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($action === 'stats') {
             // İstatistikler
             $stats = [
-                'toplam' => $db->fetchOne("SELECT COUNT(*) as sayi FROM kullanicilar")['sayi'] ?? 0,
-                'aktif' => $db->fetchOne("SELECT COUNT(*) as sayi FROM kullanicilar WHERE kullanici_durum = 1")['sayi'] ?? 0,
-                'pasif' => $db->fetchOne("SELECT COUNT(*) as sayi FROM kullanicilar WHERE kullanici_durum = 0")['sayi'] ?? 0
+                'toplam' => $db->fetchOne("SELECT COUNT(*) as sayi FROM kullanicilar k WHERE 1=1 $firmaKisitSql", $firmaKisitParams)['sayi'] ?? 0,
+                'aktif' => $db->fetchOne("SELECT COUNT(*) as sayi FROM kullanicilar k WHERE k.kullanici_durum = 1 $firmaKisitSql", $firmaKisitParams)['sayi'] ?? 0,
+                'pasif' => $db->fetchOne("SELECT COUNT(*) as sayi FROM kullanicilar k WHERE k.kullanici_durum = 0 $firmaKisitSql", $firmaKisitParams)['sayi'] ?? 0
             ];
-            
+
             // Son kayıt
             $sonKayit = $db->fetchOne("
-                SELECT TOP 1 
-                    kullanici_ad, 
-                    kullanici_soyad,
-                    CONVERT(VARCHAR(10), kullanici_olusturma_tarihi, 104) as tarih
-                FROM kullanicilar 
-                ORDER BY kullanici_olusturma_tarihi DESC
-            ");
+                SELECT TOP 1
+                    k.kullanici_ad,
+                    k.kullanici_soyad,
+                    CONVERT(VARCHAR(10), k.kullanici_olusturma_tarihi, 104) as tarih
+                FROM kullanicilar k
+                WHERE 1=1 $firmaKisitSql
+                ORDER BY k.kullanici_olusturma_tarihi DESC
+            ", $firmaKisitParams);
             
             if ($sonKayit) {
                 $adSoyad = trim(($sonKayit['kullanici_ad'] ?? '') . ' ' . ($sonKayit['kullanici_soyad'] ?? ''));
@@ -188,7 +194,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         
         if ($action === 'get_firmalar') {
-            $firmalar = $db->fetchAll("SELECT firma_id, firma_adi FROM Firmalar WHERE firma_durum = 1 ORDER BY firma_adi");
+            [$fSql, $fParams] = PageAuth::firmaKisitSql($kisitFirmaId, 'firma_id');
+            $firmalar = $db->fetchAll("SELECT firma_id, firma_adi FROM Firmalar WHERE firma_durum = 1 $fSql ORDER BY firma_adi", $fParams);
             echo json_encode(['success' => true, 'data' => $firmalar]);
             exit;
         }
@@ -250,7 +257,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $sehir_id = !empty($_POST['sehir_id']) ? intval($_POST['sehir_id']) : null;
             $bes_durumu = isset($_POST['bes_durumu']) ? intval($_POST['bes_durumu']) : 0;
             $puantaj_donem_id = !empty($_POST['puantaj_donem_id']) ? intval($_POST['puantaj_donem_id']) : null;
-            
+
+            // Firma kısıtlı kullanıcı yalnız kendi firmasına personel ekler
+            if ($kisitFirmaId !== null) {
+                if ($kisitFirmaId <= 0) {
+                    throw new Exception('Firma bilginiz tanımlı olmadığı için personel ekleyemezsiniz.');
+                }
+                $firma_id = $kisitFirmaId;
+            }
+
             if (empty($email) || empty($sifre)) {
                 throw new Exception('Email ve şifre boş olamaz');
             }
@@ -316,7 +331,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (empty($email) || $id <= 0) {
                 throw new Exception('Geçersiz veri');
             }
-            
+
+            if (!PageAuth::personelFirmadaMi($kisitFirmaId, $id)) {
+                throw new Exception('Bu personel üzerinde işlem yetkiniz yok.');
+            }
+            if ($kisitFirmaId !== null) {
+                $firma_id = $kisitFirmaId;
+            }
+
             if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
                 throw new Exception('Geçersiz email adresi');
             }
@@ -392,6 +414,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($id <= 0) {
                 throw new Exception('Geçersiz kullanıcı');
             }
+            if (!PageAuth::personelFirmadaMi($kisitFirmaId, $id)) {
+                throw new Exception('Bu personel üzerinde işlem yetkiniz yok.');
+            }
 
             $db->update('kullanicilar', [
                 'kullanici_durum' => $durum,
@@ -415,6 +440,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             
             if ($id <= 0) {
                 throw new Exception('Geçersiz ID');
+            }
+            if (!PageAuth::personelFirmadaMi($kisitFirmaId, $id)) {
+                throw new Exception('Bu personel üzerinde işlem yetkiniz yok.');
             }
             
             // Kendi hesabını silmeyi engelle
@@ -512,11 +540,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $whereConditions[] = "k.kullanici_maas <= ?";
                 $params[] = intval($maasMax);
             }
-            
-            $whereClause = implode(" AND ", $whereConditions);
-            
+
+            $whereClause = implode(" AND ", $whereConditions) . $firmaKisitSql;
+            $params = array_merge($params, $firmaKisitParams);
+
             $kullanicilar = $db->fetchAll("
-                SELECT 
+                SELECT
                     k.kullanici_id,
                     k.kullanici_email,
                     k.kullanici_ad,
@@ -656,8 +685,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 WHERE (k.kullanici_ad LIKE ? OR k.kullanici_soyad LIKE ?
                     OR k.kullanici_tc_kimlik_no LIKE ?
                     OR (ISNULL(k.kullanici_ad,'') + ' ' + ISNULL(k.kullanici_soyad,'')) LIKE ?)
+                    $firmaKisitSql
                 ORDER BY k.kullanici_ad, k.kullanici_soyad
-            ", ["%$q%", "%$q%", "%$q%", "%$q%"]);
+            ", array_merge(["%$q%", "%$q%", "%$q%", "%$q%"], $firmaKisitParams));
             
             $data = [];
             foreach ($results as $r) {
@@ -682,6 +712,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             
             if ($id1 <= 0 || $id2 <= 0 || $id1 === $id2) {
                 throw new Exception('Geçersiz veya aynı personel seçildi.');
+            }
+            if (!PageAuth::personelFirmadaMi($kisitFirmaId, [$id1, $id2])) {
+                throw new Exception('Bu personel üzerinde işlem yetkiniz yok.');
             }
             
             $sqlFields = "
@@ -754,6 +787,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             
             if ($sourceId <= 0 || $targetId <= 0 || $sourceId === $targetId) {
                 throw new Exception('Geçersiz personel seçimi.');
+            }
+            if (!PageAuth::personelFirmadaMi($kisitFirmaId, [$sourceId, $targetId])) {
+                throw new Exception('Bu personel üzerinde işlem yetkiniz yok.');
             }
             
             if ($sourceId == $user['kullanici_id']) {

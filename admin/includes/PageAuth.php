@@ -103,6 +103,95 @@ class PageAuth {
     }
     
     /**
+     * Firma Gör (firma_gor) kısıtını çözer
+     *
+     * Admin değilse ve sayfada firma_gor açıksa kullanıcı kendi firmasının
+     * kayıtlarıyla sınırlanır. Firma önce şubenin firmasından, yoksa
+     * kullanıcının firma alanından alınır.
+     *
+     * @param array $pagePermissions checkPagePermissions() sonucu
+     * @param int $userId Kullanıcı ID
+     * @return int|null null: kısıt yok · >0: firma_id · 0: firma çözülemedi (hiç kayıt gösterilmez)
+     */
+    public static function firmaKisiti(array $pagePermissions, $userId) {
+        if (!empty($pagePermissions['is_admin']) || empty($pagePermissions['can_view_firma'])) {
+            return null;
+        }
+
+        $db = Database::getInstance();
+        $kayit = $db->fetchOne("
+            SELECT COALESCE(s.sube_firma_id, k.kullanici_firma_id) AS firma_id
+            FROM kullanicilar k
+            LEFT JOIN Subeler s ON k.kullanici_sube_id = s.sube_id
+            WHERE k.kullanici_id = ?
+        ", [$userId]);
+
+        return (int)($kayit['firma_id'] ?? 0);
+    }
+
+    /**
+     * Firma kısıtı için SQL koşulu üretir
+     *
+     * Örnek: [$sql, $params] = PageAuth::firmaKisitSql($kisitFirmaId, 'k.kullanici_firma_id');
+     *
+     * @param int|null $kisitFirmaId firmaKisiti() sonucu
+     * @param string $kolon Filtrelenecek firma kolonu (sabit değer verilmeli, kullanıcı girdisi değil)
+     * @return array [' AND ...' veya '', parametreler]
+     */
+    public static function firmaKisitSql($kisitFirmaId, $kolon) {
+        if ($kisitFirmaId === null) {
+            return ['', []];
+        }
+        if ($kisitFirmaId > 0) {
+            return [" AND $kolon = ?", [$kisitFirmaId]];
+        }
+        return [" AND 1 = 0", []];
+    }
+
+    /**
+     * Personel(ler) kısıtlı firmaya mı ait? Kısıt yoksa her zaman true.
+     *
+     * @param int|null $kisitFirmaId firmaKisiti() sonucu
+     * @param int|int[] $kullaniciIdler Kontrol edilecek personel ID(leri)
+     * @return bool
+     */
+    public static function personelFirmadaMi($kisitFirmaId, $kullaniciIdler) {
+        if ($kisitFirmaId === null) {
+            return true;
+        }
+        $idler = array_values(array_unique(array_filter(array_map('intval', (array)$kullaniciIdler))));
+        if (!$idler || $kisitFirmaId <= 0) {
+            return false;
+        }
+
+        $db = Database::getInstance();
+        $yer = implode(',', array_fill(0, count($idler), '?'));
+        $sonuc = $db->fetchOne("
+            SELECT COUNT(*) AS sayi
+            FROM kullanicilar
+            WHERE kullanici_id IN ($yer) AND kullanici_firma_id = ?
+        ", array_merge($idler, [$kisitFirmaId]));
+
+        return (int)($sonuc['sayi'] ?? 0) === count($idler);
+    }
+
+    /**
+     * Puantaj/izin kaydının personeli kısıtlı firmada mı? Kısıt yoksa her zaman true.
+     *
+     * @param int|null $kisitFirmaId firmaKisiti() sonucu
+     * @param int $puantajId Personel_Puantaj.puantaj_id
+     * @return bool
+     */
+    public static function puantajFirmadaMi($kisitFirmaId, $puantajId) {
+        if ($kisitFirmaId === null) {
+            return true;
+        }
+        $db = Database::getInstance();
+        $kayit = $db->fetchOne("SELECT puantaj_kullanici_id FROM Personel_Puantaj WHERE puantaj_id = ?", [intval($puantajId)]);
+        return $kayit && self::personelFirmadaMi($kisitFirmaId, $kayit['puantaj_kullanici_id']);
+    }
+
+    /**
      * Yetkisiz erişim durumunda hata sayfası göster
      */
     public static function accessDenied($message = 'Bu sayfaya erişim yetkiniz yok!') {

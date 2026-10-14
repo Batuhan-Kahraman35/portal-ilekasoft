@@ -25,6 +25,10 @@ if (!$pagePermissions['has_access']) {
     PageAuth::accessDenied($pagePermissions['error'] ?? 'Bu sayfaya erişim yetkiniz bulunmamaktadır.');
 }
 
+// YETKİ: firma_gor açıksa yalnız kullanıcının firmasındaki personelin izinleri görülür/işlenir
+$kisitFirmaId = PageAuth::firmaKisiti($pagePermissions, $user['kullanici_id']);
+[$firmaKisitSql, $firmaKisitParams] = PageAuth::firmaKisitSql($kisitFirmaId, 'k.kullanici_firma_id');
+
 // Mevcut sayfanın bilgilerini al
 $pageInfo = $db->fetchOne("
     SELECT 
@@ -65,14 +69,16 @@ $personeller = $db->fetchAll("
     FROM kullanicilar k
     LEFT JOIN Departmanlar d ON k.kullanici_calisma_departman_id = d.departman_id
     LEFT JOIN Firmalar f ON k.kullanici_firma_id = f.firma_id
+    WHERE 1=1 $firmaKisitSql
     ORDER BY k.kullanici_durum DESC, k.kullanici_ad, k.kullanici_soyad
-");
+", $firmaKisitParams);
 
 // Departmanları çek
 $departmanlar = $db->fetchAll("SELECT departman_id, departman_adi FROM Departmanlar WHERE departman_durum = 1 ORDER BY departman_adi");
 
-// Firmaları çek
-$firmalar = $db->fetchAll("SELECT firma_id, firma_adi FROM Firmalar WHERE firma_durum = 1 ORDER BY firma_adi");
+// Firmaları çek (kısıt varsa yalnız kendi firması)
+[$fSql, $fParams] = PageAuth::firmaKisitSql($kisitFirmaId, 'firma_id');
+$firmalar = $db->fetchAll("SELECT firma_id, firma_adi FROM Firmalar WHERE firma_durum = 1 $fSql ORDER BY firma_adi", $fParams);
 
 // Excel Export (GET isteği)
 if (isset($_GET['action']) && $_GET['action'] === 'export') {
@@ -103,7 +109,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'export') {
         $params[] = "%$searchValue%"; $params[] = "%$searchValue%";
     }
 
-    $whereClause = implode(" AND ", $whereConditions);
+    $whereClause = implode(" AND ", $whereConditions) . $firmaKisitSql;
+    $params = array_merge($params, $firmaKisitParams);
 
     $rows = $db->fetchAll("
         SELECT
@@ -146,7 +153,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'export') {
             if ($personelId)  { $pWhere[] = "k.kullanici_id = ?";           $pParams[] = $personelId; }
             if ($firmaId)     { $pWhere[] = "k.kullanici_firma_id = ?";     $pParams[] = $firmaId;    }
             if ($departmanId) { $pWhere[] = "k.kullanici_calisma_departman_id = ?"; $pParams[] = $departmanId;}
-            $pWhereClause = implode(" AND ", $pWhere);
+            $pWhereClause = implode(" AND ", $pWhere) . $firmaKisitSql;
+            $pParams = array_merge($pParams, $firmaKisitParams);
 
             $personelListesi = $db->fetchAll("
                 SELECT
@@ -240,14 +248,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         switch ($action) {
             case 'stats':
                 // İstatistikleri getir - Sadece izin kayıtları için
-                $baseSql = "SELECT COUNT(*) as sayi FROM Personel_Puantaj WHERE puantaj_aktif = 1 AND puantaj_izin_durum_id IS NOT NULL";
-                
+                // Firma kısıtı varsa yalnız o firmanın personelinin kayıtları sayılır
+                $kisitExists = $kisitFirmaId !== null
+                    ? " AND EXISTS (SELECT 1 FROM kullanicilar k WHERE k.kullanici_id = pp.puantaj_kullanici_id $firmaKisitSql)"
+                    : "";
+                $baseSql = "SELECT COUNT(*) as sayi FROM Personel_Puantaj pp WHERE pp.puantaj_aktif = 1 AND pp.puantaj_izin_durum_id IS NOT NULL" . $kisitExists;
+
                 // Bu ay filtresi
-                $buAySql = $baseSql . " AND YEAR(puantaj_tarih) = YEAR(GETDATE()) AND MONTH(puantaj_tarih) = MONTH(GETDATE())";
-                
+                $buAySql = $baseSql . " AND YEAR(pp.puantaj_tarih) = YEAR(GETDATE()) AND MONTH(pp.puantaj_tarih) = MONTH(GETDATE())";
+
                 // Bu hafta filtresi
-                $buHaftaSql = $baseSql . " AND puantaj_tarih >= DATEADD(day, 1 - DATEPART(weekday, GETDATE()), CAST(GETDATE() AS DATE)) 
-                                          AND puantaj_tarih < DATEADD(day, 8 - DATEPART(weekday, GETDATE()), CAST(GETDATE() AS DATE))";
+                $buHaftaSql = $baseSql . " AND pp.puantaj_tarih >= DATEADD(day, 1 - DATEPART(weekday, GETDATE()), CAST(GETDATE() AS DATE))
+                                          AND pp.puantaj_tarih < DATEADD(day, 8 - DATEPART(weekday, GETDATE()), CAST(GETDATE() AS DATE))";
                 
                 // İzin durumlarına göre sayılar (Bu ay)
                 $izinIstatistikleri = $db->fetchAll("
@@ -263,10 +275,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         AND pp.puantaj_aktif = 1
                         AND YEAR(pp.puantaj_tarih) = YEAR(GETDATE()) 
                         AND MONTH(pp.puantaj_tarih) = MONTH(GETDATE())
+                        $kisitExists
                     WHERE id.izin_durum_durum = 1
                     GROUP BY id.izin_durum_id, id.izin_durum_adi, id.izin_durum_renk, id.izin_durum_ucretli, id.izin_durum_sira_no
                     ORDER BY ISNULL(id.izin_durum_sira_no, 999), id.izin_durum_adi
-                ");
+                ", $firmaKisitParams);
                 
                 // Ücretli ve ücretsiz izin sayıları
                 $ucretliSayi = $db->fetchOne("
@@ -276,9 +289,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     WHERE pp.puantaj_aktif = 1 
                     AND pp.puantaj_izin_durum_id IS NOT NULL
                     AND id.izin_durum_ucretli = 1
-                    AND YEAR(pp.puantaj_tarih) = YEAR(GETDATE()) 
+                    AND YEAR(pp.puantaj_tarih) = YEAR(GETDATE())
                     AND MONTH(pp.puantaj_tarih) = MONTH(GETDATE())
-                ")['sayi'] ?? 0;
+                    $kisitExists
+                ", $firmaKisitParams)['sayi'] ?? 0;
                 
                 $ucretsizSayi = $db->fetchOne("
                     SELECT COUNT(*) as sayi 
@@ -287,14 +301,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     WHERE pp.puantaj_aktif = 1 
                     AND pp.puantaj_izin_durum_id IS NOT NULL
                     AND id.izin_durum_ucretli = 0
-                    AND YEAR(pp.puantaj_tarih) = YEAR(GETDATE()) 
+                    AND YEAR(pp.puantaj_tarih) = YEAR(GETDATE())
                     AND MONTH(pp.puantaj_tarih) = MONTH(GETDATE())
-                ")['sayi'] ?? 0;
-                
+                    $kisitExists
+                ", $firmaKisitParams)['sayi'] ?? 0;
+
                 $stats = [
-                    'toplam' => $db->fetchOne($baseSql)['sayi'] ?? 0,
-                    'bu_ay' => $db->fetchOne($buAySql)['sayi'] ?? 0,
-                    'bu_hafta' => $db->fetchOne($buHaftaSql)['sayi'] ?? 0,
+                    'toplam' => $db->fetchOne($baseSql, $firmaKisitParams)['sayi'] ?? 0,
+                    'bu_ay' => $db->fetchOne($buAySql, $firmaKisitParams)['sayi'] ?? 0,
+                    'bu_hafta' => $db->fetchOne($buHaftaSql, $firmaKisitParams)['sayi'] ?? 0,
                     'ucretli' => $ucretliSayi,
                     'ucretsiz' => $ucretsizSayi,
                     'izin_istatistikleri' => $izinIstatistikleri
@@ -369,9 +384,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $params[] = "%$searchValue%";
                     $params[] = "%$searchValue%";
                 }
-                
-                $whereClause = implode(" AND ", $whereConditions);
-                
+
+                $whereClause = implode(" AND ", $whereConditions) . $firmaKisitSql;
+                $params = array_merge($params, $firmaKisitParams);
+
                 // Toplam kayıt sayısı (filtresiz - sadece izin kayıtları, çıkış sonrası hariç)
                 $totalRecords = $db->fetchOne("
                     SELECT COUNT(*) as total 
@@ -382,7 +398,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     AND p.puantaj_izin_durum_id IS NOT NULL
                     AND (dep.departman_personel = 1 OR dep.departman_personel IS NULL)
                     AND (k.kullanici_ise_cikis_tarihi IS NULL OR CONVERT(DATE, p.puantaj_tarih) <= CONVERT(DATE, k.kullanici_ise_cikis_tarihi))
-                ")['total'] ?? 0;
+                    $firmaKisitSql
+                ", $firmaKisitParams)['total'] ?? 0;
                 
                 // Filtrelenmiş kayıt sayısı
                 $countSql = "
@@ -459,6 +476,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             case 'get':
                 // Tek kayıt getir
                 $id = $_POST['id'] ?? 0;
+                if (!PageAuth::puantajFirmadaMi($kisitFirmaId, $id)) {
+                    echo json_encode(['success' => false, 'message' => 'Bu kayıt üzerinde yetkiniz yok!']);
+                    break;
+                }
                 $data = $db->fetchOne("SELECT * FROM Personel_Puantaj WHERE puantaj_id = ?", [$id]);
                 
                 if ($data && isset($data['puantaj_tarih'])) {
@@ -484,6 +505,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
                 if (!$izinDurumId) {
                     echo json_encode(['success' => false, 'message' => 'İzin türü seçmelisiniz!']);
+                    break;
+                }
+
+                if (!PageAuth::personelFirmadaMi($kisitFirmaId, $kullaniciId)
+                    || ($id > 0 && !PageAuth::puantajFirmadaMi($kisitFirmaId, $id))) {
+                    echo json_encode(['success' => false, 'message' => 'Bu personel üzerinde işlem yetkiniz yok!']);
                     break;
                 }
                 
@@ -562,6 +589,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     echo json_encode(['success' => false, 'message' => 'Tüm alanları doldurun!']);
                     break;
                 }
+
+                if (!PageAuth::personelFirmadaMi($kisitFirmaId, $kullaniciId)) {
+                    echo json_encode(['success' => false, 'message' => 'Bu personel üzerinde işlem yetkiniz yok!']);
+                    break;
+                }
                 
                 // Tarih aralığındaki günleri hesapla
                 $start = new DateTime($baslangicTarihi);
@@ -637,6 +669,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 $id = $_POST['id'] ?? 0;
+                if (!PageAuth::puantajFirmadaMi($kisitFirmaId, $id)) {
+                    echo json_encode(['success' => false, 'message' => 'Bu kayıt üzerinde yetkiniz yok!']);
+                    break;
+                }
                 $db->update('Personel_Puantaj', ['puantaj_aktif' => 0], ['puantaj_id' => $id]);
                 echo json_encode(['success' => true, 'message' => 'İzin kaydı silindi!']);
                 break;
@@ -649,6 +685,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
                 if (!$personelId || !$izinDurumId) {
                     echo json_encode(['success' => false, 'message' => 'Eksik parametre!']);
+                    break;
+                }
+
+                if (!PageAuth::personelFirmadaMi($kisitFirmaId, $personelId)) {
+                    echo json_encode(['success' => false, 'message' => 'Bu personel üzerinde yetkiniz yok!']);
                     break;
                 }
                 

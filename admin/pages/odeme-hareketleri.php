@@ -35,6 +35,20 @@ if (!$pagePermissions['has_access']) {
 // Yetkileri $permissions değişkenine ata (HTML ve JavaScript için)
 $permissions = $pagePermissions;
 
+// YETKİ: firma_gor açıksa PERSONEL hareketleri personelin firmasına,
+// CARI hareketleri hareketi oluşturan kullanıcının firmasına göre süzülür
+$kisitFirmaId = PageAuth::firmaKisiti($pagePermissions, $user['kullanici_id']);
+if ($kisitFirmaId === null) {
+    $odemeKisitSql = '';
+    $odemeKisitParams = [];
+} elseif ($kisitFirmaId > 0) {
+    $odemeKisitSql = " AND (firma_id = ? OR (taraf_tipi = 'CARI' AND olusturan_id IN (SELECT kullanici_id FROM kullanicilar WHERE kullanici_firma_id = ?)))";
+    $odemeKisitParams = [$kisitFirmaId, $kisitFirmaId];
+} else {
+    $odemeKisitSql = " AND 1 = 0";
+    $odemeKisitParams = [];
+}
+
 // Mevcut sayfanın bilgilerini al
 $pageInfo = $db->fetchOne("
     SELECT 
@@ -64,6 +78,8 @@ $siteTitle = $siteAyarlari['site_ayarlari_site_title'] ?? 'Örnek Soft Portal';
  */
 function odemeHareketFiltresi(array $girdi)
 {
+    global $odemeKisitSql, $odemeKisitParams;
+
     $whereConditions = ["1=1"];
     $params = [];
 
@@ -130,7 +146,7 @@ function odemeHareketFiltresi(array $girdi)
         $params[] = "%$search%";
     }
 
-    return [implode(" AND ", $whereConditions), $params];
+    return [implode(" AND ", $whereConditions) . $odemeKisitSql, array_merge($params, $odemeKisitParams)];
 }
 
 // AJAX İşlemleri
@@ -156,7 +172,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         SUM(CASE WHEN odeme_tip_isaret = -1 THEN odeme_hareket_tutar ELSE 0 END) as toplam_gider,
                         SUM(odeme_hareket_tutar * odeme_tip_isaret) as net_bakiye
                     FROM vw_Odeme_Hareketleri_Detay
-                ");
+                    WHERE 1=1 $odemeKisitSql
+                ", $odemeKisitParams);
                 echo json_encode(['success' => true, 'data' => $stats]);
                 exit;
                 
@@ -290,7 +307,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 
                 $id = $_POST['id'] ?? 0;
-                
+
+                // Firma kısıtı: kayıt kullanıcının görebildiği kayıtlardan olmalı
+                if ($kisitFirmaId !== null) {
+                    $gorunur = $db->fetchOne(
+                        "SELECT odeme_hareket_id FROM vw_Odeme_Hareketleri_Detay WHERE odeme_hareket_id = ? $odemeKisitSql",
+                        array_merge([intval($id)], $odemeKisitParams)
+                    );
+                    if (!$gorunur) {
+                        echo json_encode(['success' => false, 'message' => 'Bu kayıt üzerinde yetkiniz yok!']);
+                        exit;
+                    }
+                }
+
                 // Soft delete (durum = 0)
                 $result = $db->update('Odeme_Hareketleri', 
                     ['odeme_hareket_durum' => 0, 'odeme_hareket_guncelleme_tarihi' => date('Y-m-d H:i:s')], 
@@ -305,6 +334,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 exit;
                 
             case 'get_personeller':
+                [$pSql, $pParams] = PageAuth::firmaKisitSql($kisitFirmaId, 'k.kullanici_firma_id');
                 $personeller = $db->fetchAll("
                     SELECT 
                         kullanici_id,
@@ -313,9 +343,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         kullanici_durum
                     FROM kullanicilar k
                     LEFT JOIN Departmanlar d ON k.kullanici_calisma_departman_id = d.departman_id
-                    WHERE d.departman_personel = 1
+                    WHERE d.departman_personel = 1 $pSql
                     ORDER BY kullanici_durum DESC, kullanici_ad, kullanici_soyad
-                ");
+                ", $pParams);
                 echo json_encode(['success' => true, 'data' => $personeller]);
                 exit;
                 
@@ -372,15 +402,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 exit;
 
             case 'get_banka_hesaplari':
+                [$bSql, $bParams] = PageAuth::firmaKisitSql($kisitFirmaId, 'h.bankaHesap_firma_id');
                 $hesaplar = $db->fetchAll("
                     SELECT
                         h.bankaHesap_id,
                         b.banka_adi + ' - ' + ISNULL(NULLIF(h.bankaHesap_iban, ''), ISNULL(h.bankaHesap_no, '')) as hesap_adi
                     FROM Banka_Hesap h
                     INNER JOIN bankalar b ON h.bankaHesap_banka_id = b.banka_id
-                    WHERE h.bankaHesap_durum = 1
+                    WHERE h.bankaHesap_durum = 1 $bSql
                     ORDER BY b.banka_adi, h.bankaHesap_iban
-                ");
+                ", $bParams);
                 echo json_encode(['success' => true, 'data' => $hesaplar]);
                 exit;
 

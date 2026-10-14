@@ -25,6 +25,19 @@ if (!$pagePermissions['has_access']) {
     PageAuth::accessDenied($pagePermissions['error'] ?? 'Bu sayfaya erişim yetkiniz bulunmamaktadır.');
 }
 
+// YETKİ: firma_gor açıksa yalnız kullanıcının firmasındaki personelin zimmetleri görülür/işlenir
+$kisitFirmaId = PageAuth::firmaKisiti($pagePermissions, $user['id']);
+[$firmaKisitSql, $firmaKisitParams] = PageAuth::firmaKisitSql($kisitFirmaId, 'p.kullanici_firma_id');
+
+// Zimmet kaydının personeli kısıtlı firmada mı?
+$zimmetFirmadaMi = function ($hareketId) use ($db, $kisitFirmaId) {
+    if ($kisitFirmaId === null) {
+        return true;
+    }
+    $kayit = $db->fetchOne("SELECT stok_hareket_personel_id FROM Stok_Hareket WHERE stok_hareket_id = ? AND stok_hareket_belge_tipi = 'ZIMMET'", [intval($hareketId)]);
+    return $kayit && PageAuth::personelFirmadaMi($kisitFirmaId, $kayit['stok_hareket_personel_id']);
+};
+
 // Mevcut sayfanın bilgilerini al
 $pageInfo = $db->fetchOne("
     SELECT 
@@ -54,14 +67,16 @@ $personeller = $db->fetchAll("
         d.departman_adi
     FROM kullanicilar k
     LEFT JOIN Departmanlar d ON k.kullanici_calisma_departman_id = d.departman_id
+    WHERE 1=1 " . PageAuth::firmaKisitSql($kisitFirmaId, 'k.kullanici_firma_id')[0] . "
     ORDER BY k.kullanici_durum DESC, k.kullanici_ad, k.kullanici_soyad
-");
+", $firmaKisitParams);
 
 // Zimmetlik ürünleri çek (kategori_id = 5: Fiziki SIM kart vb.)
 $kategoriler = $db->fetchAll("SELECT kategori_id, kategori_adi FROM Kategoriler WHERE kategori_durum = 1 ORDER BY kategori_adi");
 
-// Şubeleri çek
-$subeler = $db->fetchAll("SELECT sube_id, sube_adi FROM Subeler WHERE sube_durum = 1 ORDER BY sube_adi");
+// Şubeleri çek (kısıt varsa yalnız kendi firmasının şubeleri)
+[$sSql, $sParams] = PageAuth::firmaKisitSql($kisitFirmaId, 'sube_firma_id');
+$subeler = $db->fetchAll("SELECT sube_id, sube_adi FROM Subeler WHERE sube_durum = 1 $sSql ORDER BY sube_adi", $sParams);
 
 // AJAX İşlemleri
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -72,28 +87,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         switch ($action) {
             case 'stats':
                 // İstatistikler (ZIMMET belge tipli kayıtlar)
+                // Firma kısıtı varsa yalnız o firmanın personelinin zimmetleri sayılır
+                $kisitExists = $kisitFirmaId !== null
+                    ? " AND EXISTS (SELECT 1 FROM kullanicilar p WHERE p.kullanici_id = Stok_Hareket.stok_hareket_personel_id $firmaKisitSql)"
+                    : "";
+
                 $toplam = $db->fetchOne("
-                    SELECT COUNT(*) as sayi 
-                    FROM Stok_Hareket 
-                    WHERE stok_hareket_belge_tipi = 'ZIMMET' 
+                    SELECT COUNT(*) as sayi
+                    FROM Stok_Hareket
+                    WHERE stok_hareket_belge_tipi = 'ZIMMET'
                     AND stok_hareket_durum = 1
-                ")['sayi'] ?? 0;
-                
+                    $kisitExists
+                ", $firmaKisitParams)['sayi'] ?? 0;
+
                 $teslimEdildi = $db->fetchOne("
-                    SELECT COUNT(*) as sayi 
-                    FROM Stok_Hareket 
-                    WHERE stok_hareket_belge_tipi = 'ZIMMET' 
+                    SELECT COUNT(*) as sayi
+                    FROM Stok_Hareket
+                    WHERE stok_hareket_belge_tipi = 'ZIMMET'
                     AND stok_hareket_tipi = 1
                     AND stok_hareket_durum = 1
-                ")['sayi'] ?? 0;
-                
+                    $kisitExists
+                ", $firmaKisitParams)['sayi'] ?? 0;
+
                 $iadeAlindi = $db->fetchOne("
-                    SELECT COUNT(*) as sayi 
-                    FROM Stok_Hareket 
-                    WHERE stok_hareket_belge_tipi = 'ZIMMET' 
+                    SELECT COUNT(*) as sayi
+                    FROM Stok_Hareket
+                    WHERE stok_hareket_belge_tipi = 'ZIMMET'
                     AND stok_hareket_tipi = 0
                     AND stok_hareket_durum = 1
-                ")['sayi'] ?? 0;
+                    $kisitExists
+                ", $firmaKisitParams)['sayi'] ?? 0;
                 
                 $aktifZimmet = $teslimEdildi - $iadeAlindi;
                 
@@ -195,6 +218,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $sql .= " AND p.kullanici_durum = 0 AND ISNULL(pz.net_miktar, 0) > 0";
                 }
 
+                $sql .= $firmaKisitSql;
+                $params = array_merge($params, $firmaKisitParams);
+
                 $sql .= " ORDER BY sh.stok_hareket_tarihi DESC, sh.stok_hareket_id DESC";
                 
                 $data = $db->fetchAll($sql, $params);
@@ -203,6 +229,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
             case 'get':
                 $id = $_POST['id'] ?? 0;
+                if (!$zimmetFirmadaMi($id)) {
+                    echo json_encode(['success' => false, 'message' => 'Bu kayıt üzerinde yetkiniz yok!']);
+                    break;
+                }
                 $data = $db->fetchOne("
                     SELECT * 
                     FROM Stok_Hareket 
@@ -226,7 +256,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $miktar = floatval($_POST['miktar'] ?? 1);
                 $tarih = !empty($_POST['tarih']) ? $_POST['tarih'] : date('Y-m-d H:i:s');
                 $aciklama = trim($_POST['aciklama'] ?? '');
-                
+
+                if (!PageAuth::personelFirmadaMi($kisitFirmaId, $personelId)
+                    || ($id > 0 && !$zimmetFirmadaMi($id))) {
+                    echo json_encode(['success' => false, 'message' => 'Bu personel üzerinde işlem yetkiniz yok!']);
+                    break;
+                }
+
                 // Tarih formatını doğrula ve düzelt
                 if (!empty($tarih)) {
                     // datetime-local formatı: 2026-01-08T10:30 -> 2026-01-08 10:30:00
@@ -340,6 +376,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         continue;
                     }
 
+                    if (!PageAuth::personelFirmadaMi($kisitFirmaId, $kayit['stok_hareket_personel_id'])) {
+                        $atlananlar[] = '#' . $hid . ': yetkiniz yok';
+                        continue;
+                    }
+
                     $etiket = $kayit['urun_hizmet_adi'];
                     $seriNo = trim((string)($kayit['stok_hareket_seri_no'] ?? ''));
                     if ($seriNo !== '') {
@@ -431,6 +472,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 
                 $id = $_POST['id'] ?? 0;
+                if (!$zimmetFirmadaMi($id)) {
+                    echo json_encode(['success' => false, 'message' => 'Bu kayıt üzerinde yetkiniz yok!']);
+                    break;
+                }
                 $db->update('Stok_Hareket', ['stok_hareket_durum' => 0], ['stok_hareket_id' => $id]);
                 echo json_encode(['success' => true, 'message' => 'Zimmet kaydı silindi!']);
                 break;
@@ -493,13 +538,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             WHEN sh.stok_hareket_tipi = 0 THEN 'stokta'
                             WHEN sh.stok_hareket_tipi = 1 THEN 'zimmetli'
                         END as durum,
-                        k.kullanici_ad + ' ' + k.kullanici_soyad as zimmetli_personel
+                        k.kullanici_ad + ' ' + k.kullanici_soyad as zimmetli_personel,
+                        k.kullanici_firma_id
                     FROM SonHareketler sh
                     LEFT JOIN kullanicilar k ON sh.stok_hareket_personel_id = k.kullanici_id
                     WHERE sh.rn = 1
                     ORDER BY sh.stok_hareket_seri_no
                 ", [$urunId]);
-                
+
+                // Firma kısıtı: başka firmadaki personelin adı gösterilmez
+                foreach ($seriNumaralari as &$seri) {
+                    if ($kisitFirmaId !== null && $seri['zimmetli_personel'] !== null
+                        && (int)$seri['kullanici_firma_id'] !== $kisitFirmaId) {
+                        $seri['zimmetli_personel'] = 'Başka firma personeli';
+                    }
+                    unset($seri['kullanici_firma_id']);
+                }
+                unset($seri);
+
                 echo json_encode(['success' => true, 'data' => $seriNumaralari]);
                 break;
                 

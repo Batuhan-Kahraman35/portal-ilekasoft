@@ -23,6 +23,10 @@ if (!$pagePermissions['has_access']) {
     PageAuth::accessDenied($pagePermissions['error'] ?? 'Bu sayfaya erişim yetkiniz bulunmamaktadır.');
 }
 
+// YETKİ: firma_gor açıksa yalnız kullanıcının firmasındaki personel hesaplanır/görülür
+$kisitFirmaId = PageAuth::firmaKisiti($pagePermissions, $user['kullanici_id']);
+[$firmaKisitSql, $firmaKisitParams] = PageAuth::firmaKisitSql($kisitFirmaId, 'k.kullanici_firma_id');
+
 // Mevcut sayfanın bilgilerini al
 $pageInfo = $db->fetchOne("
     SELECT 
@@ -58,11 +62,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $action = $_POST['action'] ?? '';
         
         if ($action === 'stats') {
+            $kisitExists = $kisitFirmaId !== null
+                ? " AND EXISTS (SELECT 1 FROM kullanicilar k WHERE k.kullanici_id = pp.puantaj_kullanici_id $firmaKisitSql)"
+                : "";
             $stats = [
-                'toplam_personel' => $db->fetchOne("SELECT COUNT(*) as sayi FROM kullanicilar WHERE kullanici_durum = 1")['sayi'] ?? 0,
-                'puantaj_var' => $db->fetchOne("SELECT COUNT(DISTINCT puantaj_kullanici_id) as sayi FROM Personel_Puantaj WHERE puantaj_aktif = 1")['sayi'] ?? 0,
-                'toplam_maas' => $db->fetchOne("SELECT ISNULL(SUM(kullanici_maas), 0) as toplam FROM kullanicilar WHERE kullanici_durum = 1 AND kullanici_maas IS NOT NULL")['toplam'] ?? 0,
-                'bekleyen' => $db->fetchOne("SELECT COUNT(*) as sayi FROM kullanicilar WHERE kullanici_durum = 1 AND kullanici_puantaj_donem_id IS NULL")['sayi'] ?? 0
+                'toplam_personel' => $db->fetchOne("SELECT COUNT(*) as sayi FROM kullanicilar k WHERE k.kullanici_durum = 1 $firmaKisitSql", $firmaKisitParams)['sayi'] ?? 0,
+                'puantaj_var' => $db->fetchOne("SELECT COUNT(DISTINCT pp.puantaj_kullanici_id) as sayi FROM Personel_Puantaj pp WHERE pp.puantaj_aktif = 1 $kisitExists", $firmaKisitParams)['sayi'] ?? 0,
+                'toplam_maas' => $db->fetchOne("SELECT ISNULL(SUM(k.kullanici_maas), 0) as toplam FROM kullanicilar k WHERE k.kullanici_durum = 1 AND k.kullanici_maas IS NOT NULL $firmaKisitSql", $firmaKisitParams)['toplam'] ?? 0,
+                'bekleyen' => $db->fetchOne("SELECT COUNT(*) as sayi FROM kullanicilar k WHERE k.kullanici_durum = 1 AND k.kullanici_puantaj_donem_id IS NULL $firmaKisitSql", $firmaKisitParams)['sayi'] ?? 0
             ];
             
             echo json_encode(['success' => true, 'data' => $stats]);
@@ -76,6 +83,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             
             if (!$kullanici_id || $tutar <= 0) {
                 echo json_encode(['success' => false, 'message' => 'Geçersiz bilgiler']);
+                exit;
+            }
+            if (!PageAuth::personelFirmadaMi($kisitFirmaId, $kullanici_id)) {
+                echo json_encode(['success' => false, 'message' => 'Bu personel üzerinde işlem yetkiniz yok']);
                 exit;
             }
             
@@ -206,8 +217,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $params[] = "%$search%";
                 $params[] = "%$search%";
             }
-            
-            $whereClause = implode(" AND ", $whereConditions);
+
+            $whereClause = implode(" AND ", $whereConditions) . $firmaKisitSql;
+            $params = array_merge($params, $firmaKisitParams);
             
             // Her kullanıcı için izin durumlarına göre puantaj sayılarını al
             $sql = "
@@ -500,6 +512,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(['success' => false, 'message' => 'Eksik parametreler']);
                 exit;
             }
+            if (!PageAuth::personelFirmadaMi($kisitFirmaId, $kullanici_id)) {
+                echo json_encode(['success' => false, 'message' => 'Bu personel üzerinde yetkiniz yok']);
+                exit;
+            }
             
             // Dönem bilgilerini çek
             $donemBilgi = $db->fetchOne(
@@ -735,6 +751,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(['success' => false, 'message' => 'Eksik parametreler']);
                 exit;
             }
+            if (!PageAuth::personelFirmadaMi($kisitFirmaId, $kullanici_id)) {
+                echo json_encode(['success' => false, 'message' => 'Bu personel üzerinde yetkiniz yok']);
+                exit;
+            }
             
             // Tarih aralığını hesapla
             $baslangicTarihi = sprintf('%04d-%02d-01', $hesaplama_yil, $hesaplama_ay);
@@ -826,13 +846,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         
         if ($action === 'get_firmalar') {
-            $firmalar = $db->fetchAll("SELECT firma_id, firma_adi FROM Firmalar WHERE firma_durum = 1 ORDER BY firma_adi");
+            [$fSql, $fParams] = PageAuth::firmaKisitSql($kisitFirmaId, 'firma_id');
+            $firmalar = $db->fetchAll("SELECT firma_id, firma_adi FROM Firmalar WHERE firma_durum = 1 $fSql ORDER BY firma_adi", $fParams);
             echo json_encode(['success' => true, 'data' => $firmalar]);
             exit;
         }
 
         if ($action === 'get_subeler') {
-            $subeler = $db->fetchAll("SELECT sube_id, sube_adi FROM Subeler WHERE sube_durum = 1 ORDER BY sube_adi");
+            [$sSql, $sParams] = PageAuth::firmaKisitSql($kisitFirmaId, 'sube_firma_id');
+            $subeler = $db->fetchAll("SELECT sube_id, sube_adi FROM Subeler WHERE sube_durum = 1 $sSql ORDER BY sube_adi", $sParams);
             echo json_encode(['success' => true, 'data' => $subeler]);
             exit;
         }
