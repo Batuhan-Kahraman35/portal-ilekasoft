@@ -249,6 +249,7 @@ function gorevCalistir(string $gorevKodu, array $params, $db): array
         'faturam_senkron'       => 'gorevFaturamSenkron',
         'banka_senkron'         => 'gorevBankaSenkron',
         'banka_whatsapp_bildirim' => 'gorevBankaWhatsappBildirim',
+        'aras_kargo_senkron'    => 'gorevArasKargoSenkron',
     ];
 
     if (!isset($eslesme[$gorevKodu])) {
@@ -837,4 +838,37 @@ function gorevBankaWhatsappBildirim(array $params, $db): array
     $sonuc = cronHariciSurec('BankaWhatsappBildirim.php', $argumanlar, 600);
 
     return cronSurecSonucu($sonuc, 'WhatsApp bildirimi tamamlandi');
+}
+
+// ================================================================
+// GÖREV: aras_kargo_senkron
+// Son N günün giden (QT13) ve gelen (QT30) kargolarını kargo_gonderiler'e
+// ekler / günceller; takip no bekleyen portal gönderilerini eşler.
+// params: gun (varsayılan 30, en fazla 90), kanal_id (boşsa ilk aktif kanal)
+// ================================================================
+function gorevArasKargoSenkron(array $params, $db): array
+{
+    require_once __DIR__ . '/../includes/ArasKargo.php';
+
+    ob_start();
+
+    $kanalId = !empty($params['kanal_id']) ? (int)$params['kanal_id'] : null;
+    $aras = new ArasKargo($db, $kanalId, 1, 'CRON');
+
+    if (!$aras->hazirMi()) {
+        echo "[HATA] " . $aras->getHata() . "\n";
+        return ['durum' => 2, 'sonuc' => $aras->getHata(), 'cikti' => ob_get_clean()];
+    }
+
+    $gun = (int)($params['gun'] ?? 30);
+    echo "[..] Kanal: " . $aras->kanalAd() . " | Son {$gun} gun\n";
+
+    $r = $aras->senkronize($gun);
+    echo ($r['success'] ? '[OK] ' : '[HATA] ') . $r['message'] . "\n";
+
+    return [
+        'durum' => $r['success'] ? 1 : 2,
+        'sonuc' => $r['message'],
+        'cikti' => ob_get_clean(),
+    ];
 }

@@ -16,7 +16,7 @@ $siteAyarlari = $db->fetchOne("SELECT TOP 1 site_ayarlari_site_title FROM dbo.ta
 $siteTitle = $siteAyarlari['site_ayarlari_site_title'] ?? 'Örnek Soft Portal';
 
 // Bağlantı testi desteklenen entegrasyonlar (Entegrasyonlar_Ad değerleri)
-const TEST_EDILEBILIR = ['ÖRNEK HOLDİNG', 'Destek Sistemi', 'Cloudflare', 'SMS', 'Whatsapp (Evolution API)', 'E-Posta (SMTP)', 'Google Workspace'];
+const TEST_EDILEBILIR = ['ÖRNEK HOLDİNG', 'Destek Sistemi', 'Cloudflare', 'SMS', 'Whatsapp (Evolution API)', 'E-Posta (SMTP)', 'Google Workspace', 'Aras Kargo'];
 
 // Log listesinde tek seferde çekilecek en fazla satır.
 // Not: Istek/Cevap kolonları listede seçilmez; yalnız detay penceresinde okunur.
@@ -727,6 +727,89 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         } else {
                             $hataVar = true;
                             $satirlar[] = ['etiket' => 'Lisanslar', 'ok' => false, 'mesaj' => $r['message']];
+                        }
+                        break;
+
+                    // ---------------- Aras Kargo ----------------
+                    // Entegrasyon ayarı: SiparisURL, TakipURL
+                    // Kanal: Kullanıcı Adı, Şifre, AyarJSON → MusteriKodu
+                    // Var olmayan entegrasyon koduyla sorgu yapılır; gönderi OLUŞTURULMAZ.
+                    case 'Aras Kargo':
+                        $entAyar   = json_decode($kanal['Entegrasyonlar_AyarJSON'] ?? '{}', true) ?: [];
+                        $kanalAyar = json_decode($kanal['EntegrasyonKanallari_AyarJSON'] ?? '{}', true) ?: [];
+
+                        $siparisUrl  = trim((string)($entAyar['SiparisURL'] ?? ''));
+                        $takipUrl    = trim((string)($entAyar['TakipURL'] ?? ''));
+                        $kullanici   = trim((string)$kanal['EntegrasyonKanallari_KullaniciAdi']);
+                        $sifre       = (string)$kanal['EntegrasyonKanallari_Sifre'];
+                        $musteriKodu = trim((string)($kanalAyar['MusteriKodu'] ?? ''));
+
+                        if ($siparisUrl === '' || $takipUrl === '') {
+                            echo json_encode(['success' => false, 'message' => 'Entegrasyon ayarında SiparisURL veya TakipURL tanımlı değil.']);
+                            break 2;
+                        }
+                        if ($kullanici === '' || $sifre === '' || $musteriKodu === '') {
+                            echo json_encode(['success' => false, 'message' => 'Kanalda Kullanıcı Adı, Şifre veya AyarJSON → MusteriKodu boş.']);
+                            break 2;
+                        }
+
+                        $satirlar[] = ['etiket' => 'Müşteri kodu', 'ok' => true, 'mesaj' => $musteriKodu];
+
+                        $soapGonder = function (string $url, string $action, string $govde): array {
+                            $ch = curl_init($url);
+                            curl_setopt_array($ch, [
+                                CURLOPT_RETURNTRANSFER => true,
+                                CURLOPT_POST           => true,
+                                CURLOPT_POSTFIELDS     => $govde,
+                                CURLOPT_HTTPHEADER     => ['Content-Type: text/xml; charset=utf-8', 'SOAPAction: "' . $action . '"'],
+                                CURLOPT_CONNECTTIMEOUT => 10,
+                                CURLOPT_TIMEOUT        => 30,
+                            ]);
+                            $res  = curl_exec($ch);
+                            $err  = curl_error($ch);
+                            $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                            curl_close($ch);
+                            return ['res' => (string)$res, 'err' => $err, 'code' => $code];
+                        };
+                        $x = fn(string $s) => htmlspecialchars($s, ENT_XML1 | ENT_QUOTES, 'UTF-8');
+
+                        // 1) Gönderi servisi: kimlik doğruysa "Kayıt Bulunamadı", yanlışsa boş sonuç döner
+                        $r = $soapGonder($siparisUrl, 'http://tempuri.org/GetOrderWithIntegrationCode',
+                            '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>'
+                            . '<GetOrderWithIntegrationCode xmlns="http://tempuri.org/">'
+                            . '<userName>' . $x($kullanici) . '</userName><password>' . $x($sifre) . '</password>'
+                            . '<integrationCode>0000000000</integrationCode>'
+                            . '</GetOrderWithIntegrationCode></soap:Body></soap:Envelope>');
+
+                        if ($r['err'] !== '' || $r['code'] !== 200) {
+                            $hataVar = true;
+                            $satirlar[] = ['etiket' => 'Gönderi servisi', 'ok' => false, 'mesaj' => $r['err'] ?: ('HTTP ' . $r['code'])];
+                        } elseif (stripos($r['res'], '<Order>') !== false) {
+                            $satirlar[] = ['etiket' => 'Gönderi servisi', 'ok' => true, 'mesaj' => 'Kimlik doğrulandı'];
+                        } else {
+                            $hataVar = true;
+                            $satirlar[] = ['etiket' => 'Gönderi servisi', 'ok' => false, 'mesaj' => 'Kimlik reddedildi — kullanıcı adı / şifre kontrol edin.'];
+                        }
+
+                        // 2) Takip servisi: kimlik doğruysa HTTP 200, yanlışsa HTTP 500 (Fault) döner
+                        $login = '<LoginInfo><UserName>' . $x($kullanici) . '</UserName><Password>' . $x($sifre) . '</Password>'
+                               . '<CustomerCode>' . $x($musteriKodu) . '</CustomerCode></LoginInfo>';
+                        $sorgu = '<QueryInfo><QueryType>1</QueryType><IntegrationCode>0000000000</IntegrationCode></QueryInfo>';
+
+                        $r = $soapGonder($takipUrl, 'http://tempuri.org/IArasCargoIntegrationService/GetQueryXML',
+                            '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>'
+                            . '<GetQueryXML xmlns="http://tempuri.org/">'
+                            . '<loginInfo>' . $x($login) . '</loginInfo><queryInfo>' . $x($sorgu) . '</queryInfo>'
+                            . '</GetQueryXML></soap:Body></soap:Envelope>');
+
+                        if ($r['err'] !== '') {
+                            $hataVar = true;
+                            $satirlar[] = ['etiket' => 'Takip servisi', 'ok' => false, 'mesaj' => $r['err']];
+                        } elseif ($r['code'] === 200 && stripos($r['res'], 'GetQueryXMLResult') !== false) {
+                            $satirlar[] = ['etiket' => 'Takip servisi', 'ok' => true, 'mesaj' => 'Kimlik doğrulandı'];
+                        } else {
+                            $hataVar = true;
+                            $satirlar[] = ['etiket' => 'Takip servisi', 'ok' => false, 'mesaj' => 'HTTP ' . $r['code'] . ' — kullanıcı adı / şifre / müşteri kodu kontrol edin.'];
                         }
                         break;
 
