@@ -7,9 +7,6 @@
 require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/includes/Mailer.php';
 
-// Türkiye timezone'u
-date_default_timezone_set('Europe/Istanbul');
-
 session_start();
 
 $db = Database::getInstance();

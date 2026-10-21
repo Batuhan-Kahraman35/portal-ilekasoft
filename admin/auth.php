@@ -4,9 +4,6 @@
  * Portal Örnek Soft
  */
 
-// Türkiye timezone'u
-date_default_timezone_set('Europe/Istanbul');
-
 // session_start() oncesi DB erisimi gerekir: oturum omru tanim_site_ayarlari'ndan okunur
 require_once __DIR__ . '/db.php';
 

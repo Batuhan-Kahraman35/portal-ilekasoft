@@ -6,9 +6,6 @@
 
 require_once __DIR__ . '/db.php';
 
-// Türkiye timezone'u
-date_default_timezone_set('Europe/Istanbul');
-
 session_start();
 
 $db = Database::getInstance();

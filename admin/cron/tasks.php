@@ -250,6 +250,7 @@ function gorevCalistir(string $gorevKodu, array $params, $db): array
         'banka_senkron'         => 'gorevBankaSenkron',
         'banka_whatsapp_bildirim' => 'gorevBankaWhatsappBildirim',
         'aras_kargo_senkron'    => 'gorevArasKargoSenkron',
+        'pazaryeri_senkron'     => 'gorevPazaryeriSenkron',
     ];
 
     if (!isset($eslesme[$gorevKodu])) {
@@ -869,6 +870,108 @@ function gorevArasKargoSenkron(array $params, $db): array
     return [
         'durum' => $r['success'] ? 1 : 2,
         'sonuc' => $r['message'],
+        'cikti' => ob_get_clean(),
+    ];
+}
+
+// ================================================================
+// GÖREV: pazaryeri_senkron
+// Aktif pazaryeri kanallarından sipariş ve/veya iade çeker (PazaryeriSiparisleri,
+// PazaryeriIadeler). Bir kanalın hatası diğerlerini durdurmaz.
+// Pasif firmaya bağlı kanallar atlanır (PazaryeriFabrika::kanallar).
+// params: tip      siparis | iade | hepsi        (varsayılan siparis)
+//         gun      geriye dönük gün sayısı        (varsayılan 2, en fazla 90)
+//         pazaryeri yalnız bu pazaryeri kodları   (virgüllü, örn. "trendyol,n11")
+//         haric    bu pazaryeri kodları hariç     (virgüllü)
+//         kanal_id yalnız bu kanal
+// ================================================================
+function gorevPazaryeriSenkron(array $params, $db): array
+{
+    require_once __DIR__ . '/../includes/PazaryeriFabrika.php';
+
+    ob_start();
+
+    $tip = in_array($params['tip'] ?? '', ['siparis', 'iade', 'hepsi'], true) ? $params['tip'] : 'siparis';
+    $gun = max(1, min(90, (int)($params['gun'] ?? 2)));
+    $kodListesi = fn($v) => array_filter(array_map('trim', explode(',', strtolower((string)$v))));
+    $yalniz = $kodListesi($params['pazaryeri'] ?? '');
+    $haric  = $kodListesi($params['haric'] ?? '');
+
+    $kanallar = PazaryeriFabrika::kanallar();
+    if (!empty($params['kanal_id'])) {
+        $kanallar = array_filter($kanallar, fn($k) => (int)$k['EntegrasyonKanallari_id'] === (int)$params['kanal_id']);
+    }
+    $kanallar = array_filter($kanallar, function ($k) use ($yalniz, $haric) {
+        $kod = strtolower((string)$k['Pazaryerleri_Kod']);
+        return (!$yalniz || in_array($kod, $yalniz, true)) && !in_array($kod, $haric, true);
+    });
+
+    echo "[..] Tip: {$tip} | Son {$gun} gun | " . count($kanallar) . " kanal\n";
+
+    $toplamSiparis = 0;
+    $toplamIade    = 0;
+    $hatalar       = [];
+
+    foreach ($kanallar as $k) {
+        $kanalId = (int)$k['EntegrasyonKanallari_id'];
+        $etiket  = $k['EntegrasyonKanallari_Ad'] . ' (#' . $kanalId . ')';
+
+        try {
+            $api = PazaryeriFabrika::olusturKanaldan($kanalId, 1);
+            if (!$api || !$api->hazirMi()) {
+                $hata = $api ? $api->getHata() : PazaryeriFabrika::sonHata();
+                echo "[HATA] {$etiket}: {$hata}\n";
+                $hatalar[] = $etiket;
+                continue;
+            }
+
+            $satir = [];
+            if ($tip !== 'iade' && $api->yetenek('siparis')) {
+                $r = $api->siparisleriSenkronla($gun);
+                if (!empty($r['basarili'])) {
+                    $toplamSiparis += (int)$r['adet'];
+                    $satir[] = 'siparis ' . (int)$r['adet'];
+                } else {
+                    $satir[] = 'siparis HATA: ' . $r['hata'];
+                    $hatalar[] = $etiket;
+                }
+            }
+            if ($tip !== 'siparis' && $api->yetenek('iade')) {
+                $r = $api->iadeleriSenkronla($gun);
+                if (!empty($r['basarili'])) {
+                    $toplamIade += (int)$r['adet'];
+                    $satir[] = 'iade ' . (int)$r['adet'];
+                } else {
+                    $satir[] = 'iade HATA: ' . $r['hata'];
+                    $hatalar[] = $etiket;
+                }
+            }
+
+            // Komisyon finans servisinden gelir (yalnız teslim edilenler); tam senkronda çalışır
+            if ($tip === 'hepsi' && $api->yetenek('komisyon')) {
+                $r = $api->komisyonlariSenkronla($gun);
+                if (!empty($r['basarili'])) {
+                    $satir[] = 'komisyon ' . (int)$r['adet'] . ' kalem';
+                } else {
+                    $satir[] = 'komisyon HATA: ' . $r['hata'];
+                    $hatalar[] = $etiket;
+                }
+            }
+
+            echo ($satir ? '[OK] ' : '[--] ') . $etiket . ': ' . ($satir ? implode(' | ', $satir) : 'yetenek yok') . "\n";
+        } catch (Throwable $e) {
+            echo "[HATA] {$etiket}: " . get_class($e) . ': ' . $e->getMessage() . "\n";
+            $hatalar[] = $etiket;
+        }
+    }
+
+    $hatalar = array_unique($hatalar);
+    $ozet = "Siparis: {$toplamSiparis}, iade: {$toplamIade}"
+          . ($hatalar ? ' | Hatali kanal: ' . implode(', ', $hatalar) : '');
+
+    return [
+        'durum' => $hatalar ? 2 : 1,
+        'sonuc' => $ozet,
         'cikti' => ob_get_clean(),
     ];
 }

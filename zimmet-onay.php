@@ -11,7 +11,6 @@
  *  - Hatali TC denemesi sayilir, limitte kayit kilitlenir
  */
 
-date_default_timezone_set('Europe/Istanbul');
 require_once __DIR__ . '/admin/includes/ZimmetOnay.php';
 
 $zimmetOnay = new ZimmetOnay();
