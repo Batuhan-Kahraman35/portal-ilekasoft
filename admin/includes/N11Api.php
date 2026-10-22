@@ -29,6 +29,14 @@ class N11Api extends PazaryeriApi
     /** SOAP şema ad alanı */
     const SOAP_NS = 'http://www.n11.com/ws/schemas';
 
+    /**
+     * Senkron sayfa boyutu. DetailedOrderList ardışık çağrıyı reddeder
+     * ("detailedOrders belli süre aralıklarıyla güncellenebilir"); 50'lik sayfalarla
+     * ikinci sayfa hep bu hataya düşüyordu. 200 canlıda kabul edildi (22.10.2026),
+     * böylece senkron çoğu kanalda tek istekte biter.
+     */
+    const SENKRON_SAYFA_BOYUTU = 200;
+
     public function __construct($userId = null, $kanalId = null)
     {
         parent::__construct('n11', $userId, $kanalId);
@@ -239,7 +247,7 @@ class N11Api extends PazaryeriApi
 
         do {
             $sonuc = $this->siparisleriListele(
-                ['startDate' => $baslangic, 'endDate' => $bitis], $sayfa, 50);
+                ['startDate' => $baslangic, 'endDate' => $bitis], $sayfa, self::SENKRON_SAYFA_BOYUTU);
 
             if (!$sonuc['basarili']) {
                 return ['basarili' => false, 'hata' => $sonuc['hata'], 'adet' => $toplam];
@@ -296,7 +304,7 @@ class N11Api extends PazaryeriApi
             'disId'          => (string)($s['id'] ?? ($s['orderNumber'] ?? '')),
             'siparisNo'      => (string)($s['orderNumber'] ?? ''),
             'paketNo'        => null,   // n11'de paket kavramı yok
-            'durumKod'       => $this->siparisDurumKodu($s['status'] ?? ''),
+            'durumKod'       => $this->kalemlerdenDurum($kalemler) ?? $this->siparisDurumKodu($s['status'] ?? ''),
             'hamDurum'       => is_scalar($s['status'] ?? null) ? (string)$s['status'] : null,
             'toplamTutar'    => isset($s['totalAmount']) ? (float)$s['totalAmount'] : null,
             'paraBirimi'     => 'TRY',
@@ -365,11 +373,49 @@ class N11Api extends PazaryeriApi
             case 'new': case 'created': case '1':      return 'yeni';
             case 'approved': case 'picking': case '2': return 'hazirlaniyor';
             case 'shipped': case '3':                  return 'kargoda';
-            case 'delivered': case 'completed':        return 'teslim';
+            case 'delivered': case 'completed': case '5': return 'teslim';
             case 'rejected': case 'cancelled':         return 'iptal';
             case 'returned': case 'claim':             return 'iade';
             default:                                   return 'diger';
         }
+    }
+
+    /**
+     * Sipariş düzeyindeki durum ayrım yapmaz ('2' = İşlemde; kargoda ve teslim
+     * edilmiş siparişler de böyle gelir). Gerçek aşama kalemlerdedir.
+     * Kalem durumları: 1 İşlem bekliyor, 2 Ödendi, 3 Geçersiz, 4 İptal, 5 Kabul edildi,
+     * 6 Kargoda, 7 Teslim edildi, 8 Reddedildi, 9 İade edildi, 10 Tamamlandı
+     * (6/7/10 canlı veriyle doğrulandı, 22.10.2026).
+     * İptal olmayan kalemlerin en GERİDEKİ aşaması alınır; hepsi iptalse iptal.
+     * Kalem durumu çözülemezse null döner, sipariş düzeyi eşlemesi kullanılır.
+     */
+    private function kalemlerdenDurum(array $kalemler)
+    {
+        $harita = [
+            '1' => 'yeni', '2' => 'yeni', '5' => 'hazirlaniyor', '6' => 'kargoda',
+            '7' => 'teslim', '10' => 'teslim', '9' => 'iade',
+            '3' => 'iptal', '4' => 'iptal', '8' => 'iptal'
+        ];
+        $sira = ['yeni' => 1, 'hazirlaniyor' => 2, 'kargoda' => 3, 'teslim' => 4, 'iade' => 5];
+
+        $kodlar = [];
+        foreach ($kalemler as $k) {
+            $kod = $harita[(string)($k['hamDurum'] ?? '')] ?? null;
+            if ($kod === null) {
+                return null;
+            }
+            $kodlar[] = $kod;
+        }
+        if (!$kodlar) {
+            return null;
+        }
+
+        $aktif = array_values(array_filter($kodlar, fn($d) => $d !== 'iptal'));
+        if (!$aktif) {
+            return 'iptal';
+        }
+        usort($aktif, fn($a, $b) => $sira[$a] <=> $sira[$b]);
+        return $aktif[0];
     }
 
     /**

@@ -402,6 +402,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $ayarlar[$anahtar] = $deger;
                 }
 
+                // Zorunlu kimlik alanı ne formda ne kayıtta varsa kanal kaydedilmez;
+                // aksi halde hata ancak bağlantı testinde/cron'da ortaya çıkar.
+                foreach (PazaryeriFabrika::kimlikAlanlari($pazaryeriKod) as $alan) {
+                    if (!empty($alan['zorunlu']) && trim((string)($ayarlar[$alan['anahtar']] ?? '')) === '') {
+                        $cik(['success' => false, 'message' => ($alan['etiket'] ?? $alan['anahtar']) . ' zorunludur.']);
+                    }
+                }
+
                 $veri = [
                     'EntegrasyonKanallari_Ad'                   => $kanalAdi,
                     'EntegrasyonKanallari_AyarJSON'             => json_encode($ayarlar, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),

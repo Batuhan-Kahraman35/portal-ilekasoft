@@ -6,9 +6,11 @@
  * özgü uç yolları, sayfalama ve alan eşlemesi bulunur.
  *
  * ÜÇ ÖNEMLİ FARK:
- *   1. SAYFA NUMARASI 1'DEN BAŞLAR. Ortak katman 0 tabanlı çalışır;
- *      dönüşüm bu sınıfta yapılır. 0 gönderilirse API
- *      "page.should.be.greater.than.zero" hatası döndürür.
+ *   1. SAYFA NUMARASI UCA GÖRE DEĞİŞİR. Ürün ucu (/Products, Page) 1'den başlar;
+ *      0 gönderilirse "page.should.be.greater.than.zero" döner. Sipariş ucu
+ *      (/Order/GetOrders, page) ise 0'dan başlar: 1 gönderilirse ikinci sayfa
+ *      istenir, sonuç tek sayfaysa liste BOŞ gelir ama orderListCount dolu
+ *      görünür (22.10.2026 canlı doğrulandı).
  *   2. TEKRAR KORUMASI: Aynı uca AYNI PARAMETRELERLE yapılan istek
  *      10 DAKİKA boyunca reddedilir ("Limit aşımı! Bu endpointe aynı
  *      isteği 10 dakikada..."). Farklı parametreli istekler sorunsuzdur;
@@ -110,12 +112,6 @@ class CicekSepetiApi extends PazaryeriApi
         return parent::hataMesajiCoz($httpKod, $veri, $hamYanit);
     }
 
-    /** Ortak katman 0 tabanlı sayfalar; Çiçeksepeti 1 tabanlı ister */
-    private function sayfaNo($sayfa)
-    {
-        return max(1, (int)$sayfa + 1);
-    }
-
     /** Yanıttaki uyarı mesajını log'a düşür (istek başarılı olsa bile) */
     private function uyariKontrol($veri)
     {
@@ -156,13 +152,15 @@ class CicekSepetiApi extends PazaryeriApi
     /**
      * Siparişleri listele.
      * DİKKAT: Bu uç POST ister; GET denenirse HTTP 405 döner.
-     * Gövde alan adları küçük harfle başlar (page, pageSize).
+     * Gövde alan adları küçük harfle başlar (page, pageSize). Sayfa 0 TABANLIDIR.
+     * Yanıttaki her kayıt bir sipariş KALEMİDİR (orderItemId); aynı orderId'li
+     * kalemler senkronda tek siparişte toplanır.
      */
     public function siparisleriListele(array $filtre = [], $sayfa = 0, $boyut = 50)
     {
         $govde = [
-            'page'     => $this->sayfaNo($sayfa),
-            'pageSize' => (int)$boyut
+            'page'     => max(0, (int)$sayfa),
+            'pageSize' => max(1, min(100, (int)$boyut))
         ];
 
         if (!empty($filtre['startDate'])) {
@@ -194,7 +192,7 @@ class CicekSepetiApi extends PazaryeriApi
         $this->uyariKontrol($sonuc['veri']);
 
         $veri  = $sonuc['veri'] ?? [];
-        $liste = $veri['orders'] ?? ($veri['orderList'] ?? ($veri['data'] ?? []));
+        $liste = $veri['supplierOrderListWithBranch'] ?? [];
 
         return [
             'basarili'    => true,
@@ -207,7 +205,8 @@ class CicekSepetiApi extends PazaryeriApi
 
     /**
      * Siparişleri çek ve kaydet.
-     * Tarih aralığı sınırlı olduğu için dilimlenerek istenir.
+     * Tarih aralığı sınırlı olduğu için dilimlenerek istenir. Kalemler orderId'ye
+     * göre dilim sonunda toplanır: bir siparişin kalemleri sayfalara bölünebilir.
      */
     public function siparisleriSenkronla($gunSayisi = 14)
     {
@@ -216,97 +215,162 @@ class CicekSepetiApi extends PazaryeriApi
         $toplam    = 0;
 
         foreach ($this->tarihDilimle($baslangic, $bitis, self::SIPARIS_GUN_SINIRI) as $dilim) {
-            $sayfa = 0;
+            $gruplar = [];
+            $sayfa   = 0;
             do {
                 $sonuc = $this->siparisleriListele([
                     'startDate' => $dilim['bas'],
                     'endDate'   => $dilim['bit']
-                ], $sayfa, 50);
+                ], $sayfa, 100);
 
                 if (!$sonuc['basarili']) {
                     return ['basarili' => false, 'hata' => $sonuc['hata'], 'adet' => $toplam];
                 }
 
-                foreach ($sonuc['siparisler'] as $s) {
-                    if ($this->siparisKaydet($this->siparisNotrle($s))) {
-                        $toplam++;
-                    }
+                foreach ($sonuc['siparisler'] as $kalem) {
+                    $gruplar[(string)($kalem['orderId'] ?? '')][] = $kalem;
                 }
 
                 $sayfa++;
             } while ($sayfa < (int)($sonuc['toplamSayfa'] ?? 0) && $sayfa < 50);
+
+            unset($gruplar['']);
+            foreach ($gruplar as $kalemler) {
+                if ($this->siparisKaydet($this->siparisNotrle($kalemler))) {
+                    $toplam++;
+                }
+            }
         }
 
         return ['basarili' => true, 'hata' => '', 'adet' => $toplam];
     }
 
     /**
-     * Çiçeksepeti siparişi → nötr sipariş.
-     * NOT: Alan adları canlı veriyle doğrulanmamıştır (mağazada sipariş yoktu);
-     * yaygın adlar sırayla denenerek yazılmıştır.
+     * Çiçeksepeti sipariş kalemleri (aynı orderId) → nötr sipariş.
+     * Alanlar 22.10.2026'da canlı veriyle doğrulandı. Sipariş düzeyi bilgi
+     * (alıcı, fatura, tarih) her kalemde tekrar eder; ilk kalemden alınır.
+     * sender* alanları siparişi veren (fatura) tarafıdır, receiver* teslim alan.
      */
-    private function siparisNotrle(array $s)
+    private function siparisNotrle(array $kalemListesi)
     {
+        $s = $kalemListesi[0];
+
         $kalemler = [];
-        foreach ($s['items'] ?? ($s['orderItems'] ?? []) as $it) {
+        $tutar    = 0.0;
+        foreach ($kalemListesi as $it) {
+            $satir = isset($it['totalPrice']) ? (float)$it['totalPrice'] : null;
+            $tutar += (float)$satir;
+
             $kalemler[] = [
-                'disId'        => (string)($it['id'] ?? ($it['itemId'] ?? '')),
-                'barkod'       => $it['barcode']   ?? null,
-                'stokKodu'     => $it['stockCode'] ?? null,
+                'disId'        => (string)($it['orderItemId'] ?? ''),
+                'barkod'       => $it['barcode'] ?? null,
+                'stokKodu'     => $it['code']    ?? null,
                 'disUrunId'    => (string)($it['productCode'] ?? ''),
-                'urunAdi'      => $it['productName'] ?? null,
+                'urunAdi'      => trim(($it['name'] ?? '') . (!empty($it['variantName']) ? ' - ' . $it['variantName'] : '')) ?: null,
                 'miktar'       => (int)($it['quantity'] ?? 1),
-                'birimFiyat'   => isset($it['price'])      ? (float)$it['price']      : null,
-                'toplamTutar'  => isset($it['totalPrice']) ? (float)$it['totalPrice'] : null,
-                'komisyonOran' => $this->yuzdeCoz($it['commissionRate'] ?? null),
-                'hamDurum'     => $it['status'] ?? null,
+                'birimFiyat'   => isset($it['itemPrice']) ? (float)$it['itemPrice'] : null,
+                'toplamTutar'  => $satir,
+                'indirimTutar' => isset($it['discount']) ? (float)$it['discount'] : null,
+                'kdvOran'      => isset($it['tax']) ? (float)$it['tax'] : null,
+                'hamDurum'     => isset($it['orderItemStatusId']) ? (string)$it['orderItemStatusId'] : null,
                 'ham'          => $it
             ];
         }
 
-        $adres = $s['deliveryAddress'] ?? ($s['shippingAddress'] ?? []);
+        // senderTaxNumber: 11 hane → TCKN (bireysel), 10 hane → VKN (kurumsal)
+        $vergiNo = preg_replace('/\D/', '', (string)($s['senderTaxNumber'] ?? ''));
+
+        $teslimat = [
+            'ad'        => $s['receiverName']        ?? null,
+            'firma'     => $s['receiverCompanyName'] ?? null,
+            'telefon'   => $s['receiverPhone']       ?? null,
+            'adres'     => $s['receiverAddress']     ?? null,
+            'semt'      => $s['receiverRegion']      ?? null,
+            'ilce'      => $s['receiverDistrict']    ?? null,
+            'il'        => $s['receiverCity']        ?? null,
+            'postaKodu' => $s['zipCode']             ?? null
+        ];
+        $fatura = [
+            'ad'      => $s['senderName']        ?? null,
+            'firma'   => $s['senderCompanyName'] ?? null,
+            'telefon' => $s['senderPhone']       ?? null,
+            'adres'   => $s['senderAddress']     ?? null,
+            'semt'    => $s['senderRegion']      ?? null,
+            'ilce'    => $s['senderDistrict']    ?? null,
+            'il'      => $s['senderCity']        ?? null
+        ];
 
         return [
-            'disId'          => (string)($s['orderId'] ?? ($s['id'] ?? ($s['orderNumber'] ?? ''))),
-            'siparisNo'      => (string)($s['orderNumber'] ?? ''),
-            'paketNo'        => null,
-            'durumKod'       => $this->siparisDurumKodu($s['status'] ?? ($s['orderStatus'] ?? '')),
-            'hamDurum'       => is_scalar($s['status'] ?? null) ? (string)$s['status'] : null,
-            'toplamTutar'    => isset($s['totalPrice']) ? (float)$s['totalPrice'] : null,
-            'paraBirimi'     => 'TRY',
-            'musteriAdi'     => $s['customerName'] ?? ($s['buyerName'] ?? null),
-            'aliciAdi'       => $adres['name'] ?? ($s['receiverName'] ?? null),
-            'eposta'         => $s['email']  ?? null,
-            'telefon'        => $adres['phone'] ?? ($s['phone'] ?? null),
-            'tckn'           => $s['identityNumber'] ?? null,
-            'vergiNo'        => $s['taxNumber'] ?? null,
-            'vergiDairesi'   => $s['taxOffice'] ?? null,
-            'il'             => $adres['city']     ?? null,
-            'ilce'           => $adres['town']     ?? ($adres['district'] ?? null),
-            'semt'           => $adres['district'] ?? null,
-            'teslimatAdresi' => $adres,
-            'faturaAdresi'   => $s['invoiceAddress'] ?? [],
-            'kargoFirmasi'   => $s['cargoCompany']  ?? null,
-            'kargoTakipNo'   => $s['cargoTrackingNumber'] ?? null,
-            'siparisTarihi'  => $this->isoTarih($s['orderDate'] ?? ($s['createdDate'] ?? null)),
+            'disId'          => (string)($s['orderId'] ?? ''),
+            'siparisNo'      => (string)($s['orderId'] ?? ''),
+            'paketNo'        => count($kalemListesi) === 1 ? ($s['partialNumber'] ?? null) : null,
+            'durumKod'       => $this->kalemlerdenDurum($kalemListesi),
+            'hamDurum'       => $s['orderProductStatus'] ?? null,
+            'toplamTutar'    => $tutar,
+            'paraBirimi'     => $s['currency'] ?? 'TRY',
+            'musteriAdi'     => ($s['senderCompanyName'] ?? '') !== '' ? $s['senderCompanyName'] : ($s['senderName'] ?? null),
+            'aliciAdi'       => $s['receiverName'] ?? null,
+            'eposta'         => ($s['invoiceEmail'] ?? '') !== '' ? $s['invoiceEmail'] : ($s['senderEmail'] ?? null),
+            'telefon'        => $s['receiverPhone'] ?? ($s['senderPhone'] ?? null),
+            'tckn'           => strlen($vergiNo) === 11 ? $vergiNo : null,
+            'vergiNo'        => strlen($vergiNo) === 10 ? $vergiNo : null,
+            'vergiDairesi'   => $s['senderTaxOfficeName'] ?? null,
+            'il'             => $s['receiverCity']     ?? null,
+            'ilce'           => $s['receiverDistrict'] ?? null,
+            'semt'           => $s['receiverRegion']   ?? null,
+            'teslimatAdresi' => $teslimat,
+            'faturaAdresi'   => $fatura,
+            'kargoFirmasi'   => ($s['cargoCompany'] ?? '') !== '' ? $s['cargoCompany'] : null,
+            'kargoTakipNo'   => ($s['cargoNumber']  ?? '') !== '' ? $s['cargoNumber']  : null,
+            'siparisTarihi'  => $this->csTarih(($s['orderCreateDate'] ?? '') . ' ' . ($s['orderCreateTime'] ?? '')),
+            'tahminiTeslim'  => $this->csTarih($s['requestedDeliveryDate'] ?? null),
             'kalemler'       => $kalemler,
-            'ham'            => $s
+            'ham'            => $kalemListesi
         ];
     }
 
-    /** Komisyon oranı "%25" biçiminde METİN gelebilir */
-    private function yuzdeCoz($deger)
+    /** Sipariş tarihi "dd/MM/yyyy HH:mm", teslim tarihleri "dd-MM-yyyy [HH:mm]" gelir */
+    private function csTarih($metin)
     {
-        if ($deger === null || $deger === '') {
+        $metin = trim((string)$metin);
+        if ($metin === '') {
             return null;
         }
-        if (is_numeric($deger)) {
-            return (float)$deger;
+        foreach (['d/m/Y H:i', 'd/m/Y', 'd-m-Y H:i', 'd-m-Y'] as $bicim) {
+            $d = DateTime::createFromFormat('!' . $bicim, $metin);
+            if ($d) {
+                return $d->format('Y-m-d H:i:s');
+            }
         }
-        $temiz = str_replace(['%', ' ', ','], ['', '', '.'], (string)$deger);
-        return is_numeric($temiz) ? (float)$temiz : null;
+        return $this->isoTarih($metin);
     }
 
+    /**
+     * Kalem durumu (orderItemStatusId): 1 yeni, 2 hazırlanıyor, 11 kargoya verilecek,
+     * 5 kargoda, 7 teslim edildi (2/5/7 canlı doğrulandı). Bilinmeyen kimlikte
+     * orderProductStatus metni yorumlanır. İptal olmayan kalemlerin en GERİDEKİ
+     * aşaması alınır; hepsi iptalse iptal.
+     */
+    private function kalemlerdenDurum(array $kalemListesi)
+    {
+        $harita = ['1' => 'yeni', '2' => 'hazirlaniyor', '11' => 'hazirlaniyor', '5' => 'kargoda', '7' => 'teslim'];
+        $sira   = ['yeni' => 1, 'hazirlaniyor' => 2, 'kargoda' => 3, 'teslim' => 4, 'iade' => 5, 'diger' => 6];
+
+        $kodlar = [];
+        foreach ($kalemListesi as $it) {
+            $kodlar[] = $harita[(string)($it['orderItemStatusId'] ?? '')]
+                     ?? $this->siparisDurumKodu($it['orderProductStatus'] ?? '');
+        }
+
+        $aktif = array_values(array_filter($kodlar, fn($d) => $d !== 'iptal'));
+        if (!$aktif) {
+            return 'iptal';
+        }
+        usort($aktif, fn($a, $b) => $sira[$a] <=> $sira[$b]);
+        return $aktif[0];
+    }
+
+    /** Durum metni → kod. "Kargoya Verilecek" kargoda sayılmasın diye sıra önemlidir. */
     private function siparisDurumKodu($durum)
     {
         if (!is_scalar($durum)) {
@@ -314,14 +378,14 @@ class CicekSepetiApi extends PazaryeriApi
         }
         $d = mb_strtolower(trim((string)$durum));
 
-        if (strpos($d, 'yeni') !== false || strpos($d, 'new') !== false
-            || strpos($d, 'onay bekle') !== false)                     return 'yeni';
-        if (strpos($d, 'hazırla') !== false || strpos($d, 'preparing') !== false
-            || strpos($d, 'onaylandı') !== false)                      return 'hazirlaniyor';
-        if (strpos($d, 'kargo') !== false || strpos($d, 'shipped') !== false) return 'kargoda';
+        if (strpos($d, 'iptal') !== false || strpos($d, 'cancel') !== false)     return 'iptal';
+        if (strpos($d, 'iade') !== false || strpos($d, 'return') !== false)      return 'iade';
         if (strpos($d, 'teslim') !== false || strpos($d, 'delivered') !== false) return 'teslim';
-        if (strpos($d, 'iptal') !== false || strpos($d, 'cancel') !== false) return 'iptal';
-        if (strpos($d, 'iade') !== false || strpos($d, 'return') !== false) return 'iade';
+        if (strpos($d, 'yeni') !== false || strpos($d, 'new') !== false
+            || strpos($d, 'onay bekle') !== false)                               return 'yeni';
+        if (strpos($d, 'hazırla') !== false || strpos($d, 'preparing') !== false
+            || strpos($d, 'onaylandı') !== false || strpos($d, 'verilecek') !== false) return 'hazirlaniyor';
+        if (strpos($d, 'kargo') !== false || strpos($d, 'shipped') !== false)    return 'kargoda';
 
         return 'diger';
     }
