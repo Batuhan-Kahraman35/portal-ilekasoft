@@ -54,7 +54,15 @@ class WsseAuthHeader extends \SoapHeader
 class HalkbankService extends BaseBankaService
 {
     private ?\SoapClient $soapClient = null;
-    
+
+    /**
+     * 888: "Sorgu limiti asilmistir" (günlük kota, gece yarısı sıfırlanır)
+     */
+    protected function limitHataKodlari(): array
+    {
+        return ['888'];
+    }
+
     /**
      * SOAP Client oluştur (WSSE Auth ile)
      */
@@ -664,10 +672,15 @@ class HalkbankService extends BaseBankaService
         $toplamInserted = 0;
         $toplamSkipped = 0;
         $detaylar = [];
-        
+        $hatalar = [];
+
         foreach ($hesaplar['data'] as $hesap) {
             $result = $this->senkronizeHesap($hesap['dbId'], $baslangicTarih, $bitisTarih);
-            
+
+            if (!$result['success']) {
+                $hatalar[] = $hesap['iban'] . ': ' . $result['message'];
+            }
+
             $detaylar[] = [
                 'hesap_id' => $hesap['dbId'],
                 'iban' => $hesap['iban'],
@@ -681,9 +694,14 @@ class HalkbankService extends BaseBankaService
             $toplamSkipped += $result['skipped'] ?? 0;
         }
         
+        $message = "$toplamInserted yeni kayıt eklendi, $toplamSkipped kayıt atlandı.";
+        if ($hatalar) {
+            $message .= ' HATA: ' . implode(' | ', $hatalar);
+        }
+
         return [
-            'success' => true,
-            'message' => "$toplamInserted yeni kayıt eklendi, $toplamSkipped kayıt atlandı.",
+            'success' => empty($hatalar),
+            'message' => $message,
             'summary' => [
                 'toplam_inserted' => $toplamInserted,
                 'toplam_skipped' => $toplamSkipped

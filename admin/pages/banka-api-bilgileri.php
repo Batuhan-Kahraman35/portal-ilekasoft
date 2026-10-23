@@ -125,7 +125,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // Tek kayıt getir
                 $id = $_POST['id'] ?? 0;
                 $data = $db->fetchOne("
-                    SELECT a.*, b.banka_adi, f.firma_adi
+                    SELECT a.*, b.banka_adi, f.firma_adi,
+                           CONVERT(VARCHAR(5), a.apiKimlik_calismaBaslangic, 108) AS calisma_baslangic,
+                           CONVERT(VARCHAR(5), a.apiKimlik_calismaBitis, 108) AS calisma_bitis
                     FROM banka_ApiKimlik a
                     LEFT JOIN bankalar b ON a.apiKimlik_banka_id = b.banka_id
                     LEFT JOIN Firmalar f ON a.apiKimlik_firma_id = f.firma_id
@@ -165,7 +167,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'apiKimlik_ekAyarlar' => !empty($_POST['ek_ayarlar']) ? trim($_POST['ek_ayarlar']) : null,
                     'apiKimlik_durum' => isset($_POST['durum']) ? intval($_POST['durum']) : 1,
                     'apiKimlik_aciklama' => !empty($_POST['aciklama']) ? trim($_POST['aciklama']) : null,
-                    'apiKimlik_nakitYonetimEmail' => !empty($_POST['nakit_yonetim_email']) ? trim($_POST['nakit_yonetim_email']) : null
+                    'apiKimlik_nakitYonetimEmail' => !empty($_POST['nakit_yonetim_email']) ? trim($_POST['nakit_yonetim_email']) : null,
+                    'apiKimlik_gunlukSorguLimiti' => !empty($_POST['gunluk_sorgu_limiti']) ? max(1, intval($_POST['gunluk_sorgu_limiti'])) : null,
+                    'apiKimlik_calismaBaslangic' => preg_match('/^\d{2}:\d{2}$/', $_POST['calisma_baslangic'] ?? '') ? $_POST['calisma_baslangic'] : null,
+                    'apiKimlik_calismaBitis' => preg_match('/^\d{2}:\d{2}$/', $_POST['calisma_bitis'] ?? '') ? $_POST['calisma_bitis'] : null
                 ];
                 
                 if ($id > 0) {
@@ -646,6 +651,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                         <label class="form-label">Açıklama / Not</label>
                                         <textarea class="form-control" id="aciklama" name="aciklama" rows="3" placeholder="Bu API hakkında notlar..."></textarea>
                                     </div>
+                                    <div class="col-md-4">
+                                        <label class="form-label">Günlük Sorgu Limiti</label>
+                                        <input type="number" class="form-control" id="gunluk_sorgu_limiti" name="gunluk_sorgu_limiti" min="1" placeholder="Boş = limit yok">
+                                        <small class="text-muted">Bankanın günlük hareket sorgusu kotası (tüm hesaplar toplamı)</small>
+                                    </div>
+                                    <div class="col-md-4">
+                                        <label class="form-label">Çalışma Başlangıç</label>
+                                        <input type="time" class="form-control" id="calisma_baslangic" name="calisma_baslangic">
+                                        <small class="text-muted">Boş = 00:00</small>
+                                    </div>
+                                    <div class="col-md-4">
+                                        <label class="form-label">Çalışma Bitiş</label>
+                                        <input type="time" class="form-control" id="calisma_bitis" name="calisma_bitis">
+                                        <small class="text-muted">Boş = 24:00. Limit bu aralığa eşit dağıtılır.</small>
+                                    </div>
                                     <div class="col-md-12">
                                         <div class="form-check form-switch">
                                             <input class="form-check-input" type="checkbox" id="durum" name="durum" value="1" checked>
@@ -878,6 +898,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $('#ek_ayarlar').val(d.apiKimlik_ekAyarlar);
                     $('#aciklama').val(d.apiKimlik_aciklama);
                     $('#nakit_yonetim_email').val(d.apiKimlik_nakitYonetimEmail);
+                    $('#gunluk_sorgu_limiti').val(d.apiKimlik_gunlukSorguLimiti);
+                    $('#calisma_baslangic').val(d.calisma_baslangic);
+                    $('#calisma_bitis').val(d.calisma_bitis);
                     $('#durum').prop('checked', d.apiKimlik_durum == 1);
                     modal.show();
                 } else {

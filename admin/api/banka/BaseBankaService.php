@@ -299,6 +299,105 @@ abstract class BaseBankaService implements BankaServiceInterface
     }
     
     /**
+     * Bankanın "günlük sorgu limiti aşıldı" hata kodları
+     * Alt sınıf override eder (örn: Halkbank 888)
+     *
+     * @return string[]
+     */
+    protected function limitHataKodlari(): array
+    {
+        return [];
+    }
+
+    /**
+     * Sorgu planı kontrolü — bu çalışmada bankaya sorgu atılmalı mı?
+     *
+     * apiKimlik_gunlukSorguLimiti ve çalışma saatlerine göre karar verir.
+     * Kalan sorgu hakkı (hesap sayısına bölünerek) kalan süreye eşit dağıtılır;
+     * manuel sorgular da banka_ApiLog'dan sayıldığı için plana otomatik dahil olur.
+     * Saat hesabı DB saatiyle yapılır (PHP CLI timezone farkından etkilenmez).
+     *
+     * @return array ['calistir' => bool, 'neden' => string]
+     */
+    public function sorguPlaniKontrol(): array
+    {
+        $apiId = $this->apiKimlik['apiKimlik_id'];
+        $limitKodlari = $this->limitHataKodlari();
+        $kodListesi = $limitKodlari ? implode(',', array_fill(0, count($limitKodlari), '?')) : "''";
+
+        $durum = $this->db->fetchOne("
+            SELECT
+                ak.apiKimlik_gunlukSorguLimiti AS limit_,
+                DATEDIFF(MINUTE, CAST('00:00' AS TIME), ak.apiKimlik_calismaBaslangic) AS basDk,
+                DATEDIFF(MINUTE, CAST('00:00' AS TIME), ak.apiKimlik_calismaBitis) AS bitDk,
+                DATEDIFF(MINUTE, CAST(GETDATE() AS DATE), GETDATE()) AS simdiDk,
+                (SELECT COUNT(*) FROM banka_Hesap
+                  WHERE bankaHesap_apiKimlik_id = ak.apiKimlik_id AND bankaHesap_durum = 1) AS hesapSayisi,
+                (SELECT COUNT(*) FROM banka_ApiLog
+                  WHERE log_apiKimlik_id = ak.apiKimlik_id AND log_islem_tipi = 'getHareketler'
+                    AND log_istek_tarihi >= CAST(GETDATE() AS DATE)) AS kullanilan,
+                (SELECT COUNT(*) FROM banka_ApiLog
+                  WHERE log_apiKimlik_id = ak.apiKimlik_id
+                    AND log_istek_tarihi >= CAST(GETDATE() AS DATE)
+                    AND log_banka_hata_kodu IN ($kodListesi)) AS limitHatasi,
+                (SELECT DATEDIFF(MINUTE, MAX(log_istek_tarihi), GETDATE()) FROM banka_ApiLog
+                  WHERE log_apiKimlik_id = ak.apiKimlik_id AND log_islem_tipi = 'getHareketler') AS sonSorgudanDk
+            FROM banka_ApiKimlik ak
+            WHERE ak.apiKimlik_id = ?
+        ", array_merge($limitKodlari, [$apiId]));
+
+        if (!$durum) {
+            return ['calistir' => true, 'neden' => ''];
+        }
+
+        $limit = $durum['limit_'] !== null ? (int)$durum['limit_'] : null;
+        $basDk = $durum['basDk'] !== null ? (int)$durum['basDk'] : 0;
+        $bitDk = $durum['bitDk'] !== null && (int)$durum['bitDk'] > 0 ? (int)$durum['bitDk'] : 1440;
+        $simdiDk = (int)$durum['simdiDk'];
+
+        // Çalışma saati (bitiş <= başlangıç ise gece yarısını aşan aralık)
+        $icinde = $bitDk > $basDk
+            ? ($simdiDk >= $basDk && $simdiDk < $bitDk)
+            : ($simdiDk >= $basDk || $simdiDk < $bitDk);
+        $saat = fn(int $dk) => sprintf('%02d:%02d', intdiv($dk, 60) % 24, $dk % 60);
+
+        if (!$icinde) {
+            return ['calistir' => false, 'neden' => "Çalışma saati dışında ({$saat($basDk)}-{$saat($bitDk)})"];
+        }
+
+        if ($limit === null) {
+            return ['calistir' => true, 'neden' => ''];
+        }
+
+        if ((int)$durum['limitHatasi'] > 0) {
+            return ['calistir' => false, 'neden' => 'Bugün bankadan limit aşıldı hatası alındı, yarın devam edilecek'];
+        }
+
+        $hesapSayisi = max(1, (int)$durum['hesapSayisi']);
+        $kullanilan = (int)$durum['kullanilan'];
+        $kalanHak = intdiv(max(0, $limit - $kullanilan), $hesapSayisi);
+
+        if ($kalanHak < 1) {
+            return ['calistir' => false, 'neden' => "Günlük sorgu limiti doldu ($kullanilan/$limit)"];
+        }
+
+        // Kalan hakkı, kalan çalışma süresine eşit dağıt
+        $kalanDk = max(1, ($simdiDk < $bitDk ? $bitDk : 1440) - $simdiDk);
+        $aralikDk = $kalanDk / $kalanHak;
+        $sonSorgudanDk = $durum['sonSorgudanDk'] !== null ? (int)$durum['sonSorgudanDk'] : null;
+
+        if ($sonSorgudanDk !== null && $sonSorgudanDk < $aralikDk) {
+            $bekle = (int)ceil($aralikDk - $sonSorgudanDk);
+            return [
+                'calistir' => false,
+                'neden' => "Sıra gelmedi: ~{$bekle} dk sonra (aralık " . round($aralikDk) . " dk, kullanılan $kullanilan/$limit)"
+            ];
+        }
+
+        return ['calistir' => true, 'neden' => "Kullanılan $kullanilan/$limit, aralık " . round($aralikDk) . " dk"];
+    }
+
+    /**
      * API kimliğine bağlı tüm hesapları getir
      * 
      * @return array

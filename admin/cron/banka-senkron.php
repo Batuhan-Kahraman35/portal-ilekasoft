@@ -193,7 +193,25 @@ try {
         try {
             // Servis oluştur
             $service = BankaServiceFactory::createByApiKimlik($apiId, null, 'cron');
-            
+
+            // Sorgu planı: günlük limit + çalışma saati (banka_ApiKimlik)
+            $plan = $service->sorguPlaniKontrol();
+            if (!$plan['calistir']) {
+                writeLog("[$bankaAdi] ATLANDI: {$plan['neden']}");
+                consoleOutput("  - Atlandı: {$plan['neden']}");
+                $results[] = [
+                    'api_kimlik_id' => $apiId,
+                    'banka' => $bankaAdi,
+                    'success' => true,
+                    'atlandi' => true,
+                    'message' => $plan['neden']
+                ];
+                continue;
+            }
+            if ($plan['neden'] !== '') {
+                writeLog("[$bankaAdi] Sorgu planı: {$plan['neden']}");
+            }
+
             // Önce hesapları güncelle
             writeLog("[$bankaAdi] Hesap listesi çekiliyor...");
             $hesapResult = $service->getHesaplar();
@@ -222,7 +240,7 @@ try {
             $toplamSkipped += $senkronResult['summary']['toplam_skipped'] ?? 0;
             $basariliApi++;
             
-            writeLog("[$bankaAdi] Tamamlandı: {$senkronResult['message']}");
+            writeLog("[$bankaAdi] Tamamlandı: {$senkronResult['message']}", $senkronResult['success'] ? 'INFO' : 'ERROR');
             consoleOutput("  - Tamamlandı: {$senkronResult['message']}");
             
             // === DEKONT İNDİRME ===
