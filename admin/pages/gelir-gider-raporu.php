@@ -404,7 +404,7 @@ function platformListesi()
  */
 function filtreCoz(array $girdi, $kisitFirmaId)
 {
-    $bas = tarihGecerli($girdi['bas_tarih'] ?? '') ?: date('Y') . '-01-01';
+    $bas = tarihGecerli($girdi['bas_tarih'] ?? '') ?: date('Y-m-d');
     $bit = tarihGecerli($girdi['bit_tarih'] ?? '') ?: date('Y-m-d');
     if ($bas > $bit) {
         return ['hata' => 'Başlangıç tarihi bitiş tarihinden sonra olamaz.'];
@@ -768,7 +768,11 @@ function detayTanim(array $d, array $f)
                 'params' => $p,
                 'id'     => 's.PazaryeriSiparisleri_id',
                 'ozet'   => 'COUNT(*) AS adet, ISNULL(SUM(ISNULL(s.PazaryeriSiparisleri_ToplamTutar, 0)), 0) AS toplam',
-                'ara'    => 's.PazaryeriSiparisleri_SiparisNo LIKE ? OR s.PazaryeriSiparisleri_MusteriAdi LIKE ?',
+                'ara'    => 's.PazaryeriSiparisleri_SiparisNo LIKE ? OR s.PazaryeriSiparisleri_MusteriAdi LIKE ?
+                             OR EXISTS (SELECT 1 FROM dbo.PazaryeriSiparisKalemleri ca
+                                        WHERE ca.PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id = s.PazaryeriSiparisleri_id
+                                          AND ca.PazaryeriSiparisKalemleri_Durum = 1
+                                          AND (ca.PazaryeriSiparisKalemleri_UrunAdi LIKE ? OR ca.PazaryeriSiparisKalemleri_Barkod LIKE ?))',
                 'siralama' => [
                     0 => 's.PazaryeriSiparisleri_SiparisTarihi',
                     1 => 's.PazaryeriSiparisleri_SiparisNo',
@@ -776,10 +780,10 @@ function detayTanim(array $d, array $f)
                     3 => 'k.EntegrasyonKanallari_Ad',
                     4 => FIRMA_AD_SQL,
                     5 => 's.PazaryeriSiparisleri_MusteriAdi',
-                    6 => 's.PazaryeriSiparisleri_DurumKod',
-                    8 => 's.PazaryeriSiparisleri_ToplamTutar',
+                    7 => 's.PazaryeriSiparisleri_DurumKod',
+                    9 => 's.PazaryeriSiparisleri_ToplamTutar',
                 ],
-                // Kalem sayısı yalnız bu sayfanın satırlarına (ağır alt sorgu CTE'de yok)
+                // Kalem sayısı ve ürün adları yalnız bu sayfanın satırlarına (ağır alt sorgu CTE'de yok)
                 'dis' => "
                     SELECT s.PazaryeriSiparisleri_id                                  AS id,
                            CONVERT(VARCHAR(16), s.PazaryeriSiparisleri_SiparisTarihi, 120) AS tarih,
@@ -790,6 +794,7 @@ function detayTanim(array $d, array $f)
                            s.PazaryeriSiparisleri_MusteriAdi                          AS musteri,
                            s.PazaryeriSiparisleri_DurumKod                            AS durum,
                            kl.adet                                                    AS kalem,
+                           ur.urunler                                                 AS urunler,
                            ISNULL(s.PazaryeriSiparisleri_ToplamTutar, 0)              AS tutar
                     FROM sayfa x
                     INNER JOIN dbo.PazaryeriSiparisleri s ON s.PazaryeriSiparisleri_id = x.id
@@ -801,7 +806,19 @@ function detayTanim(array $d, array $f)
                         FROM dbo.PazaryeriSiparisKalemleri c
                         WHERE c.PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id = s.PazaryeriSiparisleri_id
                           AND c.PazaryeriSiparisKalemleri_Durum = 1
-                    ) kl",
+                    ) kl
+                    -- Ürün adları (miktar ile): kalemler ' ¦ ' ile birleşir, arayüz satır satır gösterir
+                    OUTER APPLY (
+                        SELECT STUFF((
+                            SELECT N' ¦ ' + CAST(c.PazaryeriSiparisKalemleri_Miktar AS NVARCHAR(10)) + N' x '
+                                 + ISNULL(NULLIF(c.PazaryeriSiparisKalemleri_UrunAdi, N''), c.PazaryeriSiparisKalemleri_Barkod)
+                            FROM dbo.PazaryeriSiparisKalemleri c
+                            WHERE c.PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id = s.PazaryeriSiparisleri_id
+                              AND c.PazaryeriSiparisKalemleri_Durum = 1
+                            ORDER BY c.PazaryeriSiparisKalemleri_id
+                            FOR XML PATH(''), TYPE
+                        ).value('.', 'NVARCHAR(MAX)'), 1, 3, N'') AS urunler
+                    ) ur",
                 'bicim' => fn($r) => [
                     'tarih'      => (string)$r['tarih'],
                     'siparis_no' => (string)($r['siparis_no'] ?? ''),
@@ -811,6 +828,7 @@ function detayTanim(array $d, array $f)
                     'musteri'    => (string)($r['musteri'] ?? ''),
                     'durum'      => (string)($r['durum'] ?? ''),
                     'kalem'      => (int)$r['kalem'],
+                    'urunler'    => (string)($r['urunler'] ?? ''),
                     'tutar'      => round((float)$r['tutar'], 2),
                 ],
             ];
@@ -1903,7 +1921,7 @@ $platformlar = platformListesi();
 
         function varsayilanTarihler() {
             const bugun = new Date();
-            $('#fBas').val(bugun.getFullYear() + '-01-01');
+            $('#fBas').val(yerelTarih(bugun));
             $('#fBit').val(yerelTarih(bugun));
         }
 
@@ -2153,7 +2171,7 @@ $platformlar = platformListesi();
 
         const DETAY_KOLONLARI = {
             satis: {
-                ikon: 'bi-cart-check', ara: 'Sipariş no / müşteri', birim: 'sipariş',
+                ikon: 'bi-cart-check', ara: 'Sipariş no / müşteri / ürün / barkod', birim: 'sipariş',
                 kolonlar: [
                     { title: 'Sipariş Tarihi', data: 'tarih', render: metin },
                     { title: 'Sipariş No', data: 'siparis_no', render: metin },
@@ -2161,6 +2179,8 @@ $platformlar = platformListesi();
                     { title: 'Kanal', data: 'kanal', render: metin },
                     { title: 'Firma', data: 'firma', render: metin },
                     { title: 'Müşteri', data: 'musteri', render: metin },
+                    { title: 'Ürün', data: 'urunler', orderable: false, className: 'aciklama-hucre',
+                      render: (v) => v ? v.split(' ¦ ').map((u) => '<div>' + kacis(u) + '</div>').join('') : '—' },
                     { title: 'Durum', data: 'durum', render: (v) => '<span class="badge text-bg-light border">' + kacis(v || '-') + '</span>' },
                     { title: 'Kalem', data: 'kalem', orderable: false, className: 'text-end', render: sayi },
                     { title: 'Tutar', data: 'tutar', className: 'text-end tutar', render: para }
