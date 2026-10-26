@@ -295,16 +295,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 
                 $id = $_POST['id'] ?? 0;
-                
+
+                // Tutar girişini "1234.56" biçimine çevir: "34.771,43", "34771,43", "34771.43" kabul edilir
+                $tutarCoz = function (string $girdi): string|false|null {
+                    $s = str_replace([' ', "\u{00A0}"], '', trim($girdi));
+                    if ($s === '') return null;
+                    if (str_contains($s, ',')) {
+                        $s = str_replace(',', '.', str_replace('.', '', $s));
+                    }
+                    return is_numeric($s) ? number_format((float)$s, 2, '.', '') : false;
+                };
+                $tutar = $tutarCoz($_POST['amount'] ?? '');
+                $kalanBakiye = $tutarCoz($_POST['remaining_balance'] ?? '');
+                if ($tutar === null || $tutar === false || $kalanBakiye === false) {
+                    echo json_encode(['success' => false, 'message' => 'Tutar / kalan bakiye geçerli bir sayı olmalıdır (örn. 34771,43).']);
+                    break;
+                }
+
                 $data = [
                     'banka_HesapHareketleriIBAN' => trim($_POST['iban'] ?? ''),
                     'banka_HesapHareketleriName' => trim($_POST['name'] ?? ''),
                     'banka_HesapHareketleriDateTime' => $_POST['date_time'] ?? null,
-                    'banka_HesapHareketleriAmount' => trim($_POST['amount'] ?? ''),
+                    'banka_HesapHareketleriAmount' => $tutar,
                     'banka_HesapHareketleriDescription' => trim($_POST['description'] ?? ''),
                     'banka_HesapHareketleriBorcAlacak' => $_POST['borc_alacak'] ?? 'A',
                     'banka_HesapHareketleriCurrencyType' => $_POST['currency_type'] ?? 'TRY',
-                    'banka_HesapHareketleriRemainingBalance' => trim($_POST['remaining_balance'] ?? ''),
+                    'banka_HesapHareketleriRemainingBalance' => $kalanBakiye,
                     'banka_HesapHareketleriIdentifier' => trim($_POST['identifier'] ?? ''),
                     'ReceiptNo' => trim($_POST['receipt_no'] ?? ''),
                     'VknOrTc' => trim($_POST['vkn_or_tc'] ?? ''),

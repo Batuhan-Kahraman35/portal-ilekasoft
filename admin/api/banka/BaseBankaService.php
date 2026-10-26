@@ -225,7 +225,11 @@ abstract class BaseBankaService implements BankaServiceInterface
         if ($mevcut) {
             return false; // Zaten var
         }
-        
+
+        // Tutar/bakiye sütunları nvarchar: float doğrudan bağlanırsa sqlsrv 6 anlamlı haneye
+        // yuvarlar (73619.98 → "73620", 1340000 → "1.34e+006"). 2 haneli sabit metin gönderilir.
+        $paraMetni = fn($deger) => number_format((float)($deger ?? 0), 2, '.', '');
+
         // Yeni kayıt ekle
         $this->db->execute("
             INSERT INTO banka_HesapHareketleri (
@@ -249,11 +253,11 @@ abstract class BaseBankaService implements BankaServiceInterface
             $hareketData['karsiTarafIban'] ?? $hesap['bankaHesap_iban'],
             $hareketData['karsiTarafAdUnvan'] ?? null,
             $hareketData['islemTarihi'],
-            $hareketData['tutar'],
+            $paraMetni($hareketData['tutar']),
             $hareketData['aciklama'] ?? null,
             $hareketData['borcAlacak'], // 'B' veya 'A'
             $hareketData['dovizKodu'] ?? 'TRY',
-            $hareketData['bakiye'] ?? 0,
+            $paraMetni($hareketData['bakiye'] ?? 0),
             $hareketData['identifier'],
             $hareketData['receiptNo'] ?? null,
             $hareketData['vknTckn'] ?? null,
