@@ -558,9 +558,33 @@ class HalkbankService extends BaseBankaService
      */
     public function dekontIndir(int $hesapId, string $dekontNo, ?string $kayitDizini = null): array
     {
+        // DekontSorgulama HesapNo'yu "şube(4)-müşteri(8)-mudi(8)" ister; kısa formatta
+        // banka her istekte hata döner (694). Bankaya gitmeden hesabı atla.
+        $hesapNo = (string)($this->db->fetchOne("SELECT bankaHesap_no FROM banka_Hesap WHERE bankaHesap_id = ?", [$hesapId])['bankaHesap_no'] ?? '');
+        if (!preg_match('/^\d{4}-\d{8}-\d{8}$/', $hesapNo)) {
+            return [
+                'success' => false,
+                'atla' => true,
+                'message' => "Hesap no dekont formatında değil ($hesapNo), beklenen: şube-müşteri-mudi (4-8-8)",
+                'dosyaYolu' => null
+            ];
+        }
+
         $result = $this->getDekont($hesapId, $dekontNo);
-        
+
         if (!$result['success'] || empty($result['data'])) {
+            // Bankada dekontu olmayan hareket (COM_RC:100 / boş yanıt): 1 günden eskiyse
+            // boş yol yazılır, her turda tekrar denenmez. Boş yol tüm ekranlarda "dekont yok" sayılır.
+            if (stripos($result['message'], 'kayit donmemistir') !== false || $result['message'] === 'Dekont bulunamadı') {
+                $this->db->execute("
+                    UPDATE banka_HesapHareketleri
+                    SET banka_HesapHareketleriDekontYolu = ''
+                    WHERE banka_HesapId = ?
+                      AND banka_HesapHareketleriDekontYolu IS NULL
+                      AND banka_HesapHareketleriDateTime < DATEADD(DAY, -1, GETDATE())
+                      AND (ReceiptNo = ? OR banka_HesapHareketleriIdentifier LIKE ?)
+                ", [$hesapId, $dekontNo, '%_' . $dekontNo . '_%']);
+            }
             return ['success' => false, 'message' => $result['message'], 'dosyaYolu' => null];
         }
         

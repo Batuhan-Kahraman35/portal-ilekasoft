@@ -144,7 +144,9 @@ try {
     $toplamSkipped = 0;
     $basariliApi = 0;
     $hataliApi = 0;
-    
+    $atlananApi = 0;
+    $hataOzet = []; // "Banka (id): mesaj" — cron yönetimi sonuç satırında gösterilir
+
     // Tek API mi yoksa tümü mü?
     $tekApiKimlikId = $isWeb ? ($_GET['api_kimlik_id'] ?? null) : ($argv[1] ?? null);
     
@@ -189,7 +191,11 @@ try {
         
         writeLog("[$bankaAdi] Senkronizasyon başlıyor (API ID: $apiId)");
         consoleOutput("[$bankaAdi] Senkronizasyon başlıyor...");
-        
+
+        // Bu turdaki API hatalarını tespit için başlangıç noktası (servisler hatayı farklı
+        // biçimlerde döndürüyor; banka_ApiLog tüm bankalar için ortak kaynak)
+        $sonLogId = (int)($db->fetchOne("SELECT ISNULL(MAX(log_id), 0) AS id FROM banka_ApiLog")['id'] ?? 0);
+
         try {
             // Servis oluştur
             $service = BankaServiceFactory::createByApiKimlik($apiId, null, 'cron');
@@ -206,6 +212,7 @@ try {
                     'atlandi' => true,
                     'message' => $plan['neden']
                 ];
+                $atlananApi++;
                 continue;
             }
             if ($plan['neden'] !== '') {
@@ -225,23 +232,41 @@ try {
             
             // Tüm hesapları senkronize et
             $senkronResult = $service->senkronizeTumu();
-            
+
+            // Hata: servis success=false döndü veya bu turda banka_ApiLog'a hatalı kayıt düştü (dekont hariç)
+            $apiHata = $db->fetchOne("
+                SELECT COUNT(*) AS adet, MAX(LEFT(log_hata_mesaji, 200)) AS mesaj
+                FROM banka_ApiLog
+                WHERE log_id > ? AND log_apiKimlik_id = ?
+                  AND log_basarili = 0 AND log_islem_tipi NOT LIKE '%ekont%'
+            ", [$sonLogId, $apiId]);
+            $senkronBasarili = !empty($senkronResult['success']) && (int)($apiHata['adet'] ?? 0) === 0;
+            $senkronMesaj = $senkronResult['message'] ?? '';
+            if (!$senkronBasarili) {
+                $hataDetay = trim((string)($apiHata['mesaj'] ?? '')) ?: $senkronMesaj;
+                $hataOzet[] = "$bankaAdi ($apiId): $hataDetay";
+            }
+
             $results[] = [
                 'api_kimlik_id' => $apiId,
                 'banka' => $bankaAdi,
                 'hesap_sayisi' => $hesapResult['count'],
                 'inserted' => $senkronResult['summary']['toplam_inserted'] ?? 0,
                 'skipped' => $senkronResult['summary']['toplam_skipped'] ?? 0,
-                'success' => $senkronResult['success'],
-                'message' => $senkronResult['message']
+                'success' => $senkronBasarili,
+                'message' => $senkronMesaj
             ];
-            
+
             $toplamInserted += $senkronResult['summary']['toplam_inserted'] ?? 0;
             $toplamSkipped += $senkronResult['summary']['toplam_skipped'] ?? 0;
-            $basariliApi++;
-            
-            writeLog("[$bankaAdi] Tamamlandı: {$senkronResult['message']}", $senkronResult['success'] ? 'INFO' : 'ERROR');
-            consoleOutput("  - Tamamlandı: {$senkronResult['message']}");
+            if ($senkronBasarili) {
+                $basariliApi++;
+            } else {
+                $hataliApi++;
+            }
+
+            writeLog("[$bankaAdi] Tamamlandı: $senkronMesaj", $senkronBasarili ? 'INFO' : 'ERROR');
+            consoleOutput("  - " . ($senkronBasarili ? 'Tamamlandı' : 'HATA') . ": $senkronMesaj");
             
             // === DEKONT İNDİRME ===
             // Servis dekontIndir metodunu destekliyorsa, dekont yolu olmayan kayıtları indir
@@ -268,12 +293,17 @@ try {
                     
                     $dekontBasarili = 0;
                     $dekontHatali = 0;
-                    
+                    $dekontAtlananHesap = []; // hesapId => neden (servis 'atla' döndürdü, bankaya istek atılmaz)
+
                     foreach ($dekontSizKayitlar as $kayit) {
                         // DekontNo'yu belirle: ReceiptNo varsa onu kullan, yoksa Identifier'dan çıkar
                         $dekontNo = $kayit['ReceiptNo'];
                         $hesapId = $kayit['banka_HesapId'];
-                        
+
+                        if (isset($dekontAtlananHesap[$hesapId])) {
+                            continue;
+                        }
+
                         if (empty($dekontNo) && !empty($kayit['banka_HesapHareketleriIdentifier'])) {
                             // Identifier formatı: HALKBANK_{hesapId}_{dekontNo}_{sirano}
                             $parts = explode('_', $kayit['banka_HesapHareketleriIdentifier']);
@@ -288,6 +318,11 @@ try {
                         
                         try {
                             $dekontResult = $service->dekontIndir($hesapId, $dekontNo);
+                            if (!empty($dekontResult['atla'])) {
+                                $dekontAtlananHesap[$hesapId] = $dekontResult['message'];
+                                writeLog("[$bankaAdi] Dekont atlandı (hesap $hesapId): {$dekontResult['message']}", 'WARN');
+                                continue;
+                            }
                             if ($dekontResult['success']) {
                                 $dekontBasarili++;
                             } else {
@@ -326,6 +361,7 @@ try {
                 'message' => $errorMsg
             ];
             $hataliApi++;
+            $hataOzet[] = "$bankaAdi ($apiId): $errorMsg";
             
             writeLog("[$bankaAdi] HATA: $errorMsg", 'ERROR');
             consoleOutput("  - HATA: $errorMsg");
@@ -338,27 +374,37 @@ try {
     }
     
     // Özet
+    $ozetMesaj = "$basariliApi başarılı, $hataliApi hatalı, $atlananApi atlandı. $toplamInserted yeni kayıt.";
+    if ($hataOzet) {
+        $ozetMesaj .= ' HATA: ' . implode(' | ', $hataOzet);
+    }
+
     $summary = [
         'success' => $hataliApi === 0,
-        'message' => "$basariliApi API başarılı, $hataliApi API hatalı. Toplam $toplamInserted yeni kayıt eklendi.",
+        'message' => $ozetMesaj,
         'toplam_api' => count($apiKimlikleri),
         'basarili_api' => $basariliApi,
         'hatali_api' => $hataliApi,
+        'atlanan_api' => $atlananApi,
         'toplam_inserted' => $toplamInserted,
         'toplam_skipped' => $toplamSkipped,
         'results' => $results,
         'timestamp' => date('Y-m-d H:i:s')
     ];
     
-    writeLog("=== Senkronizasyon Tamamlandı: {$summary['message']} ===");
-    consoleOutput("\nSenkronizasyon Tamamlandı: {$summary['message']}");
-    
+    writeLog("=== Senkronizasyon Tamamlandı: {$summary['message']} ===", $hataliApi > 0 ? 'ERROR' : 'INFO');
+    // Son satır cron yönetiminde sonuç olarak gösterilir (cronSurecSonucu)
+    consoleOutput("\n{$summary['message']}");
+
     releaseLock();
-    
+
     if ($isWeb) {
         jsonResponse($summary);
     }
-    
+
+    // Hatalı banka varsa çıkış kodu 1 → cron yönetiminde "hata" olarak işaretlenir
+    exit($hataliApi > 0 ? 1 : 0);
+
 } catch (\Exception $e) {
     $errorMsg = 'Kritik Hata: ' . $e->getMessage();
     writeLog($errorMsg, 'CRITICAL');

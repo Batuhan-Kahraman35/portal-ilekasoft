@@ -73,7 +73,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         f.firma_adi,
                         CONVERT(VARCHAR(19), a.apiKimlik_olusturmaTarihi, 120) as olusturma_tarihi,
                         CONVERT(VARCHAR(19), a.apiKimlik_guncellemeTarihi, 120) as guncelleme_tarihi,
-                        CONVERT(VARCHAR(19), a.apiKimlik_sonTestTarihi, 120) as son_test_tarihi
+                        CONVERT(VARCHAR(19), a.apiKimlik_sonTestTarihi, 120) as son_test_tarihi,
+                        CONVERT(VARCHAR(5), a.apiKimlik_calismaBaslangic, 108) as calisma_baslangic,
+                        CONVERT(VARCHAR(5), a.apiKimlik_calismaBitis, 108) as calisma_bitis
                     FROM banka_ApiKimlik a
                     LEFT JOIN bankalar b ON a.apiKimlik_banka_id = b.banka_id
                     LEFT JOIN Firmalar f ON a.apiKimlik_firma_id = f.firma_id
@@ -118,6 +120,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $sql .= " ORDER BY a.apiKimlik_id DESC";
                 
                 $data = $db->fetchAll($sql, $params);
+
+                // Senkron sağlığı: son 24 saatin hareket sorguları (banka_ApiLog ~6M satır;
+                // tarih indeksiyle yalnız son 24 saat taranır, kimlik başına ayrı APPLY yapılmaz)
+                $saglik = [];
+                foreach ($db->fetchAll("
+                    WITH son AS (
+                        SELECT l.log_id, l.log_apiKimlik_id, l.log_basarili, l.log_istek_tarihi, l.log_hata_mesaji
+                        FROM banka_ApiLog l WITH (INDEX(IX_ApiLog_IstekTarihi))
+                        WHERE l.log_istek_tarihi >= DATEADD(HOUR, -24, GETDATE())
+                          AND l.log_islem_tipi = 'getHareketler'
+                    ),
+                    ozet AS (
+                        SELECT log_apiKimlik_id,
+                               MAX(CASE WHEN log_basarili = 1 THEN log_istek_tarihi END) AS son_ok,
+                               MAX(CASE WHEN log_basarili = 0 THEN log_istek_tarihi END) AS son_hata,
+                               SUM(CASE WHEN log_istek_tarihi >= CAST(GETDATE() AS DATE) THEN 1 ELSE 0 END) AS bugun
+                        FROM son GROUP BY log_apiKimlik_id
+                    ),
+                    hata AS (
+                        SELECT log_apiKimlik_id, LEFT(log_hata_mesaji, 300) AS mesaj,
+                               ROW_NUMBER() OVER (PARTITION BY log_apiKimlik_id ORDER BY log_id DESC) AS sira
+                        FROM son WHERE log_basarili = 0
+                    )
+                    SELECT o.log_apiKimlik_id,
+                           CONVERT(VARCHAR(16), o.son_ok, 120) AS son_ok,
+                           CONVERT(VARCHAR(16), o.son_hata, 120) AS son_hata,
+                           o.bugun, h.mesaj
+                    FROM ozet o
+                    LEFT JOIN hata h ON h.log_apiKimlik_id = o.log_apiKimlik_id AND h.sira = 1
+                ") as $s) {
+                    $saglik[(int)$s['log_apiKimlik_id']] = $s;
+                }
+                foreach ($data as &$satir) {
+                    $s = $saglik[(int)$satir['apiKimlik_id']] ?? null;
+                    $satir['senkron_son_ok'] = $s['son_ok'] ?? null;
+                    $satir['senkron_son_hata'] = $s['son_hata'] ?? null;
+                    $satir['senkron_hata_mesaj'] = $s['mesaj'] ?? null;
+                    $satir['senkron_bugun'] = (int)($s['bugun'] ?? 0);
+                }
+                unset($satir);
+
                 echo json_encode(['success' => true, 'data' => $data, 'count' => count($data)]);
                 break;
                 
@@ -497,12 +540,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                             <th>Endpoint</th>
                                             <th width="80">Durum</th>
                                             <th width="80">Test</th>
+                                            <th width="170">Senkron (24 saat)</th>
                                             <th width="150">İşlemler</th>
                                         </tr>
                                     </thead>
                                     <tbody id="tableBody">
                                         <tr>
-                                            <td colspan="9" class="text-center">Yükleniyor...</td>
+                                            <td colspan="10" class="text-center">Yükleniyor...</td>
                                         </tr>
                                     </tbody>
                                 </table>
@@ -771,6 +815,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         
         // DataTable başlat
+        // Senkron sağlığı rozeti: son 24 saatin hareket sorgularına göre
+        function senkronDurumu(d) {
+            const kacis = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+            const saat = s => s ? s.substring(8, 10) + '.' + s.substring(5, 7) + ' ' + s.substring(11, 16) : '';
+
+            let rozet;
+            if (d.apiKimlik_durum != 1) {
+                rozet = '<span class="badge bg-secondary">Pasif</span>';
+            } else if (!d.senkron_son_ok && !d.senkron_son_hata) {
+                rozet = '<span class="badge bg-warning text-dark" title="Son 24 saatte hareket sorgusu yapılmadı"><i class="bi bi-exclamation-triangle"></i> Sorgu yok</span>';
+            } else if (d.senkron_son_hata && (!d.senkron_son_ok || d.senkron_son_hata > d.senkron_son_ok)) {
+                rozet = `<span class="badge bg-danger" title="${kacis(saat(d.senkron_son_hata) + ' — ' + d.senkron_hata_mesaj)}"><i class="bi bi-x-circle"></i> Hata</span>`;
+            } else {
+                rozet = `<span class="badge bg-success" title="Son başarılı: ${saat(d.senkron_son_ok)}"><i class="bi bi-check-circle"></i> ${saat(d.senkron_son_ok).substring(6)}</span>`;
+            }
+
+            let alt = 'Bugün ' + (d.senkron_bugun || 0) + (d.apiKimlik_gunlukSorguLimiti ? ' / ' + d.apiKimlik_gunlukSorguLimiti : '') + ' sorgu';
+            if (d.calisma_baslangic || d.calisma_bitis) {
+                alt += ' · ' + (d.calisma_baslangic || '00:00') + '–' + (d.calisma_bitis || '24:00');
+            }
+            return rozet + `<div class="small text-muted">${alt}</div>`;
+        }
+
         function initDataTable() {
             table = $('#dataTable').DataTable({
                 processing: true,
@@ -823,6 +890,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         render: data => data.apiKimlik_testEdildi == 1 
                             ? `<span class="badge bg-info test-badge" title="${data.son_test_tarihi || ''}"><i class="bi bi-check"></i> OK</span>` 
                             : '<span class="badge bg-warning test-badge"><i class="bi bi-question"></i></span>'
+                    },
+                    {
+                        data: null,
+                        orderable: false,
+                        render: data => senkronDurumu(data)
                     },
                     { 
                         data: null,
