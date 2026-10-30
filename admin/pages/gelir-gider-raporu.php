@@ -1023,7 +1023,7 @@ function detayOzet($r)
  *  2) Dış SELECT: o sayfanın satırlarına detay kolonları / ağır alt sorgular
  * Sıralama kolonu whitelist'ten, yön ASC/DESC normalize. Sayım tek taban sorgusundan.
  */
-function detayCalistir(array $t, array $istek)
+function detayCalistir(array $t, array $istek, $enFazla = 500)
 {
     $db = Database::getInstance();
 
@@ -1046,7 +1046,7 @@ function detayCalistir(array $t, array $istek)
     $yon     = strtolower((string)($istek['order'][0]['dir'] ?? 'desc')) === 'asc' ? 'ASC' : 'DESC';
     $start   = max(0, (int)($istek['start'] ?? 0));
     $len     = (int)($istek['length'] ?? 25);
-    if ($len < 1 || $len > 500) {
+    if ($len < 1 || $len > $enFazla) {
         $len = 25;
     }
 
@@ -1073,6 +1073,47 @@ function detayCalistir(array $t, array $istek)
         'ozet_filtre'     => $ara !== '' ? $ozetFilt : null,
         'data'            => array_map(fn($r) => ['id' => (int)$r['id']] + ($t['bicim'])($r), $satirlar),
     ];
+}
+
+/** Detay Excel'inde en fazla satır (tek istekte bellek sınırı) */
+const DETAY_EXCEL_EN_FAZLA = 50000;
+
+/**
+ * Detay Excel kolonları: tür → [başlık, alan, hücre türü]. Sıra arayüzdeki DETAY_KOLONLARI ile aynı.
+ * Alanlar bicim çıktısıdır; 'kaynak' ve 'yon_ad' detayExcelSatir'da türetilir. NULL değer boş hücre yazılır.
+ */
+const DETAY_EXCEL_KOLONLARI = [
+    'satis' => [
+        ['Sipariş Tarihi', 'tarih', 'metin'], ['Sipariş No', 'siparis_no', 'metin'], ['Pazaryeri', 'pazaryeri', 'metin'],
+        ['Kanal', 'kanal', 'metin'], ['Firma', 'firma', 'metin'], ['Müşteri', 'musteri', 'metin'],
+        ['Ürün', 'urunler', 'metin'], ['Durum', 'durum', 'metin'], ['Kalem', 'kalem', 'sayi'], ['Tutar', 'tutar', 'para'],
+    ],
+    'komisyon_pazaryeri' => [
+        ['Sipariş Tarihi', 'tarih', 'metin'], ['Sipariş No', 'siparis_no', 'metin'], ['Pazaryeri', 'pazaryeri', 'metin'],
+        ['Firma', 'firma', 'metin'], ['Ürün Adı', 'urun', 'metin'], ['Barkod', 'barkod', 'metin'],
+        ['Miktar', 'miktar', 'sayi'], ['Kalem Tutarı', 'kalem_tutar', 'para'],
+        ['Komisyon Oranı (%)', 'komisyon_oran', 'sayi'], ['Komisyon Tutarı', 'komisyon_tutar', 'para'],
+    ],
+    'banka' => [
+        ['Tarih', 'tarih', 'metin'], ['Banka', 'banka', 'metin'], ['IBAN', 'iban', 'metin'],
+        ['Açıklama', 'aciklama', 'metin'], ['Tutar', 'tutar', 'para'], ['Kaynak', 'kaynak', 'metin'],
+    ],
+    'kargo' => [
+        ['Çıkış Tarihi', 'tarih', 'metin'], ['Yön', 'yon_ad', 'metin'], ['Takip No', 'takip_no', 'metin'],
+        ['Gönderici', 'gonderici', 'metin'], ['Alıcı', 'alici', 'metin'], ['Alıcı İl', 'alici_il', 'metin'],
+        ['Ödeme Tipi', 'odeme_tipi', 'metin'], ['Durum', 'durum', 'metin'], ['Tutar', 'tutar', 'para'],
+    ],
+];
+
+/** Detay satırı → Excel hücreleri (arayüzde render ile gösterilen türetilmiş alanlar dahil) */
+function detayExcelSatir($tur, array $s)
+{
+    if ($tur === 'banka') {
+        $s['kaynak'] = $s['cost'] === 1 ? 'Banka işareti' : $s['kural_desen'];
+    } elseif ($tur === 'kargo') {
+        $s['yon_ad'] = $s['yon'] === 'GIDEN' ? 'Giden' : 'Gelen';
+    }
+    return array_map(fn($k) => ($s[$k[1]] ?? null) === null ? '' : ['deger' => $s[$k[1]], 'tur' => $k[2]], DETAY_EXCEL_KOLONLARI[$tur]);
 }
 
 /** Kural formu doğrulaması. Hata varsa ['hata' => mesaj] döner. */
@@ -1396,8 +1437,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             // ---------------------------------------------------------
             // Excel: aylık tablo + altında kaynak kırılımları (tek sayfa)
+            //   bolum: '' → ikisi birden · 'aylik' → yalnız aylık döküm · 'kirilim' → yalnız 'kaynak' kodunun kırılım kartı
             case 'excel':
                 $f = filtreCoz($_POST, $kisitFirmaId);
+                $bolum = (string)($_POST['bolum'] ?? '');
+                if (!isset($f['hata']) && !in_array($bolum, ['', 'aylik', 'kirilim'], true)) {
+                    $f = ['hata' => 'Geçersiz Excel bölümü.'];
+                }
                 if (isset($f['hata'])) {
                     http_response_code(400);
                     header('Content-Type: text/plain; charset=utf-8');
@@ -1423,66 +1469,131 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         : implode(', ', array_map(fn($s) => $kirilimAd[$s] ?? $s, $secili));
                 }
 
+                // Tek kırılım kartı: yalnız o kaynak (görünür kaynaklar arasında olmalı)
+                $kirilimKaynaklari = $bolum === 'aylik' ? [] : $destekli;
+                if ($bolum === 'kirilim') {
+                    $kod = (string)($_POST['kaynak'] ?? '');
+                    $kirilimKaynaklari = array_values(array_filter($destekli, fn($k) => $k['kod'] === $kod));
+                    if (!$kirilimKaynaklari) {
+                        http_response_code(400);
+                        header('Content-Type: text/plain; charset=utf-8');
+                        echo 'Kaynak bulunamadı.';
+                        exit;
+                    }
+                }
+
                 // basliklar() satırı en üste alır; not ve filtre bilgisi en üstte kalsın diye başlık satırı satir() ile yazılır
-                $xlsx = new XlsxYazici('Gelir ve Gider');
+                $xlsx = new XlsxYazici($bolum === 'kirilim' ? $kirilimKaynaklari[0]['ad'] : 'Gelir ve Gider');
                 $xlsx->satir([RAPOR_NOTU]);
                 $xlsx->satir(['Dönem: ' . $f['bas'] . ' – ' . $f['bit'] . ' · Platform: ' . $f['platformAd']
                     . ($f['platform'] !== null ? ' (platformsuz kalemler – banka masrafları, kargo – dahil değil)' : '')
                     . ' · Kırılım: ' . ($secili ? $kirilimMetin : 'Tümü')]);
-                $xlsx->satir(array_map(fn($b) => ['deger' => $b, 'tur' => 'baslik'], array_merge(
-                    ['Ay'],
-                    array_map(fn($k) => $k['ad'] . ' (' . ($k['tip'] === 'gelir' ? 'Gelir' : 'Gider') . ')', $destekli),
-                    ['Toplam Gelir', 'Toplam Gider', 'Net']
-                )));
 
                 $kaynakTop = (array)$r['kaynakTop'];
-                foreach ($r['aylar'] as $a) {
-                    $kaynakTutar = (array)$a['kaynaklar'];
+
+                if ($bolum !== 'kirilim') {
+                    $xlsx->satir(array_map(fn($b) => ['deger' => $b, 'tur' => 'baslik'], array_merge(
+                        ['Ay'],
+                        array_map(fn($k) => $k['ad'] . ' (' . ($k['tip'] === 'gelir' ? 'Gelir' : 'Gider') . ')', $destekli),
+                        ['Toplam Gelir', 'Toplam Gider', 'Net']
+                    )));
+
+                    foreach ($r['aylar'] as $a) {
+                        $kaynakTutar = (array)$a['kaynaklar'];
+                        $xlsx->satir(array_merge(
+                            [$a['ay']],
+                            array_map(fn($k) => ['deger' => $kaynakTutar[$k['kod']] ?? 0, 'tur' => 'para'], $destekli),
+                            [
+                                ['deger' => $a['gelir'], 'tur' => 'para'],
+                                ['deger' => $a['gider'], 'tur' => 'para'],
+                                ['deger' => $a['net'],   'tur' => 'para'],
+                            ]
+                        ));
+                    }
                     $xlsx->satir(array_merge(
-                        [$a['ay']],
-                        array_map(fn($k) => ['deger' => $kaynakTutar[$k['kod']] ?? 0, 'tur' => 'para'], $destekli),
+                        [['deger' => 'GENEL TOPLAM', 'tur' => 'baslik']],
+                        array_map(fn($k) => ['deger' => $kaynakTop[$k['kod']]['tutar'] ?? 0, 'tur' => 'para'], $destekli),
                         [
-                            ['deger' => $a['gelir'], 'tur' => 'para'],
-                            ['deger' => $a['gider'], 'tur' => 'para'],
-                            ['deger' => $a['net'],   'tur' => 'para'],
+                            ['deger' => $r['ozet']['gelir'], 'tur' => 'para'],
+                            ['deger' => $r['ozet']['gider'], 'tur' => 'para'],
+                            ['deger' => $r['ozet']['net'],   'tur' => 'para'],
                         ]
                     ));
                 }
-                $xlsx->satir(array_merge(
-                    [['deger' => 'GENEL TOPLAM', 'tur' => 'baslik']],
-                    array_map(fn($k) => ['deger' => $kaynakTop[$k['kod']]['tutar'] ?? 0, 'tur' => 'para'], $destekli),
-                    [
-                        ['deger' => $r['ozet']['gelir'], 'tur' => 'para'],
-                        ['deger' => $r['ozet']['gider'], 'tur' => 'para'],
-                        ['deger' => $r['ozet']['net'],   'tur' => 'para'],
-                    ]
-                ));
 
                 // Kırılımlar
-                $kirilim = (array)$r['kirilim'];
-                $xlsx->satir(['']);
-                $xlsx->satir([
-                    ['deger' => 'Kaynak', 'tur' => 'baslik'],
-                    ['deger' => 'Tip', 'tur' => 'baslik'],
-                    ['deger' => 'Alt Kırılım', 'tur' => 'baslik'],
-                    ['deger' => 'Firma', 'tur' => 'baslik'],
-                    ['deger' => 'Adet', 'tur' => 'baslik'],
-                    ['deger' => 'Tutar', 'tur' => 'baslik'],
-                ]);
-                foreach ($destekli as $k) {
-                    foreach ($kirilim[$k['kod']] ?? [] as $s) {
+                if ($kirilimKaynaklari) {
+                    $kirilim = (array)$r['kirilim'];
+                    if ($bolum === '') {
+                        $xlsx->satir(['']);
+                    }
+                    $xlsx->satir([
+                        ['deger' => 'Kaynak', 'tur' => 'baslik'],
+                        ['deger' => 'Tip', 'tur' => 'baslik'],
+                        ['deger' => 'Alt Kırılım', 'tur' => 'baslik'],
+                        ['deger' => 'Firma', 'tur' => 'baslik'],
+                        ['deger' => 'Adet', 'tur' => 'baslik'],
+                        ['deger' => 'Tutar', 'tur' => 'baslik'],
+                    ]);
+                    foreach ($kirilimKaynaklari as $k) {
+                        foreach ($kirilim[$k['kod']] ?? [] as $s) {
+                            $xlsx->satir([
+                                $k['ad'],
+                                $k['tip'] === 'gelir' ? 'Gelir' : 'Gider',
+                                $s['alt_kirilim'],
+                                $s['firma_adi'],
+                                ['deger' => $s['adet'], 'tur' => 'sayi'],
+                                ['deger' => round($s['tutar'], 2), 'tur' => 'para'],
+                            ]);
+                        }
+                    }
+                    // Tek kart: karttaki toplam satırı
+                    if ($bolum === 'kirilim') {
+                        $t = $kaynakTop[$kirilimKaynaklari[0]['kod']] ?? ['adet' => 0, 'tutar' => 0];
                         $xlsx->satir([
-                            $k['ad'],
-                            $k['tip'] === 'gelir' ? 'Gelir' : 'Gider',
-                            $s['alt_kirilim'],
-                            $s['firma_adi'],
-                            ['deger' => $s['adet'], 'tur' => 'sayi'],
-                            ['deger' => round($s['tutar'], 2), 'tur' => 'para'],
+                            ['deger' => 'TOPLAM', 'tur' => 'baslik'], '', '', '',
+                            ['deger' => $t['adet'], 'tur' => 'sayi'],
+                            ['deger' => round($t['tutar'], 2), 'tur' => 'para'],
                         ]);
                     }
                 }
 
-                $xlsx->indir('gelir-gider-' . $f['bas'] . '_' . $f['bit'] . '.xlsx');
+                $dosyaEk = $bolum === 'aylik' ? '-aylik' : ($bolum === 'kirilim' ? '-' . $kirilimKaynaklari[0]['kod'] : '');
+                $xlsx->indir('gelir-gider' . $dosyaEk . '-' . $f['bas'] . '_' . $f['bit'] . '.xlsx');
+                exit;
+
+            // ---------------------------------------------------------
+            // Detay Excel: kırılım detay modalındaki liste (arama + sıralama dahil, sayfalamasız).
+            // Firma kısıtı filtreCoz ile uygulanır (detay action'ıyla aynı).
+            case 'detay_excel':
+                $f = filtreCoz($_POST, $kisitFirmaId);
+                $d = isset($f['hata']) ? $f : detayGirdisi($_POST);
+                $t = isset($d['hata']) ? $d : detayTanim($d, $f);
+                if (isset($t['hata'])) {
+                    http_response_code(400);
+                    header('Content-Type: text/plain; charset=utf-8');
+                    echo $t['hata'];
+                    exit;
+                }
+
+                require_once __DIR__ . '/../includes/XlsxYazici.php';
+                $sonuc  = detayCalistir($t, ['start' => 0, 'length' => DETAY_EXCEL_EN_FAZLA] + $_POST, DETAY_EXCEL_EN_FAZLA);
+                $baslik = mb_substr(trim((string)($_POST['baslik'] ?? '')), 0, 300, 'UTF-8');
+                $ara    = mb_substr(trim((string)($_POST['ara'] ?? '')), 0, 100, 'UTF-8');
+
+                $xlsx = new XlsxYazici('Detay');
+                $xlsx->satir([RAPOR_NOTU]);
+                $xlsx->satir([$baslik . ($ara !== '' ? ' · Arama: ' . $ara : '')]);
+                if ($sonuc['recordsFiltered'] > DETAY_EXCEL_EN_FAZLA) {
+                    $xlsx->satir(['Not: ' . number_format($sonuc['recordsFiltered'], 0, ',', '.') . ' kaydın ilk '
+                        . number_format(DETAY_EXCEL_EN_FAZLA, 0, ',', '.') . ' tanesi yazıldı; aralığı daraltın.']);
+                }
+                $xlsx->satir(array_map(fn($k) => ['deger' => $k[0], 'tur' => 'baslik'], DETAY_EXCEL_KOLONLARI[$d['tur']]));
+                foreach ($sonuc['data'] as $satir) {
+                    $xlsx->satir(detayExcelSatir($d['tur'], $satir));
+                }
+
+                $xlsx->indir('gelir-gider-detay-' . $d['tur'] . '-' . $f['bas'] . '_' . $f['bit'] . '.xlsx');
                 exit;
         }
 
@@ -1684,6 +1795,9 @@ $platformlar = platformListesi();
                     <div class="card mb-3">
                         <div class="card-header">
                             <h3 class="card-title"><i class="bi bi-table"></i> Aylık Döküm</h3>
+                            <div class="card-tools">
+                                <button type="button" class="btn btn-sm btn-outline-success" id="btnExcelAylik" title="Aylık dökümü Excel'e aktar"><i class="bi bi-file-earmark-excel"></i> Excel</button>
+                            </div>
                         </div>
                         <div class="card-body">
                             <div class="table-responsive">
@@ -1720,7 +1834,10 @@ $platformlar = platformListesi();
                             <label class="form-label small mb-1" for="detayAra" id="detayAraEtiket">Ara</label>
                             <input type="text" class="form-control form-control-sm" id="detayAra" maxlength="100">
                         </div>
-                        <div class="col-md-7 text-md-end small text-muted" id="detayKapsam"></div>
+                        <div class="col-md-5 text-md-end small text-muted" id="detayKapsam"></div>
+                        <div class="col-md-2 text-end">
+                            <button type="button" class="btn btn-sm btn-outline-success" id="btnDetayExcel" title="Listeyi arama ve sıralamasıyla Excel'e aktar"><i class="bi bi-file-earmark-excel"></i> Excel</button>
+                        </div>
                     </div>
                     <table class="table table-sm table-striped table-hover w-100" id="tblDetay"></table>
                 </div>
@@ -2049,6 +2166,8 @@ $platformlar = platformListesi();
                     + '<div class="flex-grow-1"><div class="fw-semibold">' + kacis(k.ad) + '</div>'
                     + '<small class="text-muted">' + kacis(k.aciklama) + '</small></div>'
                     + '<span class="badge ' + (k.tip === 'gelir' ? 'text-bg-success' : 'text-bg-danger') + '">' + (k.tip === 'gelir' ? 'Gelir' : 'Gider') + '</span>'
+                    + '<button type="button" class="btn btn-sm btn-outline-success py-0 btn-kirilim-excel" data-kod="' + kacis(k.kod) + '" title="Kırılımı Excel\'e aktar">'
+                    + '<i class="bi bi-file-earmark-excel"></i></button>'
                     + '</div><div class="card-body p-0"><div class="table-responsive">'
                     + '<table class="table table-sm table-striped mb-0 kirilim-tablo"><thead><tr>'
                     + '<th>Kırılım</th><th>Firma</th><th class="text-end">Adet</th><th class="text-end">Tutar</th></tr></thead>'
@@ -2075,6 +2194,7 @@ $platformlar = platformListesi();
         }
 
         let raporIstekNo = 0;   // art arda değişimde yalnız son isteğin yanıtı çizilir
+        let sonFiltre = null;   // ekrandaki raporun filtresi (tablo bazlı Excel)
 
         function raporYukle() {
             const f = filtreVerisi();
@@ -2088,6 +2208,7 @@ $platformlar = platformListesi();
                 const d = res.data;
                 kirilimSecenekCiz(d.kirilimlar, d.kirilimSecili);
                 f.kirilim = d.kirilimSecili || [];
+                sonFiltre = f;
                 ozetCiz(d.ozet);
                 atlananCiz(d.atlanan);
                 grafikCiz(d.aylar);
@@ -2122,16 +2243,31 @@ $platformlar = platformListesi();
             raporYukle();
         });
 
-        // Gizli form ile POST → tarayıcı dosyayı indirir
-        $('#btnExcel').on('click', function () {
-            const f = filtreVerisi();
-            if (!filtreGecerli(f)) return;
+        // Gizli form ile POST → tarayıcı dosyayı indirir. Dizi değerler 'ad[]', iç içe nesne yok.
+        function excelIndir(veri) {
             const form = $('<form>', { method: 'POST', action: '' }).appendTo('body');
-            Object.entries(Object.assign({ action: 'excel' }, f)).forEach(([k, v]) =>
+            Object.entries(veri).forEach(([k, v]) =>
                 (Array.isArray(v) ? v : [v]).forEach(x =>
                     $('<input>', { type: 'hidden', name: Array.isArray(v) ? k + '[]' : k, value: x }).appendTo(form)));
             form.submit().remove();
             showToast('Excel dosyası hazırlanıyor...', 'info');
+        }
+
+        $('#btnExcel').on('click', function () {
+            const f = filtreVerisi();
+            if (!filtreGecerli(f)) return;
+            excelIndir(Object.assign({ action: 'excel' }, f));
+        });
+
+        // Tablo bazlı Excel: ekrandaki tablonun yüklendiği filtreyle (filtre paneli sonradan değişmiş olabilir)
+        $('#btnExcelAylik').on('click', function () {
+            if (!sonFiltre) { showToast('Rapor henüz yüklenmedi', 'warning'); return; }
+            excelIndir(Object.assign({ action: 'excel', bolum: 'aylik' }, sonFiltre));
+        });
+
+        $('#kirilimKartlari').on('click', '.btn-kirilim-excel', function () {
+            if (!sonFiltre) return;
+            excelIndir(Object.assign({ action: 'excel', bolum: 'kirilim', kaynak: $(this).data('kod') }, sonFiltre));
         });
 
         // ===============================================================
@@ -2330,6 +2466,19 @@ $platformlar = platformListesi();
         $('#detayModal').on('shown.bs.modal', function (e) {
             if (e.target !== this || !detayParam) return;
             if (!tblDetay) { detayKur(); } else { tblDetay.columns.adjust(); }
+        });
+
+        // Detay Excel: modaldaki arama ve sıralamayla, sayfalamasız
+        $('#btnDetayExcel').on('click', function () {
+            if (!detayParam || !tblDetay) return;
+            const sira = tblDetay.order()[0] || [0, 'desc'];
+            excelIndir(Object.assign({}, detayParam, {
+                action: 'detay_excel',
+                ara: $('#detayAra').val(),
+                'order[0][column]': sira[0],
+                'order[0][dir]': sira[1],
+                baslik: $('#detayBaslik').text() + ' · ' + $('#detayKapsam').text()
+            }));
         });
 
         $('#detayAra').on('input', function () {
