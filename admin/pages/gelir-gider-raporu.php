@@ -702,12 +702,13 @@ function likeKacis($s)
 // Kırılım detayı: tür → tanım. Kırılım satırının detay_tur değeri buradaki anahtardır.
 //   platform : türün satır etiketi (seçili platform farklıysa detay boş döner, raporla aynı)
 //   anahtar  : 'id' (int, 0 → NULL) | 'kargo' ('KAYNAK|YON')
+//   ad       : kaynak toplamı detayında sekme / Excel bölüm adı
 // =====================================================================
 const DETAY_TURLERI = [
-    'satis'              => ['platform' => PLATFORM_ETICARET, 'anahtar' => 'id'],
-    'komisyon_pazaryeri' => ['platform' => PLATFORM_ETICARET, 'anahtar' => 'id'],
-    'banka'              => ['platform' => null,              'anahtar' => 'id'],
-    'kargo'              => ['platform' => null,              'anahtar' => 'kargo'],
+    'satis'              => ['platform' => PLATFORM_ETICARET, 'anahtar' => 'id',    'ad' => 'Pazaryeri satışları'],
+    'komisyon_pazaryeri' => ['platform' => PLATFORM_ETICARET, 'anahtar' => 'id',    'ad' => 'Pazaryeri komisyonu'],
+    'banka'              => ['platform' => null,              'anahtar' => 'id',    'ad' => 'Banka masrafı'],
+    'kargo'              => ['platform' => null,              'anahtar' => 'kargo', 'ad' => 'Kargo'],
 ];
 
 /** Firma görünen adı (f = Firmalar takma adı; sıralama ve dış SELECT aynı ifadeyi kullanır) */
@@ -1565,35 +1566,65 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // ---------------------------------------------------------
             // Detay Excel: kırılım detay modalındaki liste (arama + sıralama dahil, sayfalamasız).
             // Firma kısıtı filtreCoz ile uygulanır (detay action'ıyla aynı).
+            // Kaynak toplamı birden fazla türse 'parcalar' (JSON: [{tur, anahtarlar, satir_firma_id}])
+            // ile her tür ayrı bölüm yazılır; arama + sıralama yalnız açık sekmeye ('tur') uygulanır.
             case 'detay_excel':
                 $f = filtreCoz($_POST, $kisitFirmaId);
-                $d = isset($f['hata']) ? $f : detayGirdisi($_POST);
-                $t = isset($d['hata']) ? $d : detayTanim($d, $f);
-                if (isset($t['hata'])) {
+                $girdiler = isset($_POST['parcalar']) ? json_decode((string)$_POST['parcalar'], true) : [$_POST];
+                if (!isset($f['hata']) && (!is_array($girdiler) || !$girdiler || count($girdiler) > count(DETAY_TURLERI))) {
+                    $f = ['hata' => 'Geçersiz detay isteği.'];
+                }
+                $parcalar = [];
+                foreach (isset($f['hata']) ? [] : $girdiler as $g) {
+                    $d = is_array($g) ? detayGirdisi($g) : ['hata' => 'Geçersiz detay isteği.'];
+                    $t = isset($d['hata']) ? $d : detayTanim($d, $f);
+                    if (isset($t['hata'])) {
+                        $f = $t;
+                        break;
+                    }
+                    $parcalar[] = ['d' => $d, 't' => $t];
+                }
+                if (isset($f['hata'])) {
                     http_response_code(400);
                     header('Content-Type: text/plain; charset=utf-8');
-                    echo $t['hata'];
+                    echo $f['hata'];
                     exit;
                 }
 
                 require_once __DIR__ . '/../includes/XlsxYazici.php';
-                $sonuc  = detayCalistir($t, ['start' => 0, 'length' => DETAY_EXCEL_EN_FAZLA] + $_POST, DETAY_EXCEL_EN_FAZLA);
-                $baslik = mb_substr(trim((string)($_POST['baslik'] ?? '')), 0, 300, 'UTF-8');
-                $ara    = mb_substr(trim((string)($_POST['ara'] ?? '')), 0, 100, 'UTF-8');
+                $baslik   = mb_substr(trim((string)($_POST['baslik'] ?? '')), 0, 300, 'UTF-8');
+                $ara      = mb_substr(trim((string)($_POST['ara'] ?? '')), 0, 100, 'UTF-8');
+                $aktifTur = (string)($_POST['tur'] ?? '');
+                $cokParca = count($parcalar) > 1;
 
                 $xlsx = new XlsxYazici('Detay');
                 $xlsx->satir([RAPOR_NOTU]);
-                $xlsx->satir([$baslik . ($ara !== '' ? ' · Arama: ' . $ara : '')]);
-                if ($sonuc['recordsFiltered'] > DETAY_EXCEL_EN_FAZLA) {
-                    $xlsx->satir(['Not: ' . number_format($sonuc['recordsFiltered'], 0, ',', '.') . ' kaydın ilk '
-                        . number_format(DETAY_EXCEL_EN_FAZLA, 0, ',', '.') . ' tanesi yazıldı; aralığı daraltın.']);
-                }
-                $xlsx->satir(array_map(fn($k) => ['deger' => $k[0], 'tur' => 'baslik'], DETAY_EXCEL_KOLONLARI[$d['tur']]));
-                foreach ($sonuc['data'] as $satir) {
-                    $xlsx->satir(detayExcelSatir($d['tur'], $satir));
+                $xlsx->satir([$baslik . (!$cokParca && $ara !== '' ? ' · Arama: ' . $ara : '')]);
+
+                foreach ($parcalar as ['d' => $d, 't' => $t]) {
+                    $aktif = !$cokParca || $d['tur'] === $aktifTur;
+                    $istek = ['start' => 0, 'length' => DETAY_EXCEL_EN_FAZLA] + ($aktif ? $_POST : []);
+                    $sonuc = detayCalistir($t, $istek, DETAY_EXCEL_EN_FAZLA);
+
+                    if ($cokParca) {
+                        $xlsx->satir(['']);
+                        $xlsx->satir([['deger' => DETAY_TURLERI[$d['tur']]['ad'] . ' · '
+                            . number_format($sonuc['recordsFiltered'], 0, ',', '.') . ' kayıt · Toplam: '
+                            . number_format(($sonuc['ozet_filtre'] ?? $sonuc['ozet'])['toplam'], 2, ',', '.') . ' ₺'
+                            . ($aktif && $ara !== '' ? ' · Arama: ' . $ara : ''), 'tur' => 'baslik']]);
+                    }
+                    if ($sonuc['recordsFiltered'] > DETAY_EXCEL_EN_FAZLA) {
+                        $xlsx->satir(['Not: ' . number_format($sonuc['recordsFiltered'], 0, ',', '.') . ' kaydın ilk '
+                            . number_format(DETAY_EXCEL_EN_FAZLA, 0, ',', '.') . ' tanesi yazıldı; aralığı daraltın.']);
+                    }
+                    $xlsx->satir(array_map(fn($k) => ['deger' => $k[0], 'tur' => 'baslik'], DETAY_EXCEL_KOLONLARI[$d['tur']]));
+                    foreach ($sonuc['data'] as $satir) {
+                        $xlsx->satir(detayExcelSatir($d['tur'], $satir));
+                    }
                 }
 
-                $xlsx->indir('gelir-gider-detay-' . $d['tur'] . '-' . $f['bas'] . '_' . $f['bit'] . '.xlsx');
+                $xlsx->indir('gelir-gider-detay-' . implode('-', array_map(fn($p) => $p['d']['tur'], $parcalar))
+                    . '-' . $f['bas'] . '_' . $f['bit'] . '.xlsx');
                 exit;
         }
 
@@ -1641,6 +1672,9 @@ $platformlar = platformListesi();
                        align-items: center; justify-content: center; color: #fff; }
         .kirilim-tablo tbody tr.kirilim-satir { cursor: pointer; }
         .kirilim-tablo tbody tr.kirilim-satir td:first-child span { border-bottom: 1px dashed currentColor; }
+        /* Kaynak toplamı (kart altı / aylık Genel Toplam) → kaynağın tüm kırılımlarının detayı */
+        .kaynak-toplam { cursor: pointer; }
+        .kaynak-toplam .toplam-tutar { border-bottom: 1px dashed currentColor; }
         #tblKurallar td, #tblKaynaklar td { vertical-align: middle; }
         #tblKaynaklar input[type=color] { width: 3rem; padding: .15rem; }
         #tblDetay td { vertical-align: middle; }
@@ -1829,6 +1863,8 @@ $platformlar = platformListesi();
                     <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Kapat"></button>
                 </div>
                 <div class="modal-body">
+                    <!-- Kaynak toplamı birden fazla detay türü içeriyorsa (ör. komisyon + banka masrafı) -->
+                    <ul class="nav nav-pills mb-2 d-none" id="detaySekmeler"></ul>
                     <div class="row g-2 align-items-end mb-2">
                         <div class="col-md-5">
                             <label class="form-label small mb-1" for="detayAra" id="detayAraEtiket">Ara</label>
@@ -2125,7 +2161,9 @@ $platformlar = platformListesi();
             }).join(''));
 
             let alt = '<tr><td>Genel Toplam</td>';
-            kaynaklar.forEach(k => { alt += '<td class="text-end tutar">' + para((top[k.kod] || {}).tutar || 0) + '</td>'; });
+            // data-kod: kirilimCiz detayı olan kaynakların hücresini tıklanabilir yapar
+            kaynaklar.forEach(k => { alt += '<td class="text-end tutar" data-kod="' + kacis(k.kod) + '"><span class="toplam-tutar">'
+                                          + para((top[k.kod] || {}).tutar || 0) + '</span></td>'; });
             alt += '<td class="text-end tutar">' + para(d.ozet.gelir) + '</td>'
                  + '<td class="text-end tutar">' + para(d.ozet.gider) + '</td>'
                  + netHucre(d.ozet.net) + '</tr>';
@@ -2135,6 +2173,24 @@ $platformlar = platformListesi();
         // ---------------------------------------------------------------
         // Kırılım satırları → detay modalı (index ile bu listeden okunur; filtre rapor anındaki haliyle saklanır)
         let detayKayitlari = [];
+        let kaynakToplamlari = {};   // kod → kaynak toplamı detayı (türe göre parçalar)
+
+        /**
+         * Kaynağın tüm kırılım satırları → detay türüne göre parçalar (anahtarlar birleşir, satır firması yok:
+         * raporun firma / platform filtresi ve kırılım seçimi zaten satırlara yansımış). adet / tutar
+         * detay özetinin kartla karşılaştırması için satırlardan toplanır.
+         */
+        function kaynakParcalari(satirlar) {
+            const parcalar = {};
+            satirlar.forEach(s => {
+                if (!DETAY_KOLONLARI[s.detay_tur] || !Array.isArray(s.anahtarlar) || !s.anahtarlar.length) return;
+                const p = parcalar[s.detay_tur] ??= { tur: s.detay_tur, anahtarlar: [], satir_firma_id: '', adet: 0, tutar: 0 };
+                s.anahtarlar.forEach(a => { if (!p.anahtarlar.includes(a)) p.anahtarlar.push(a); });
+                p.adet  += Number(s.adet) || 0;
+                p.tutar += Number(s.tutar) || 0;
+            });
+            return Object.values(parcalar);
+        }
 
         function kirilimSatir(k, s, filtre) {
             const hucreler = '<td><span>' + kacis(s.alt_kirilim) + '</span></td><td>' + kacis(s.firma_adi) + '</td>'
@@ -2152,10 +2208,16 @@ $platformlar = platformListesi();
             const kaynaklar = gorunenKaynaklar(d);
             const top = d.kaynakTop || {};
             detayKayitlari = [];
+            kaynakToplamlari = {};
 
             $('#kirilimKartlari').html(kaynaklar.map(k => {
                 const satirlar = (d.kirilim || {})[k.kod] || [];
                 const t = top[k.kod] || { tutar: 0, adet: 0 };
+                const parcalar = kaynakParcalari(satirlar);
+                if (parcalar.length) {
+                    kaynakToplamlari[k.kod] = { kaynak: k.ad, alt: 'Toplam', firma: filtre.firma_ad, parcalar: parcalar, filtre: filtre };
+                }
+                const toplamSinif = parcalar.length ? ' kaynak-toplam" data-kod="' + kacis(k.kod) + '" title="Tüm kırılımların detayını göster' : '';
                 const govde = satirlar.length
                     ? satirlar.map(s => kirilimSatir(k, s, filtre)).join('')
                     : '<tr><td colspan="4" class="text-center text-muted">Kayıt yok</td></tr>';
@@ -2172,10 +2234,16 @@ $platformlar = platformListesi();
                     + '<table class="table table-sm table-striped mb-0 kirilim-tablo"><thead><tr>'
                     + '<th>Kırılım</th><th>Firma</th><th class="text-end">Adet</th><th class="text-end">Tutar</th></tr></thead>'
                     + '<tbody>' + govde + '</tbody>'
-                    + '<tfoot><tr class="fw-bold"><td colspan="2">Toplam</td><td class="text-end">' + Number(t.adet).toLocaleString('tr-TR') + '</td>'
-                    + '<td class="text-end tutar">' + para(t.tutar) + '</td></tr></tfoot>'
+                    + '<tfoot><tr class="fw-bold' + toplamSinif + '"><td colspan="2">Toplam</td><td class="text-end">' + Number(t.adet).toLocaleString('tr-TR') + '</td>'
+                    + '<td class="text-end tutar"><span class="toplam-tutar">' + para(t.tutar) + '</span></td></tr></tfoot>'
                     + '</table></div></div></div></div>';
             }).join(''));
+
+            // Aylık tablo Genel Toplam: yalnız detayı olan kaynak hücreleri tıklanır
+            $('#tblAylik tfoot td[data-kod]').each(function () {
+                const detayli = !!kaynakToplamlari[$(this).data('kod')];
+                $(this).toggleClass('kaynak-toplam', detayli).attr('title', detayli ? 'Tüm kırılımların detayını göster' : null);
+            });
         }
 
         // ---------------------------------------------------------------
@@ -2304,6 +2372,9 @@ $platformlar = platformListesi();
         const sayi = (n) => Number(n || 0).toLocaleString('tr-TR');
         const yuzde = (v) => v === null || v === undefined ? '—' : '%' + Number(v).toLocaleString('tr-TR', { maximumFractionDigits: 2 });
         const metin = (v) => kacis(v);
+
+        /** Detay türü adları (kaynak toplamı sekmeleri): sunucudaki DETAY_TURLERI */
+        const DETAY_AD = <?= json_encode(array_map(fn($t) => $t['ad'], DETAY_TURLERI), JSON_UNESCAPED_UNICODE | JSON_HEX_TAG) ?>;
 
         const DETAY_KOLONLARI = {
             satis: {
@@ -2442,24 +2513,59 @@ $platformlar = platformListesi();
             });
         }
 
-        $('#kirilimKartlari').on('click', '.kirilim-satir', function () {
-            const k = detayKayitlari[$(this).data('idx')];
-            if (!k || !DETAY_KOLONLARI[k.tur]) return;
-            const f = k.filtre;   // raporun yüklendiği filtre: detay kırılım rakamıyla aynı kapsamda
-            detayKayit = k;
+        /**
+         * Detay modalı. a: {kaynak, alt, firma, filtre, parcalar: [{tur, anahtarlar, satir_firma_id, adet, tutar}]}
+         * Kırılım satırı tek parçadır; kaynak toplamında her detay türü bir sekme olur.
+         */
+        let detayAcilis = null;
+
+        function detayParcaSec(i) {
+            const p = detayAcilis.parcalar[i];
+            const f = detayAcilis.filtre;   // raporun yüklendiği filtre: detay kırılım rakamıyla aynı kapsamda
+            detayKayit = p;
             detayParam = {
-                tur: k.tur, anahtarlar: k.anahtarlar, satir_firma_id: k.satir_firma_id,
+                tur: p.tur, anahtarlar: p.anahtarlar, satir_firma_id: p.satir_firma_id,
                 firma_id: f.firma_id, platform: f.platform, bas_tarih: f.bas_tarih, bit_tarih: f.bit_tarih
             };
-            const tanim = DETAY_KOLONLARI[k.tur];
+            const tanim = DETAY_KOLONLARI[p.tur];
             $('#detayIkon').attr('class', 'bi ' + tanim.ikon + ' me-1');
-            $('#detayBaslik').text(k.kaynak + ' – ' + k.alt + ' – ' + k.firma + ' (' + f.bas_tarih + ' – ' + f.bit_tarih + ')');
-            $('#detayKapsam').text('Filtre: ' + f.firma_ad + (f.platform ? ' · Platform: ' + f.platform_ad : ''));
             $('#detayAraEtiket').text(tanim.ara);
             $('#detayAra').val('').attr('placeholder', tanim.ara);
             $('#detayOzet').text('Yükleniyor...');
+            $('#detaySekmeler .nav-link').removeClass('active').eq(i).addClass('active');
             if (tblDetay) { tblDetay.destroy(); $('#tblDetay').empty(); tblDetay = null; }
+            // Modal açıkken sekme değişimi: tablo hemen kurulur (ilk açılışta shown.bs.modal kurar)
+            if ($('#detayModal').hasClass('show')) detayKur();
+        }
+
+        function detayAc(a) {
+            if (!a || !a.parcalar.length) return;
+            const f = a.filtre;
+            detayAcilis = a;
+            $('#detayBaslik').text(a.kaynak + ' – ' + a.alt + ' – ' + a.firma + ' (' + f.bas_tarih + ' – ' + f.bit_tarih + ')');
+            $('#detayKapsam').text('Filtre: ' + f.firma_ad + (f.platform ? ' · Platform: ' + f.platform_ad : ''));
+            $('#detaySekmeler').toggleClass('d-none', a.parcalar.length < 2).html(a.parcalar.map((p, i) =>
+                '<li class="nav-item"><button type="button" class="nav-link py-1" data-i="' + i + '">'
+                + '<i class="bi ' + DETAY_KOLONLARI[p.tur].ikon + ' me-1"></i>' + kacis(DETAY_AD[p.tur] || p.tur)
+                + ' <span class="badge text-bg-light border tutar">' + para(p.tutar) + '</span></button></li>').join(''));
+            detayParcaSec(0);
             bootstrap.Modal.getOrCreateInstance('#detayModal').show();
+        }
+
+        $('#detaySekmeler').on('click', '.nav-link', function () {
+            if (!$(this).hasClass('active')) detayParcaSec($(this).data('i'));
+        });
+
+        $('#kirilimKartlari').on('click', '.kirilim-satir', function () {
+            const k = detayKayitlari[$(this).data('idx')];
+            if (!k || !DETAY_KOLONLARI[k.tur]) return;
+            detayAc({ kaynak: k.kaynak, alt: k.alt, firma: k.firma, filtre: k.filtre,
+                      parcalar: [{ tur: k.tur, anahtarlar: k.anahtarlar, satir_firma_id: k.satir_firma_id, adet: k.adet, tutar: k.tutar }] });
+        });
+
+        // Kaynak toplamı: kart altı Toplam satırı ve aylık tablodaki Genel Toplam hücresi
+        $('#kirilimKartlari, #tblAylik').on('click', '.kaynak-toplam', function () {
+            detayAc(kaynakToplamlari[$(this).data('kod')]);
         });
 
         // Tablo modal görünür olunca kurulur: scrollX kolon genişlikleri doğru hesaplanır
@@ -2468,17 +2574,22 @@ $platformlar = platformListesi();
             if (!tblDetay) { detayKur(); } else { tblDetay.columns.adjust(); }
         });
 
-        // Detay Excel: modaldaki arama ve sıralamayla, sayfalamasız
+        // Detay Excel: modaldaki arama ve sıralamayla, sayfalamasız.
+        // Birden fazla sekme varsa hepsi tek dosyada; arama + sıralama yalnız açık sekmeye uygulanır.
         $('#btnDetayExcel').on('click', function () {
             if (!detayParam || !tblDetay) return;
             const sira = tblDetay.order()[0] || [0, 'desc'];
-            excelIndir(Object.assign({}, detayParam, {
+            const veri = Object.assign({}, detayParam, {
                 action: 'detay_excel',
                 ara: $('#detayAra').val(),
                 'order[0][column]': sira[0],
                 'order[0][dir]': sira[1],
                 baslik: $('#detayBaslik').text() + ' · ' + $('#detayKapsam').text()
-            }));
+            });
+            if (detayAcilis && detayAcilis.parcalar.length > 1) {
+                veri.parcalar = JSON.stringify(detayAcilis.parcalar.map(p => ({ tur: p.tur, anahtarlar: p.anahtarlar, satir_firma_id: p.satir_firma_id })));
+            }
+            excelIndir(veri);
         });
 
         $('#detayAra').on('input', function () {
