@@ -167,9 +167,8 @@ class EvolutionAPI
         
         if ($method === 'POST') {
             curl_setopt($ch, CURLOPT_POST, true);
-            if ($data) {
-                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-            }
+            // Gövdesiz POST'ta da geçerli JSON gönderilir (restart vb.)
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $data ? json_encode($data) : '{}');
         } elseif ($method === 'DELETE') {
             curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
         } elseif ($method === 'PUT') {
@@ -189,13 +188,26 @@ class EvolutionAPI
         }
         
         $decoded = json_decode($response, true);
-        
-        return [
-            'success' => $httpCode >= 200 && $httpCode < 300,
+        $basarili = $httpCode >= 200 && $httpCode < 300;
+
+        $sonuc = [
+            'success' => $basarili,
             'http_code' => $httpCode,
             'data' => $decoded,
             'raw' => $response
         ];
+
+        // Hata durumunda API'nin döndürdüğü gerçek mesaj çözülür
+        // Örn: {"status":400,"response":{"message":["Error: ..."]}}
+        if (!$basarili) {
+            $mesaj = $decoded['response']['message'] ?? $decoded['message'] ?? $decoded['error'] ?? null;
+            if (is_array($mesaj)) {
+                $mesaj = implode(' | ', array_map(fn($m) => is_scalar($m) ? (string)$m : json_encode($m, JSON_UNESCAPED_UNICODE), $mesaj));
+            }
+            $sonuc['message'] = 'HTTP ' . $httpCode . ($mesaj ? ': ' . $mesaj : '');
+        }
+
+        return $sonuc;
     }
     
     /**
@@ -246,7 +258,8 @@ class EvolutionAPI
      */
     public function restart($instanceName)
     {
-        return $this->request('PUT', '/instance/restart/' . rawurlencode($instanceName));
+        // Evolution API v2: POST (v1'deki PUT 404 döner)
+        return $this->request('POST', '/instance/restart/' . rawurlencode($instanceName));
     }
     
     /**

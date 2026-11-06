@@ -297,9 +297,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 $maas = round((float)$normalizedMaas, 2);
             }
-            $dogum_tarihi = !empty($_POST['dogum_tarihi']) ? $_POST['dogum_tarihi'] : null;
-            $ise_giris = !empty($_POST['ise_giris_tarihi']) ? $_POST['ise_giris_tarihi'] : null;
-            $ise_cikis = !empty($_POST['ise_cikis_tarihi']) ? $_POST['ise_cikis_tarihi'] : null;
+            // Tarih alanları: Y-m-d ve 1900-2100 aralığı dışı (örn. 5 haneli yıl) SQL dönüşüm hatası verir
+            $tarihAl = function (string $alan, string $etiket): ?string {
+                $v = trim($_POST[$alan] ?? '');
+                if ($v === '') return null;
+                $d = DateTime::createFromFormat('!Y-m-d', $v);
+                if (!$d || $d->format('Y-m-d') !== $v || (int)$d->format('Y') < 1900 || (int)$d->format('Y') > 2100) {
+                    throw new Exception($etiket . ' geçersiz, lütfen kontrol ediniz');
+                }
+                return $v;
+            };
+            $dogum_tarihi = $tarihAl('dogum_tarihi', 'Doğum Tarihi');
+            $ise_giris = $tarihAl('ise_giris_tarihi', 'İşe Giriş Tarihi');
+            $ise_cikis = $tarihAl('ise_cikis_tarihi', 'İşten Çıkış Tarihi');
             $banka_id = !empty($_POST['banka_id']) ? intval($_POST['banka_id']) : null;
             $sehir_id = !empty($_POST['sehir_id']) ? intval($_POST['sehir_id']) : null;
             $bes_durumu = isset($_POST['bes_durumu']) ? intval($_POST['bes_durumu']) : 0;
@@ -765,7 +775,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     </div>
                                     <div class="col-md-6 mb-3">
                                         <label for="kullanici_dogum_tarihi" class="form-label">Doğum Tarihi</label>
-                                        <input type="date" class="form-control" id="kullanici_dogum_tarihi" name="dogum_tarihi"
+                                        <input type="date" class="form-control" id="kullanici_dogum_tarihi" name="dogum_tarihi" min="1900-01-01" max="2100-12-31"
                                                value="<?= htmlspecialchars($kullanici['kullanici_dogum_tarihi'] ?? '') ?>">
                                     </div>
                                 </div>
@@ -882,12 +892,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 <div class="row">
                                     <div class="col-md-6 mb-3">
                                         <label for="kullanici_ise_giris_tarihi" class="form-label">İşe Giriş Tarihi</label>
-                                        <input type="date" class="form-control" id="kullanici_ise_giris_tarihi" name="ise_giris_tarihi"
+                                        <input type="date" class="form-control" id="kullanici_ise_giris_tarihi" name="ise_giris_tarihi" min="1900-01-01" max="2100-12-31"
                                                value="<?= htmlspecialchars($kullanici['kullanici_ise_giris_tarihi'] ?? '') ?>">
                                     </div>
                                     <div class="col-md-6 mb-3">
                                         <label for="kullanici_ise_cikis_tarihi" class="form-label">İşten Çıkış Tarihi</label>
-                                        <input type="date" class="form-control" id="kullanici_ise_cikis_tarihi" name="ise_cikis_tarihi"
+                                        <input type="date" class="form-control" id="kullanici_ise_cikis_tarihi" name="ise_cikis_tarihi" min="1900-01-01" max="2100-12-31"
                                                value="<?= htmlspecialchars($kullanici['kullanici_ise_cikis_tarihi'] ?? '') ?>">
                                     </div>
                                 </div>
