@@ -226,12 +226,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                     echo json_encode(['success' => true, 'message' => 'Entegrasyon kaydedildi.']);
                 } elseif ($type === 'kanal') {
+                    // Ek ayarlar JSON'u. Fatura entegrasyonunda (Örnek Holding) fatura alanları bunun
+                    // üzerine birleştirilir; diğer kanallarda metin olduğu gibi yazılır
+                    // (yeniden kodlama boş {} değerlerini [] yapardı).
+                    $ayarHam = trim((string)($_POST['ayar'] ?? ''));
+                    $ayarYaz = $ayarHam !== '' ? $ayarHam : null;
+                    if (($_POST['fatura_ayar'] ?? '0') === '1') {
+                        $ayar = $ayarHam !== '' ? json_decode($ayarHam, true) : [];
+                        if (!is_array($ayar) || ($ayar && array_is_list($ayar))) {
+                            echo json_encode(['success' => false, 'message' => 'Ek Ayarlar geçerli bir JSON nesnesi değil.']);
+                            break;
+                        }
+                        foreach (['efatura_seri' => 'EFaturaSeri', 'earsiv_seri' => 'EArsivSeri'] as $alan => $anahtar) {
+                            $seri = strtoupper(trim((string)($_POST[$alan] ?? '')));
+                            if ($seri === '') {
+                                unset($ayar[$anahtar]);
+                            } elseif (!preg_match('/^[A-Z0-9]{3}$/', $seri)) {
+                                echo json_encode(['success' => false, 'message' => 'Seri öneki 3 karakter (harf/rakam) olmalı: ' . $seri]);
+                                break 2;
+                            } else {
+                                $ayar[$anahtar] = $seri;
+                            }
+                        }
+                        $ayar['NumaraYontemi'] = ($_POST['numara_yontemi'] ?? '') === 'seri' ? 'seri' : 'sirali';
+                        $ayarYaz = json_encode($ayar, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                    }
+                    $firmaId = (int)($_POST['firma_id'] ?? 0);
+
                     $data = [
                         'EntegrasyonKanallari_Entegrasyonlar_id' => $_POST['entegrasyon_id'] ?? 0,
                         'EntegrasyonKanallari_Ad' => $_POST['ad'] ?? '',
                         'EntegrasyonKanallari_KullaniciAdi' => !empty($_POST['kullanici']) ? $_POST['kullanici'] : null,
                         'EntegrasyonKanallari_Sifre' => !empty($_POST['sifre']) ? $_POST['sifre'] : null,
-                        'EntegrasyonKanallari_AyarJSON' => !empty($_POST['ayar']) ? $_POST['ayar'] : null,
+                        'EntegrasyonKanallari_AyarJSON' => $ayarYaz,
+                        'EntegrasyonKanallari_Firmalar_id' => $firmaId > 0 ? $firmaId : null,
                         'EntegrasyonKanallari_Durum' => isset($_POST['durum']) ? 1 : 0
                     ];
                     if ($id > 0) {
@@ -1020,6 +1048,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 $entegrasyonlarDD = $db->fetchAll("SELECT Entegrasyonlar_id, Entegrasyonlar_Ad FROM Entegrasyonlar WHERE Entegrasyonlar_Durum = 1 ORDER BY Entegrasyonlar_Ad");
 $entegrasyonlarTumu = $db->fetchAll("SELECT Entegrasyonlar_id, Entegrasyonlar_Ad FROM Entegrasyonlar ORDER BY Entegrasyonlar_Ad");
+// Pasif firmalar da listelenir: pasif firmaya bağlı kanal düzenlenince bağlantı kaybolmasın
+$firmalarDD = $db->fetchAll("SELECT firma_id, firma_adi, CAST(firma_durum AS INT) AS firma_durum FROM Firmalar ORDER BY firma_durum DESC, firma_adi") ?: [];
 
 ?>
 <!DOCTYPE html>
@@ -1385,7 +1415,7 @@ $entegrasyonlarTumu = $db->fetchAll("SELECT Entegrasyonlar_id, Entegrasyonlar_Ad
                                 <select class="form-select select2" id="kanal_entegrasyon_id" name="entegrasyon_id" required>
                                     <option value="">Seçiniz...</option>
                                     <?php foreach ($entegrasyonlarDD as $ent): ?>
-                                    <option value="<?= $ent['Entegrasyonlar_id'] ?>"><?= htmlspecialchars($ent['Entegrasyonlar_Ad']) ?></option>
+                                    <option value="<?= $ent['Entegrasyonlar_id'] ?>"<?= $ent['Entegrasyonlar_Ad'] === 'ÖRNEK HOLDİNG' ? ' data-fatura="1"' : '' ?>><?= htmlspecialchars($ent['Entegrasyonlar_Ad']) ?></option>
                                     <?php endforeach; ?>
                                 </select>
                             </div>
@@ -1394,12 +1424,46 @@ $entegrasyonlarTumu = $db->fetchAll("SELECT Entegrasyonlar_id, Entegrasyonlar_Ad
                                 <input type="text" class="form-control" id="kanal_ad" name="ad" required>
                             </div>
                             <div class="col-md-6 mb-3">
+                                <label class="form-label">Firma</label>
+                                <select class="form-select select2" id="kanal_firma_id" name="firma_id">
+                                    <option value="">Firmaya bağlı değil</option>
+                                    <?php foreach ($firmalarDD as $fr): ?>
+                                    <option value="<?= (int)$fr['firma_id'] ?>"><?= htmlspecialchars($fr['firma_adi']) ?><?= (int)$fr['firma_durum'] === 1 ? '' : ' (pasif)' ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                                <small class="text-muted">Faturanın ve pazaryeri siparişinin ait olduğu firma</small>
+                            </div>
+                            <div class="col-md-6 mb-3">
                                 <label class="form-label">Kullanıcı Adı / API Key</label>
                                 <input type="text" class="form-control" id="kanal_kullanici" name="kullanici">
                             </div>
                             <div class="col-md-6 mb-3">
                                 <label class="form-label">Şifre / Secret</label>
                                 <input type="text" class="form-control" id="kanal_sifre" name="sifre">
+                            </div>
+                            <div class="col-12 d-none" id="kanalFaturaAyar">
+                                <input type="hidden" name="fatura_ayar" id="kanal_fatura_ayar" value="0">
+                                <div class="border rounded p-3 mb-3">
+                                    <h6 class="mb-3"><i class="bi bi-receipt me-1"></i> Fatura Ayarları</h6>
+                                    <div class="row">
+                                        <div class="col-md-4 mb-2">
+                                            <label class="form-label">e-Fatura Serisi</label>
+                                            <input type="text" class="form-control text-uppercase" id="kanal_efatura_seri" name="efatura_seri" maxlength="3" placeholder="ör. OSB">
+                                        </div>
+                                        <div class="col-md-4 mb-2">
+                                            <label class="form-label">e-Arşiv Serisi</label>
+                                            <input type="text" class="form-control text-uppercase" id="kanal_earsiv_seri" name="earsiv_seri" maxlength="3" placeholder="ör. OSA">
+                                        </div>
+                                        <div class="col-md-4 mb-2">
+                                            <label class="form-label">Numara Yöntemi</label>
+                                            <select class="form-select select2" id="kanal_numara_yontemi" name="numara_yontemi">
+                                                <option value="sirali">Sıralı (son numara Örnek Holding'den okunur)</option>
+                                                <option value="seri">Seri (numarayı Örnek Holding atar)</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                    <small class="text-muted">Seri öneki 3 karakter (harf/rakam) olmalı ve Örnek Holding panelinde tanımlı olmalıdır. Pazaryeri kanalı bazında farklı seri, Pazaryeri Ayarları'ndan verilebilir.</small>
+                                </div>
                             </div>
                             <div class="col-12 mb-3">
                                 <label class="form-label">Ek Ayarlar (JSON)</label>
@@ -1625,6 +1689,9 @@ $entegrasyonlarTumu = $db->fetchAll("SELECT Entegrasyonlar_id, Entegrasyonlar_Ad
                 // Sekme gizliyken oluşan DataTables kolon genişliklerini düzelt
                 $.fn.dataTable.tables({visible: true, api: true}).columns.adjust();
             });
+
+            // Kanal formunda entegrasyon değişince fatura ayarları göster/gizle
+            $('#kanal_entegrasyon_id').on('change', kanalFaturaAlaniGuncelle);
 
             // Log filtresinde entegrasyon değişince kanal listesi daralsın
             $('#fl_entegrasyon').on('change', function() { kanalSecenekleriniDoldur($(this).val()); });
@@ -2131,10 +2198,23 @@ $entegrasyonlarTumu = $db->fetchAll("SELECT Entegrasyonlar_id, Entegrasyonlar_Ad
             }, 'json');
         }
 
+        // Fatura ayarı anahtarları kanal JSON'unda tutulur; formda ayrı alanlarda düzenlenir
+        const FATURA_ANAHTARLARI = ['EFaturaSeri', 'EArsivSeri', 'NumaraYontemi'];
+
+        // Seçili entegrasyon fatura entegrasyonu (Örnek Holding) ise fatura ayarları görünür
+        function kanalFaturaAlaniGuncelle() {
+            const fatura = $('#kanal_entegrasyon_id option:selected').data('fatura') == 1;
+            $('#kanalFaturaAyar').toggleClass('d-none', !fatura);
+            $('#kanal_fatura_ayar').val(fatura ? 1 : 0);
+        }
+
         function openKanalModal() {
             $('#kanalForm')[0].reset();
             $('#kanal_id').val(0);
             if($('#kanal_entegrasyon_id').data('select2')) $('#kanal_entegrasyon_id').val('').trigger('change');
+            $('#kanal_firma_id').val('').trigger('change');
+            $('#kanal_numara_yontemi').val('sirali').trigger('change');
+            kanalFaturaAlaniGuncelle();
             mdKanal.show();
         }
 
@@ -2146,13 +2226,28 @@ $entegrasyonlarTumu = $db->fetchAll("SELECT Entegrasyonlar_id, Entegrasyonlar_Ad
                     $('#kanal_ad').val(d.EntegrasyonKanallari_Ad);
                     $('#kanal_kullanici').val(d.EntegrasyonKanallari_KullaniciAdi);
                     $('#kanal_sifre').val(d.EntegrasyonKanallari_Sifre);
-                    $('#kanal_ayar').val(d.EntegrasyonKanallari_AyarJSON);
+                    // Fatura anahtarları ayrı alanlara alınır, JSON kutusunda kalanlar gösterilir
+                    let ayar = null;
+                    try { ayar = d.EntegrasyonKanallari_AyarJSON ? JSON.parse(d.EntegrasyonKanallari_AyarJSON) : null; } catch (e) { ayar = null; }
+                    const nesne = ayar && typeof ayar === 'object' && !Array.isArray(ayar);
+                    $('#kanal_efatura_seri').val(nesne ? (ayar.EFaturaSeri || '') : '');
+                    $('#kanal_earsiv_seri').val(nesne ? (ayar.EArsivSeri || '') : '');
+                    $('#kanal_numara_yontemi').val(nesne && ayar.NumaraYontemi === 'seri' ? 'seri' : 'sirali').trigger('change');
+                    const faturaKanali = $('#kanal_entegrasyon_id option[value="' + d.EntegrasyonKanallari_Entegrasyonlar_id + '"]').data('fatura') == 1;
+                    if (nesne && faturaKanali) {
+                        FATURA_ANAHTARLARI.forEach(k => delete ayar[k]);
+                        $('#kanal_ayar').val(Object.keys(ayar).length ? JSON.stringify(ayar, null, 2) : '');
+                    } else {
+                        $('#kanal_ayar').val(d.EntegrasyonKanallari_AyarJSON);
+                    }
+                    $('#kanal_firma_id').val(d.EntegrasyonKanallari_Firmalar_id || '').trigger('change');
                     $('#kanal_durum').prop('checked', d.EntegrasyonKanallari_Durum == 1);
                     if($('#kanal_entegrasyon_id').data('select2')) {
                         $('#kanal_entegrasyon_id').val(d.EntegrasyonKanallari_Entegrasyonlar_id).trigger('change');
                     } else {
                         $('#kanal_entegrasyon_id').val(d.EntegrasyonKanallari_Entegrasyonlar_id);
                     }
+                    kanalFaturaAlaniGuncelle();
                     mdKanal.show();
                 }
             }, 'json');
