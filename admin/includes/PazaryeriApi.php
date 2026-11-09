@@ -679,21 +679,60 @@ abstract class PazaryeriApi
             'PazaryeriSiparisleri_TerminTarihi'   => $s['terminTarihi']   ?? null,
             'PazaryeriSiparisleri_TahminiTeslim'  => $s['tahminiTeslim']  ?? null,
             'PazaryeriSiparisleri_HamVeri'        => isset($s['ham']) ? json_encode($s['ham'], JSON_UNESCAPED_UNICODE) : null,
-            'PazaryeriSiparisleri_Durum'          => 1
+            // pasif: kapanan paket (ör. Trendyol UnPacked); kayıt gizlenir
+            'PazaryeriSiparisleri_Durum'          => empty($s['pasif']) ? 1 : 0
         ];
 
+        $kolonlar = "PazaryeriSiparisleri_id, PazaryeriSiparisleri_DurumKod, PazaryeriSiparisleri_PaketNo";
         $mevcut = $this->db->fetchOne("
-            SELECT PazaryeriSiparisleri_id FROM dbo.PazaryeriSiparisleri
+            SELECT $kolonlar FROM dbo.PazaryeriSiparisleri
             WHERE PazaryeriSiparisleri_EntegrasyonKanallari_id = ? AND PazaryeriSiparisleri_DisId = ?
         ", [$this->kanalId, $disId]);
 
+        // Anahtar değiştiyse (ör. Trendyol orderNumber → paket no) eski kayıt
+        // sipariş no + paket no ile bulunur ve yeni anahtara geçirilir (Faturalar_id korunur)
+        $siparisNo = (string)($s['siparisNo'] ?? '');
+        $paketNo   = (string)($s['paketNo'] ?? '');
+        if (!$mevcut && $siparisNo !== '' && $paketNo !== '' && $siparisNo !== $disId) {
+            $mevcut = $this->db->fetchOne("
+                SELECT $kolonlar FROM dbo.PazaryeriSiparisleri
+                WHERE PazaryeriSiparisleri_EntegrasyonKanallari_id = ?
+                  AND PazaryeriSiparisleri_DisId = ? AND PazaryeriSiparisleri_PaketNo = ?
+            ", [$this->kanalId, $siparisNo, $paketNo]);
+            if ($mevcut) {
+                $veri['PazaryeriSiparisleri_DisId'] = $disId;
+            }
+        }
+
         if ($mevcut) {
+            // Bölünen pakette eski paket iptal olur, yenisi aynı sipariş no ile gelir.
+            // İptal paket, başka paketin aktif kaydını ezmez.
+            if (($veri['PazaryeriSiparisleri_DurumKod'] ?? '') === 'iptal'
+                && ($mevcut['PazaryeriSiparisleri_DurumKod'] ?? '') !== 'iptal'
+                && (string)$mevcut['PazaryeriSiparisleri_PaketNo'] !== (string)$veri['PazaryeriSiparisleri_PaketNo']) {
+                return (int)$mevcut['PazaryeriSiparisleri_id'];
+            }
+
             $veri['PazaryeriSiparisleri_GuncelleyenKullanici'] = $this->userId;
             $veri['PazaryeriSiparisleri_GuncellemeTarihi']     = $simdi;
             $this->db->update('PazaryeriSiparisleri', $veri,
                 ['PazaryeriSiparisleri_id' => $mevcut['PazaryeriSiparisleri_id']]);
             $siparisId = (int)$mevcut['PazaryeriSiparisleri_id'];
         } else {
+            // Kapanmış paket yeni kayıt olarak açılmaz
+            if (!empty($s['pasif'])) {
+                return false;
+            }
+            // Bölünmüş siparişin iptal paketi, aynı siparişin aktif paketi varken kayıt açmaz
+            if (($veri['PazaryeriSiparisleri_DurumKod'] ?? '') === 'iptal' && $siparisNo !== ''
+                && $this->db->fetchOne("
+                    SELECT TOP 1 1 AS var FROM dbo.PazaryeriSiparisleri
+                    WHERE PazaryeriSiparisleri_EntegrasyonKanallari_id = ? AND PazaryeriSiparisleri_SiparisNo = ?
+                      AND PazaryeriSiparisleri_Durum = 1 AND PazaryeriSiparisleri_DurumKod <> 'iptal'
+                ", [$this->kanalId, $siparisNo])) {
+                return false;
+            }
+
             $veri['PazaryeriSiparisleri_EntegrasyonKanallari_id'] = $this->kanalId;
             $veri['PazaryeriSiparisleri_Pazaryerleri_id']         = $this->pazaryeriId;
             $veri['PazaryeriSiparisleri_DisId']                   = $disId;

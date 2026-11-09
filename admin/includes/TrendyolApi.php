@@ -326,6 +326,7 @@ class TrendyolApi extends PazaryeriApi
                         ON s.PazaryeriSiparisleri_id = c.PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id
                 WHERE s.PazaryeriSiparisleri_EntegrasyonKanallari_id = ?
                   AND s.PazaryeriSiparisleri_SiparisNo = ?
+                  AND s.PazaryeriSiparisleri_Durum = 1   -- bölünmüş siparişin kapanan paketi pay almaz
                   AND ISNULL(c.PazaryeriSiparisKalemleri_Barkod, '') = ?
             ", [$this->kanalId, $siparisNo, $barkod]) ?: [];
 
@@ -380,9 +381,12 @@ class TrendyolApi extends PazaryeriApi
         $alici   = trim(($adres['firstName'] ?? '') . ' ' . ($adres['lastName'] ?? ''));
 
         return [
-            'disId'          => (string)($s['orderNumber'] ?? ($s['id'] ?? '')),
+            // Paket bazlı kayıt: bölünen siparişte her paket ayrı satırdır (orderNumber ortak)
+            'disId'          => (string)($s['shipmentPackageId'] ?? ($s['id'] ?? ($s['orderNumber'] ?? ''))),
             'siparisNo'      => (string)($s['orderNumber'] ?? ''),
             'paketNo'        => (string)($s['shipmentPackageId'] ?? ($paket['id'] ?? '')),
+            // Bölünüp kapanan paket (yerine yeni paketler açılır) listede gösterilmez
+            'pasif'          => strcasecmp((string)($s['status'] ?? ''), 'UnPacked') === 0,
             'durumKod'       => $this->siparisDurumKodu($s['status'] ?? ''),
             'hamDurum'       => $s['status'] ?? null,
             'toplamTutar'    => $s['totalPrice'] ?? null,
