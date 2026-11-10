@@ -64,30 +64,99 @@ class OrnekHoldingApi
         $db = $db ?: Database::getInstance();
 
         return $db->fetchAll("
-            SELECT k.*, e.Entegrasyonlar_AyarJSON, e.Entegrasyonlar_id
+            SELECT k.*, e.Entegrasyonlar_AyarJSON, e.Entegrasyonlar_id,
+                   f.firma_vergi_no AS Firma_VergiNo
             FROM Entegrasyonlar e
             INNER JOIN EntegrasyonKanallari k
                     ON k.EntegrasyonKanallari_Entegrasyonlar_id = e.Entegrasyonlar_id
+            LEFT JOIN Firmalar f ON f.firma_id = k.EntegrasyonKanallari_Firmalar_id
             WHERE e.Entegrasyonlar_Ad = 'ÖRNEK HOLDİNG'
               AND k.EntegrasyonKanallari_Durum = 1
             ORDER BY k.EntegrasyonKanallari_id
         ") ?: [];
     }
 
+    /**
+     * Tek kanalı entegrasyon ayarlarıyla birlikte yükler (pasif kanal da döner;
+     * pasif kanal yalnız "Ortam":"TEST" ise kullanılabilir, bkz. configYukle).
+     */
+    public static function kanaldan(int $kanalId, ?int $userId = 1, $db = null): ?self
+    {
+        $db  = $db ?: Database::getInstance();
+        $row = $db->fetchOne("
+            SELECT k.*, e.Entegrasyonlar_AyarJSON, e.Entegrasyonlar_id,
+                   f.firma_vergi_no AS Firma_VergiNo
+            FROM Entegrasyonlar e
+            INNER JOIN EntegrasyonKanallari k
+                    ON k.EntegrasyonKanallari_Entegrasyonlar_id = e.Entegrasyonlar_id
+            LEFT JOIN Firmalar f ON f.firma_id = k.EntegrasyonKanallari_Firmalar_id
+            WHERE e.Entegrasyonlar_Ad = 'ÖRNEK HOLDİNG' AND e.Entegrasyonlar_Durum = 1
+              AND k.EntegrasyonKanallari_id = ?
+        ", [$kanalId]);
+
+        return $row ? new self($row, $userId) : null;
+    }
+
+    /**
+     * Ayar sırası: entegrasyon JSON (endpoint'ler) → kanal JSON (VKN, GbEtiket,
+     * EFaturaSeri, EArsivSeri, NumaraYontemi, XsltKlasoru, Ortam...) → kimlik kolonları.
+     */
     private function configYukle(): void
     {
-        $ayar = json_decode((string)($this->kanal['Entegrasyonlar_AyarJSON'] ?? '{}'), true) ?: [];
+        $ayar      = json_decode((string)($this->kanal['Entegrasyonlar_AyarJSON'] ?? '{}'), true);
+        $kanalAyar = json_decode((string)($this->kanal['EntegrasyonKanallari_AyarJSON'] ?? '{}'), true);
 
-        $this->config = array_merge($ayar, [
-            'KullaniciAdi' => $this->kanal['EntegrasyonKanallari_KullaniciAdi'] ?? '',
-            'Sifre'        => $this->kanal['EntegrasyonKanallari_Sifre'] ?? '',
-        ]);
+        $this->config = array_merge(
+            is_array($ayar) ? $ayar : [],
+            is_array($kanalAyar) ? $kanalAyar : [],
+            [
+                'KullaniciAdi' => $this->kanal['EntegrasyonKanallari_KullaniciAdi'] ?? '',
+                'Sifre'        => $this->kanal['EntegrasyonKanallari_Sifre'] ?? '',
+            ]
+        );
+
+        // VKN kanal JSON'unda yoksa kanalın bağlı olduğu firmanın vergi numarası
+        if (trim((string)($this->config['VKN'] ?? '')) === '') {
+            $this->config['VKN'] = preg_replace('/\D/', '', (string)($this->kanal['Firma_VergiNo'] ?? ''));
+        }
 
         if (empty($this->config['KimlikDogrulama']) || empty($this->config['EFatura'])) {
             $this->hata = 'Entegrasyon ayarlarında KimlikDogrulama / EFatura endpoint tanımlı değil.';
         } elseif ($this->config['KullaniciAdi'] === '' || $this->config['Sifre'] === '') {
             $this->hata = 'Kanal ayarlarında kullanıcı adı / şifre tanımlı değil: ' . $this->kanalAdi;
+        } elseif (isset($this->kanal['EntegrasyonKanallari_Durum'])
+                  && (int)$this->kanal['EntegrasyonKanallari_Durum'] !== 1 && !$this->testMi()) {
+            $this->hata = 'Örnek Holding kanalı pasif: ' . $this->kanalAdi;
         }
+    }
+
+    /** Kanal ayarında "Ortam":"TEST" (Örnek Holding test hesabı) */
+    public function testMi(): bool
+    {
+        return strtoupper((string)($this->config['Ortam'] ?? '')) === 'TEST';
+    }
+
+    /** Birleşik ayardan tek değer; şifre dışarı verilmez */
+    public function ayar(string $anahtar, $varsayilan = null)
+    {
+        if ($anahtar === 'Sifre') {
+            return null;
+        }
+        $deger = $this->config[$anahtar] ?? null;
+        return ($deger === null || $deger === '') ? $varsayilan : $deger;
+    }
+
+    /** Fatura servisinin kanal kontrolü için özet */
+    public function kanalBilgi(): array
+    {
+        $firma = $this->kanal['EntegrasyonKanallari_Firmalar_id'] ?? null;
+        return [
+            'kanal_id'  => $this->kanalId,
+            'kanal_adi' => $this->kanalAdi,
+            'firma_id'  => $firma !== null ? (int)$firma : null,
+            'test'      => $this->testMi(),
+            'vkn'       => (string)($this->config['VKN'] ?? ''),
+        ];
     }
 
     public function hazirMi(): bool
@@ -285,6 +354,279 @@ class OrnekHoldingApi
             $sonuc = $islem($sessionId);
         }
 
+        return $sonuc;
+    }
+
+    /** soapCall sonucunu oturumluCagri'nin beklediği biçime çevirir */
+    private function soapSonuc(string $url, string $root, string $icXml, string $islem,
+                               array $logIstek = [], string $ns = self::NS_WSDL): array
+    {
+        [$dom, $hata] = $this->soapCall($url, $root, $icXml, $islem, $logIstek, $ns);
+        return ['success' => $hata === '', 'message' => $hata, 'data' => [], 'dom' => $dom];
+    }
+
+    // ================================================================
+    // Fatura kesme (kaynak: ornekmusteri.com.tr OrnekHoldingApi, pazaryeri-modul FaturaKesim)
+    // ================================================================
+
+    /**
+     * Alıcı e-Fatura mükellefi mi? (CheckUser)
+     *
+     * Servis hatası ile "kayıtlı değil" ayrılır: hata durumunda success=false döner ve
+     * çağıran işlemi DURDURMALIDIR; aksi halde mükellefe yanlışlıkla e-Arşiv kesilir.
+     *
+     * @return array ['success', 'message', 'mukellef', 'alias', 'unvan']
+     */
+    public function mukellefSorgula(string $vkn): array
+    {
+        $vkn = preg_replace('/\D/', '', $vkn);
+        if (!$this->hazirMi()) {
+            return ['success' => false, 'message' => $this->hata];
+        }
+        if (strlen($vkn) !== 10 && strlen($vkn) !== 11) {
+            return ['success' => true, 'message' => '', 'mukellef' => false, 'alias' => '', 'unvan' => ''];
+        }
+
+        $r = $this->oturumluCagri(fn($sid) => $this->soapSonuc(
+            $this->endpoint('EFatura'),
+            'CheckUserRequest',
+            $this->requestHeaderXml($sid)
+                . '<USER><IDENTIFIER>' . $vkn . '</IDENTIFIER><DOCUMENT_TYPE>INVOICE</DOCUMENT_TYPE></USER>',
+            'mukellef_sorgu',
+            ['vkn' => $vkn]
+        ));
+
+        // 10008 = kayıt bulunamadı → mükellef değil (hata değil)
+        if (!$r['success'] && strpos($r['message'], '[10008]') === false) {
+            return ['success' => false, 'message' => $r['message']];
+        }
+
+        $alias = $yedekAlias = $unvan = '';
+        $dom = $r['dom'] ?? null;
+        if ($dom) {
+            foreach ($dom->getElementsByTagName('*') as $node) {
+                if ($node->localName !== 'USER') continue;
+                if ($this->altDeger($node, 'DELETED') === 'Y') continue;
+                $tur = strtoupper($this->altDeger($node, 'DOCUMENT_TYPE'));
+                if ($tur !== '' && $tur !== 'INVOICE') continue;
+
+                $a     = $this->altDeger($node, 'ALIAS');
+                $unvan = $unvan ?: $this->altDeger($node, 'TITLE');
+                if ($a === '') continue;
+                // Gönderim alıcının posta kutusu (PK) etiketine yapılır
+                if (strtoupper($this->altDeger($node, 'UNIT')) === 'PK' || stripos($a, 'pk@') !== false) {
+                    $alias = $alias ?: $a;
+                } else {
+                    $yedekAlias = $yedekAlias ?: $a;
+                }
+            }
+        }
+        $alias = $alias ?: $yedekAlias;
+
+        return ['success' => true, 'message' => '', 'mukellef' => $alias !== '', 'alias' => $alias, 'unvan' => $unvan];
+    }
+
+    /**
+     * e-Fatura gönder (SendInvoice) veya taslak yükle (LoadInvoice; GİB'e gitmez).
+     * $seri boşsa (sıralı numaralandırma) numara UBL cbc:ID'dedir.
+     *
+     * @return array ['success', 'message', 'fatura_no']
+     */
+    public function efaturaGonder(string $ublXml, string $ettn, string $aliciVkn, string $aliciAlias,
+                                  string $seri, bool $taslak = true): array
+    {
+        if (!$this->hazirMi()) {
+            return ['success' => false, 'message' => $this->hata];
+        }
+
+        $icerik = base64_encode($ublXml);
+        $h = fn($s) => htmlspecialchars((string)$s, ENT_XML1, 'UTF-8');
+
+        $r = $this->oturumluCagri(function ($sid) use ($icerik, $ettn, $aliciVkn, $aliciAlias, $seri, $taslak, $h) {
+            if ($taslak) {
+                return $this->soapSonuc(
+                    $this->endpoint('EFatura'),
+                    'LoadInvoiceRequest',
+                    $this->requestHeaderXml($sid)
+                        . '<INVOICE UUID="' . $h($ettn) . '"><CONTENT>' . $icerik . '</CONTENT></INVOICE>',
+                    'efatura_taslak',
+                    ['ettn' => $ettn, 'alici' => $aliciVkn]
+                );
+            }
+
+            $gondericiAlias = (string)($this->config['GbEtiket'] ?? '');
+            // XSD sırası: SENDER, RECEIVER, XSLT_NAME, SERI_PREFIX, DISABLE_DATE_CONTROL, INVOICE
+            return $this->soapSonuc(
+                $this->endpoint('EFatura'),
+                'SendInvoiceRequest',
+                $this->requestHeaderXml($sid)
+                    . '<SENDER vkn="' . $h($this->config['VKN'] ?? '') . '"'
+                    . ($gondericiAlias !== '' ? ' alias="' . $h($gondericiAlias) . '"' : '') . '/>'
+                    . '<RECEIVER vkn="' . $h($aliciVkn) . '" alias="' . $h($aliciAlias) . '"/>'
+                    . ($seri !== '' ? '<SERI_PREFIX>' . $h($seri) . '</SERI_PREFIX>' : '')
+                    . '<INVOICE UUID="' . $h($ettn) . '"><CONTENT>' . $icerik . '</CONTENT></INVOICE>',
+                'efatura_gonder',
+                ['ettn' => $ettn, 'alici' => $aliciVkn, 'alias' => $aliciAlias, 'seri' => $seri]
+            );
+        });
+
+        if (!$r['success']) {
+            return ['success' => false, 'message' => $r['message']];
+        }
+
+        $el = !empty($r['dom']) ? $this->ilkElement($r['dom'], 'INVOICE_ID') : null;
+        return ['success' => true, 'message' => '', 'fatura_no' => $el ? trim($el->textContent) : ''];
+    }
+
+    /**
+     * e-Arşiv faturası yaz (WriteToArchiveExtended). TEST kanalında EARCHIVE_TEST_FLAG=Y.
+     *
+     * @return array ['success', 'message', 'fatura_no', 'web_key']
+     */
+    public function earsivGonder(string $ublXml, string $ettn, string $seri, bool $taslak = true,
+                                 string $earsivTipi = 'NORMAL'): array
+    {
+        if (!$this->hazirMi()) {
+            return ['success' => false, 'message' => $this->hata];
+        }
+        if (!$this->earsivVarMi()) {
+            return ['success' => false, 'message' => 'Entegrasyon ayarlarında EArsiv endpoint tanımlı değil.'];
+        }
+
+        $earsivTipi = $earsivTipi === 'INTERNET' ? 'INTERNET' : 'NORMAL';
+        $h = fn($s) => htmlspecialchars((string)$s, ENT_XML1, 'UTF-8');
+
+        // XSD sırası: EARSIV_FLAG, EARSIV_PROPERTIES, PDF_PROPERTIES, ARCHIVE_NOTE, INVOICE_CONTENT
+        //   EARSIV_PROPERTIES: EARSIV_TYPE, EARSIV_EMAIL_FLAG, EARSIV_EMAIL, SUB_STATUS,
+        //                      ARCH_INVOICE_ID, SERI, EARCHIVE_TEST_FLAG
+        $govde = '<ArchiveInvoiceExtendedContent><INVOICE_PROPERTIES>'
+               . '<EARSIV_FLAG>Y</EARSIV_FLAG>'
+               . '<EARSIV_PROPERTIES>'
+               . '<EARSIV_TYPE>' . $earsivTipi . '</EARSIV_TYPE>'
+               . '<EARSIV_EMAIL_FLAG>N</EARSIV_EMAIL_FLAG>'
+               . '<SUB_STATUS>' . ($taslak ? 'DRAFT' : 'NEW') . '</SUB_STATUS>'
+               . ($seri !== '' ? '<SERI>' . $h($seri) . '</SERI>' : '')
+               . '<EARCHIVE_TEST_FLAG>' . ($this->testMi() ? 'Y' : 'N') . '</EARCHIVE_TEST_FLAG>'
+               . '</EARSIV_PROPERTIES>'
+               . '<INVOICE_CONTENT>' . base64_encode($ublXml) . '</INVOICE_CONTENT>'
+               . '</INVOICE_PROPERTIES></ArchiveInvoiceExtendedContent>';
+
+        $r = $this->oturumluCagri(fn($sid) => $this->soapSonuc(
+            $this->endpoint('EArsiv'),
+            'ArchiveInvoiceExtendedRequest',
+            $this->requestHeaderXml($sid) . $govde,
+            $taslak ? 'earsiv_taslak' : 'earsiv_gonder',
+            ['ettn' => $ettn, 'seri' => $seri, 'tip' => $earsivTipi, 'test' => $this->testMi()],
+            self::NS_WSDL_ARCHIVE
+        ));
+
+        if (!$r['success']) {
+            return ['success' => false, 'message' => $r['message']];
+        }
+
+        $no = $webKey = '';
+        if (!empty($r['dom'])) {
+            $el = $this->ilkElement($r['dom'], 'INVOICE_ID');
+            if ($el) $no = trim($el->textContent);
+            $el = $this->ilkElement($r['dom'], 'WEB_KEY');
+            if ($el) $webKey = trim($el->textContent);
+        }
+
+        return ['success' => true, 'message' => '', 'fatura_no' => $no, 'web_key' => $webKey];
+    }
+
+    /**
+     * Serinin o yıl Örnek Holding'de kullanılmış en büyük sıra numarası (servisten, anlık).
+     * Taslakların yer tutucu numarası (…000000000) sayılmaz.
+     *
+     * @param string $belgeTuru EARSIV | EFATURA
+     * @return array ['success', 'message', 'sira']  (hiç yoksa sira = 0)
+     */
+    public function sonSiraNumarasi(string $belgeTuru, string $seri, ?int $yil = null): array
+    {
+        $yil   = $yil ?: (int)date('Y');
+        $seri  = strtoupper($seri);
+        $desen = '/^' . preg_quote($seri, '/') . $yil . '(\d{9})$/';
+        $bitis = min(date('Y-m-d'), $yil . '-12-31');
+
+        $numaralar = [];
+        if ($belgeTuru === 'EARSIV') {
+            $r = $this->earsivListesi(['start_date' => $yil . '-01-01', 'end_date' => $bitis, 'limit' => 10000]);
+            if (!$r['success']) {
+                return ['success' => false, 'message' => $r['message'], 'sira' => 0];
+            }
+            $numaralar = array_column($r['data'], 'fatura_no');
+        } else {
+            // e-Fatura listesinde istek başına sınır var (10010); ay ay taranır
+            $ay = new DateTime($yil . '-01-01');
+            while ($ay->format('Y-m-d') <= $bitis) {
+                $son = min((clone $ay)->modify('last day of this month')->format('Y-m-d'), $bitis);
+                $r = $this->faturaListesi('OUT', ['start_date' => $ay->format('Y-m-d'), 'end_date' => $son, 'limit' => 1000]);
+                if (!$r['success']) {
+                    return ['success' => false, 'message' => $r['message'], 'sira' => 0];
+                }
+                $numaralar = array_merge($numaralar, array_column($r['data'] ?? [], 'fatura_no'));
+                $ay->modify('first day of next month');
+            }
+        }
+
+        $enBuyuk = 0;
+        foreach ($numaralar as $no) {
+            if (preg_match($desen, strtoupper(trim((string)$no)), $m)) {
+                $enBuyuk = max($enBuyuk, (int)$m[1]);
+            }
+        }
+        return ['success' => true, 'message' => '', 'sira' => $enBuyuk];
+    }
+
+    /**
+     * e-Arşiv belge durumları (GetEArchiveInvoiceStatus), istek başına en fazla 500 ETTN.
+     *
+     * @return array|null [ettn (küçük harf) => ['status', 'aciklama', 'fatura_no', 'web_key']];
+     *                    servis hatasında null
+     */
+    public function earsivDurumlari(array $ettnler): ?array
+    {
+        $ettnler = array_values(array_unique(array_filter(array_map('trim', $ettnler))));
+        if (!$ettnler) {
+            return [];
+        }
+        if (!$this->hazirMi() || !$this->earsivVarMi()) {
+            return null;
+        }
+
+        $sonuc = [];
+        foreach (array_chunk($ettnler, 500) as $grup) {
+            $uuidXml = '';
+            foreach ($grup as $u) {
+                $uuidXml .= '<UUID>' . htmlspecialchars($u, ENT_XML1) . '</UUID>';
+            }
+
+            $r = $this->oturumluCagri(fn($sid) => $this->soapSonuc(
+                $this->endpoint('EArsiv'),
+                'GetEArchiveInvoiceStatusRequest',
+                $this->requestHeaderXml($sid) . $uuidXml,
+                'earsiv_durum',
+                ['adet' => count($grup)],
+                self::NS_WSDL_ARCHIVE
+            ));
+
+            if (!$r['success'] || empty($r['dom'])) {
+                return null;
+            }
+
+            foreach ($r['dom']->getElementsByTagName('*') as $node) {
+                if ($node->localName !== 'HEADER') continue;
+                $uuid = strtolower($this->altDeger($node, 'UUID'));
+                if ($uuid === '') continue;
+                $sonuc[$uuid] = [
+                    'status'    => $this->altDeger($node, 'STATUS'),
+                    'aciklama'  => $this->altDeger($node, 'STATUS_DESC'),
+                    'fatura_no' => $this->altDeger($node, 'INVOICE_ID'),
+                    'web_key'   => $this->altDeger($node, 'WEB_KEY'),
+                ];
+            }
+        }
         return $sonuc;
     }
 
