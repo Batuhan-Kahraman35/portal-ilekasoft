@@ -9,9 +9,9 @@
  * Kapsam: sipariş → kanal (EntegrasyonKanallari) → EntegrasyonKanallari_Firmalar_id → Firmalar.
  * Kullanıcının firma kısıtı (PageAuth::firmaKisiti) her sorguya kanal id listesi olarak uygulanır.
  *
- * Satır aksiyonları: kalem detayı, kargo etiketi (ZPL), paket durumu (Picking/Invoiced).
+ * Satır aksiyonları: kalem detayı, kargo etiketi (ZPL), paket durumu (Picking/Invoiced),
+ * fatura önizleme / kesim (FaturaKesim: Örnek Holding e-Fatura / e-Arşiv; taslak veya kesin).
  * Hangi aksiyonun görüneceği pazaryerinin yetenek bayraklarına göre belirlenir.
- * Fatura kesme / eşleştirme bu sayfada YOK; fatura kolonları salt bilgi olarak gösterilir.
  *
  * Hareket tablosu → DataTables SERVER-SIDE, iki aşamalı sorgu.
  */
@@ -19,6 +19,8 @@
 require_once __DIR__ . '/../auth.php';
 require_once __DIR__ . '/../includes/PageAuth.php';
 require_once __DIR__ . '/../includes/PazaryeriFabrika.php';
+require_once __DIR__ . '/../includes/OrnekHoldingApi.php';
+require_once __DIR__ . '/../includes/FaturaKesim.php';
 requireAuth();
 
 $user = Auth::user();
@@ -141,6 +143,27 @@ function siparisKosulu(array $girdi, $kisitFirmaId, $durumDahil = true)
         $kosul .= " AND s.PazaryeriSiparisleri_DurumKod = ? ";
         $params[] = $durum;
     }
+    // Fatura durumu (Faturalar_KesimDurumu; senkronla bağlanmış eski faturalar KesimDurumu boş, Durum = 1)
+    $fatura = trim($girdi['fatura'] ?? '');
+    $faturaVar = "EXISTS (SELECT 1 FROM dbo.Faturalar fa
+                          WHERE fa.Faturalar_id = s.PazaryeriSiparisleri_Faturalar_id AND %s)";
+    switch ($fatura) {
+        case 'yok':
+            $kosul .= " AND (s.PazaryeriSiparisleri_Faturalar_id IS NULL OR NOT "
+                    . sprintf($faturaVar, "fa.Faturalar_Durum = 1 AND fa.Faturalar_IptalDurumu = 0") . ") ";
+            break;
+        case 'taslak':
+            $kosul .= " AND " . sprintf($faturaVar, "fa.Faturalar_KesimDurumu = 'TASLAK'") . " ";
+            break;
+        case 'kesildi':
+            $kosul .= " AND " . sprintf($faturaVar, "fa.Faturalar_Durum = 1 AND fa.Faturalar_IptalDurumu = 0
+                          AND ISNULL(fa.Faturalar_KesimDurumu, 'GONDERILDI') = 'GONDERILDI'") . " ";
+            break;
+        case 'hata':
+            $kosul .= " AND " . sprintf($faturaVar, "fa.Faturalar_KesimDurumu IN ('HATA', 'GONDERILIYOR')") . " ";
+            break;
+    }
+
     if (($bas = tarihGecerli($girdi['bas_tarih'] ?? '')) !== '') {
         $kosul .= " AND s.PazaryeriSiparisleri_SiparisTarihi >= ? ";
         $params[] = $bas;
@@ -193,8 +216,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         SUM(CASE WHEN ISNULL(s.PazaryeriSiparisleri_DurumKod, '') NOT IN ('iptal', 'iade')
                                  THEN ISNULL(s.PazaryeriSiparisleri_ToplamTutar, 0) ELSE 0 END) AS ciro,
                         SUM(CASE WHEN s.PazaryeriSiparisleri_DurumKod IN ('iptal', 'iade') THEN 1 ELSE 0 END) AS iptal_iade,
-                        SUM(CASE WHEN s.PazaryeriSiparisleri_DurumKod IN ('yeni', 'hazirlaniyor') THEN 1 ELSE 0 END) AS bekleyen
+                        SUM(CASE WHEN s.PazaryeriSiparisleri_DurumKod IN ('yeni', 'hazirlaniyor') THEN 1 ELSE 0 END) AS bekleyen,
+                        SUM(CASE WHEN ISNULL(s.PazaryeriSiparisleri_DurumKod, '') NOT IN ('iptal', 'iade')
+                                  AND fa.Faturalar_id IS NULL THEN 1 ELSE 0 END) AS faturasiz
                     FROM dbo.PazaryeriSiparisleri s
+                    LEFT JOIN dbo.Faturalar fa
+                           ON fa.Faturalar_id = s.PazaryeriSiparisleri_Faturalar_id
+                          AND fa.Faturalar_Durum = 1 AND fa.Faturalar_IptalDurumu = 0
                     $kosul
                 ", $params);
 
@@ -203,6 +231,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'ciro'       => (float)($s['ciro'] ?? 0),
                     'iptal_iade' => (int)($s['iptal_iade'] ?? 0),
                     'bekleyen'   => (int)($s['bekleyen'] ?? 0),
+                    'faturasiz'  => (int)($s['faturasiz'] ?? 0),
                 ]], $jsonBayrak);
                 exit;
 
@@ -266,7 +295,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         p.Pazaryerleri_Renk,
                         p.Pazaryerleri_Yetenekler,
                         f.firma_adi,
-                        kl.KalemSayisi
+                        kl.KalemSayisi,
+                        fa.Faturalar_FaturaNo,
+                        fa.Faturalar_ETTN,
+                        fa.Faturalar_Tur,
+                        fa.Faturalar_KesimDurumu,
+                        fa.Faturalar_DurumAciklama,
+                        fa.Faturalar_Durum,
+                        fa.Faturalar_IptalDurumu,
+                        fa.Faturalar_GibDurum
                     FROM sayfa sf
                     INNER JOIN dbo.PazaryeriSiparisleri s
                             ON s.PazaryeriSiparisleri_id = sf.PazaryeriSiparisleri_id
@@ -282,6 +319,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         WHERE kk.PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id = s.PazaryeriSiparisleri_id
                           AND kk.PazaryeriSiparisKalemleri_Durum = 1
                     ) kl
+                    LEFT JOIN dbo.Faturalar fa
+                            ON fa.Faturalar_id = s.PazaryeriSiparisleri_Faturalar_id
                     ORDER BY $orderSql
                 ", array_merge($params, [$start, $length]));
 
@@ -289,6 +328,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 foreach ($satirlar as &$r) {
                     $r['yetenekler'] = json_decode($r['Pazaryerleri_Yetenekler'] ?? '{}', true) ?: new stdClass();
                     unset($r['Pazaryerleri_Yetenekler']);
+                    $kesin = $r['Faturalar_Durum'] !== null && FaturaKesim::kesinlesmisMi($r);
+                    $r['fatura_kesinlesmis'] = $kesin;
+                    $r['fatura_kesilebilir'] = !$kesin && $r['PazaryeriSiparisleri_DurumKod'] !== 'iptal';
                 }
                 unset($r);
 
@@ -503,6 +545,87 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 exit;
 
             // ---------------------------------------------------------
+            // Fatura: önizleme (kayıt yazmaz; mükellef sorgusu + numara tahmini) ve kesim.
+            // Belge her istekte siparişten yeniden üretilir; istemciden tutar/kalem alınmaz.
+            case 'faturaOnizle':
+            case 'faturaKes':
+                if (!$pagePermissions['can_edit']) {
+                    echo json_encode(['success' => false, 'message' => 'Fatura işlemi için düzenleme yetkisi gerekir.'], $jsonBayrak);
+                    exit;
+                }
+                set_time_limit(180);
+
+                $id = (int)($_POST['id'] ?? 0);
+                $siparis = $db->fetchOne("
+                    SELECT PazaryeriSiparisleri_id, PazaryeriSiparisleri_EntegrasyonKanallari_id
+                    FROM dbo.PazaryeriSiparisleri
+                    WHERE PazaryeriSiparisleri_id = ? AND PazaryeriSiparisleri_Durum = 1
+                ", [$id]);
+                if (!$siparis || !siparisKapsamda($siparis, $kisitFirmaId)) {
+                    echo json_encode(['success' => false, 'message' => 'Sipariş bulunamadı.'], $jsonBayrak);
+                    exit;
+                }
+
+                $fk = new FaturaKesim((int)$user['kullanici_id'], $db);
+                $b  = $fk->pazaryeriBelge($id);
+                if (!$b['success']) {
+                    echo json_encode(['success' => false, 'message' => $b['message']], $jsonBayrak);
+                    exit;
+                }
+                $belge   = $b['belge'];
+                $firmaId = (int)$belge['firma']['firma_id'];
+
+                // Örnek Holding kanalı yalnız siparişin firmasının kanallarından seçilebilir
+                $tbKanallar = $fk->ornekholdingKanallari($firmaId);
+                $tbKanalId  = (int)($_POST['tb_kanal'] ?? 0);
+                if (!in_array($tbKanalId, array_column($tbKanallar, 'kanal_id'), true)) {
+                    $tbKanalId = (int)$fk->varsayilanKanal($firmaId);
+                }
+                if ($tbKanalId <= 0) {
+                    echo json_encode(['success' => false,
+                        'message' => 'Siparişin firmasına (' . $belge['firma']['unvan'] . ') bağlı aktif Örnek Holding kanalı yok.'], $jsonBayrak);
+                    exit;
+                }
+
+                if ($action === 'faturaOnizle') {
+                    $o = $fk->onizle($belge, $tbKanalId);
+                    if (!$o['success']) {
+                        echo json_encode(['success' => false, 'message' => $o['message']], $jsonBayrak);
+                        exit;
+                    }
+                    $mevcut = $b['mevcut'];
+                    echo json_encode(['success' => true, 'data' => [
+                        'onizleme'    => $o,
+                        'uyarilar'    => array_values(array_merge($b['uyarilar'], $o['uyarilar'])),
+                        'alici'       => $belge['alici'],
+                        'satici'      => ['unvan' => $belge['firma']['unvan'], 'vkn' => $belge['firma']['vergi_no']],
+                        'kalemler'    => $belge['kalemler'],
+                        'toplam'      => $belge['toplam'],
+                        'para'        => $belge['para'],
+                        'siparis_no'  => $belge['siparis_no'],
+                        'pazaryeri'   => $belge['pazaryeri'],
+                        'yontem'      => $belge['tutar_yontemi'],
+                        'tb_kanallar' => $tbKanallar,
+                        'tb_kanal'    => $tbKanalId,
+                        'mevcut'      => $mevcut ? [
+                            'no'          => $mevcut['Faturalar_FaturaNo'],
+                            'ettn'        => $mevcut['Faturalar_ETTN'],
+                            'tur'         => $mevcut['Faturalar_Tur'],
+                            'durum'       => $mevcut['Faturalar_KesimDurumu'],
+                            'aciklama'    => $mevcut['Faturalar_DurumAciklama'],
+                            'kesinlesmis' => FaturaKesim::kesinlesmisMi($mevcut),
+                        ] : null,
+                    ]], $jsonBayrak);
+                    exit;
+                }
+
+                $taslak  = ($_POST['taslak'] ?? '1') !== '0';
+                $tekrar  = ($_POST['belirsiz_tekrar'] ?? '0') === '1';
+                $sonuc   = $fk->kes($belge, $tbKanalId, $taslak, $tekrar);
+                echo json_encode($sonuc + ['success' => false], $jsonBayrak);
+                exit;
+
+            // ---------------------------------------------------------
             case 'kanallar':
                 $firmaId = (int)($_POST['firma_id'] ?? 0) ?: null;
                 echo json_encode(['success' => true,
@@ -588,7 +711,7 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
 
                     <!-- InfoBox: seçili filtre ve tarih aralığına göre -->
                     <div class="row mb-3">
-                        <div class="col-12 col-sm-6 col-lg-3">
+                        <div class="col-12 col-sm-6 col-lg">
                             <div class="info-box">
                                 <span class="info-box-icon text-bg-primary shadow-sm"><i class="bi bi-bag"></i></span>
                                 <div class="info-box-content">
@@ -597,7 +720,7 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                                 </div>
                             </div>
                         </div>
-                        <div class="col-12 col-sm-6 col-lg-3">
+                        <div class="col-12 col-sm-6 col-lg">
                             <div class="info-box">
                                 <span class="info-box-icon text-bg-success shadow-sm"><i class="bi bi-cash-stack"></i></span>
                                 <div class="info-box-content">
@@ -606,7 +729,7 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                                 </div>
                             </div>
                         </div>
-                        <div class="col-12 col-sm-6 col-lg-3">
+                        <div class="col-12 col-sm-6 col-lg">
                             <div class="info-box">
                                 <span class="info-box-icon text-bg-danger shadow-sm"><i class="bi bi-arrow-return-left"></i></span>
                                 <div class="info-box-content">
@@ -615,12 +738,21 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                                 </div>
                             </div>
                         </div>
-                        <div class="col-12 col-sm-6 col-lg-3">
+                        <div class="col-12 col-sm-6 col-lg">
                             <div class="info-box">
                                 <span class="info-box-icon text-bg-warning shadow-sm"><i class="bi bi-hourglass-split"></i></span>
                                 <div class="info-box-content">
                                     <span class="info-box-text" title="Yeni ve hazırlanıyor durumundakiler">Bekleyen (Kargolanmamış)</span>
                                     <span class="info-box-number" id="ibBekleyen">-</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-12 col-sm-6 col-lg">
+                            <div class="info-box" role="button" id="ibFaturasizKutu" title="Faturasız siparişleri listele">
+                                <span class="info-box-icon text-bg-secondary shadow-sm"><i class="bi bi-receipt"></i></span>
+                                <div class="info-box-content">
+                                    <span class="info-box-text" title="İptal ve iade hariç, kesinleşmiş ya da taslak faturası olmayanlar">Faturasız</span>
+                                    <span class="info-box-number" id="ibFaturasiz">-</span>
                                 </div>
                             </div>
                         </div>
@@ -671,6 +803,16 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                                                placeholder="Sipariş no, müşteri, takip no...">
                                     </div>
                                     <div class="col-md-2">
+                                        <label class="form-label small mb-1">Fatura</label>
+                                        <select class="form-select form-select-sm" id="fFatura">
+                                            <option value="">Tümü</option>
+                                            <option value="yok">Faturasız</option>
+                                            <option value="taslak">Taslak</option>
+                                            <option value="kesildi">Kesildi</option>
+                                            <option value="hata">Hatalı / sonucu belirsiz</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-2">
                                         <label class="form-label small mb-1">Başlangıç</label>
                                         <input type="date" class="form-control form-control-sm" id="fBas">
                                     </div>
@@ -678,7 +820,7 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                                         <label class="form-label small mb-1">Bitiş</label>
                                         <input type="date" class="form-control form-control-sm" id="fBit">
                                     </div>
-                                    <div class="col-md-8 d-flex gap-2 justify-content-end">
+                                    <div class="col-md-6 d-flex gap-2 justify-content-end">
                                         <button class="btn btn-sm btn-primary" id="btnFiltrele"><i class="bi bi-search"></i> Filtrele</button>
                                         <button class="btn btn-sm btn-outline-secondary" id="btnTemizle"><i class="bi bi-x-circle"></i> Temizle</button>
                                     </div>
@@ -741,6 +883,39 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
         </div>
     </div>
 
+    <!-- Fatura önizleme / kesim -->
+    <div class="modal fade" id="faturaModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-receipt"></i> Fatura Kes <small class="text-muted" id="faturaBaslik"></small></h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Kapat"></button>
+                </div>
+                <div class="modal-body" id="faturaIcerik"></div>
+                <div class="modal-footer justify-content-between">
+                    <div class="d-flex align-items-center gap-2" id="faturaKanalKutu" style="min-width:280px">
+                        <label class="small text-muted mb-0" for="faturaTbKanal">Örnek Holding kanalı</label>
+                        <select class="form-select form-select-sm" id="faturaTbKanal" style="width:260px"></select>
+                    </div>
+                    <div class="d-flex gap-2">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Kapat</button>
+                        <button type="button" class="btn btn-outline-warning d-none" id="btnFaturaTekrar"
+                                title="Önceki gönderimin sonucu bilinmiyor; aynı ETTN ile tekrar gönderilir">
+                            <i class="bi bi-arrow-repeat me-1"></i> Aynı ETTN ile tekrar
+                        </button>
+                        <button type="button" class="btn btn-outline-primary" id="btnFaturaTaslak"
+                                title="Örnek Holding'ye taslak yüklenir, GİB'e gitmez">
+                            <i class="bi bi-file-earmark me-1"></i> Taslak yükle
+                        </button>
+                        <button type="button" class="btn btn-success" id="btnFaturaKes">
+                            <i class="bi bi-send-check me-1"></i> Kesin kes
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Kargo etiketi -->
     <div class="modal fade" id="etiketModal" tabindex="-1" aria-hidden="true">
         <div class="modal-dialog">
@@ -797,7 +972,7 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
 
         // custom.js tüm .form-select kutularına "Seçiniz..." yer tutuculu Select2 kurar;
         // kendi etiketleriyle yeniden kurulur.
-        [['#fFirma', 'Tüm firmalar'], ['#fPazaryeri', 'Tümü'], ['#fKanal', 'Tümü'], ['#fDurum', 'Tümü']]
+        [['#fFirma', 'Tüm firmalar'], ['#fPazaryeri', 'Tümü'], ['#fKanal', 'Tümü'], ['#fDurum', 'Tümü'], ['#fFatura', 'Tümü']]
             .forEach(([sec, etiket]) => {
                 const $s = $(sec);
                 if ($s.hasClass('select2-hidden-accessible')) { $s.select2('destroy'); }
@@ -851,6 +1026,7 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                 pazaryeri_id: $('#fPazaryeri').val() || '',
                 kanal:        $('#fKanal').val() || '',
                 durum:        $('#fDurum').val() || '',
+                fatura:       $('#fFatura').val() || '',
                 ara:          $('#fAra').val(),
                 bas_tarih:    $('#fBas').val(),
                 bit_tarih:    $('#fBit').val()
@@ -865,6 +1041,7 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                 $('#ibCiro').text(paraFormat(res.data.ciro, 'TRY'));
                 $('#ibIptal').text(Number(res.data.iptal_iade).toLocaleString('tr-TR'));
                 $('#ibBekleyen').text(Number(res.data.bekleyen).toLocaleString('tr-TR'));
+                $('#ibFaturasiz').text(Number(res.data.faturasiz).toLocaleString('tr-TR'));
             }, 'json');
         }
 
@@ -888,11 +1065,27 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
         }
 
         // ---------------------------------------------------------------
+        // Faturalar_KesimDurumu → rozet (FaturaKesim'in yazdığı değerler; boş = senkronla bağlanmış fatura)
+        const KESIM = {
+            GONDERILDI:   ['text-bg-success',   'Kesildi'],
+            TASLAK:       ['text-bg-info',      'Taslak'],
+            HATA:         ['text-bg-danger',    'Hata'],
+            GONDERILIYOR: ['text-bg-warning',   'Sonucu belirsiz']
+        };
+
         function faturaHucresi(r) {
-            // Salt bilgi: fatura kesme / eşleştirme bu sayfada yapılmaz
-            let html = r.PazaryeriSiparisleri_Faturalar_id
-                ? '<span class="text-success small"><i class="bi bi-receipt me-1"></i>Fatura #' + kacis(r.PazaryeriSiparisleri_Faturalar_id) + '</span>'
-                : '<span class="text-muted small">-</span>';
+            let html = '<span class="text-muted small">-</span>';
+            if (r.PazaryeriSiparisleri_Faturalar_id && r.Faturalar_Durum !== null) {
+                const iptal = String(r.Faturalar_IptalDurumu) === '1';
+                const h = iptal ? ['text-bg-secondary', 'İptal']
+                        : (r.fatura_kesinlesmis ? KESIM.GONDERILDI : (KESIM[r.Faturalar_KesimDurumu] || ['text-bg-light', '-']));
+                const no = (r.Faturalar_FaturaNo && !/0{9}$/.test(r.Faturalar_FaturaNo)) ? r.Faturalar_FaturaNo : '';
+                html = '<span class="badge ' + h[0] + ' durum-rozet"'
+                     + (r.Faturalar_DurumAciklama ? ' title="' + kacis(r.Faturalar_DurumAciklama) + '"' : '') + '>'
+                     + kacis(h[1]) + '</span>'
+                     + (r.Faturalar_Tur ? ' <small class="text-muted">' + (r.Faturalar_Tur === 'EARSIV' ? 'e-Arşiv' : 'e-Fatura') + '</small>' : '')
+                     + (no ? '<br><small class="fw-semibold">' + kacis(no) + '</small>' : '');
+            }
             if (r.yetenekler && r.yetenekler.faturaBildirim) {
                 if (r.PazaryeriSiparisleri_FaturaBildirimTarihi) {
                     html += '<br><small class="text-success" title="' + kacis(r.PazaryeriSiparisleri_FaturaBildirimTarihi)
@@ -999,6 +1192,10 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                         // desteklenmeyen aksiyon hiç gösterilmez (tanim_Pazaryerleri.Pazaryerleri_Yetenekler).
                         const yet = r.yetenekler || {};
                         let html = '';
+                        if (DUZENLEYEBILIR && r.fatura_kesilebilir) {
+                            html += '<button class="btn btn-sm btn-outline-success btn-fatura" data-id="' + d
+                                  + '" title="Fatura kes"><i class="bi bi-receipt"></i></button> ';
+                        }
                         if (DUZENLEYEBILIR && yet.kargoEtiketi) {
                             html += '<button class="btn btn-sm btn-outline-secondary btn-etiket" data-id="' + d
                                   + '" title="Kargo etiketi"><i class="bi bi-upc-scan"></i></button> ';
@@ -1027,7 +1224,8 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
         // ---------------------------------------------------------------
         $('#fFirma, #fPazaryeri').on('change', () => kanallariDoldur(true));
         $('#fKanal').on('change', function () { senkronButonu(); yenileHepsi(); });
-        $('#fDurum, #fBas, #fBit').on('change', yenileHepsi);
+        $('#fDurum, #fFatura, #fBas, #fBit').on('change', yenileHepsi);
+        $('#ibFaturasizKutu').on('click', function () { $('#fFatura').val('yok').trigger('change'); });
         $('#btnFiltrele').on('click', yenileHepsi);
 
         let aramaZaman = null;
@@ -1040,7 +1238,7 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
             $('#fAra').val('');
             varsayilanTarihler();
             if ($('#fFirma option[value=""]').length) { $('#fFirma').val('').trigger('change.select2'); }
-            $('#fPazaryeri, #fDurum').val('').trigger('change.select2');
+            $('#fPazaryeri, #fDurum, #fFatura').val('').trigger('change.select2');
             kanallariDoldur(true);
             showToast('Filtreler temizlendi', 'info');
         });
@@ -1207,6 +1405,174 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
         // Kargo etiketi
         // ---------------------------------------------------------------
         const etiketModal = new bootstrap.Modal('#etiketModal');
+
+        // ---------------------------------------------------------------
+        // Fatura önizleme / kesim
+        // Önizleme kayıt yazmaz (mükellef sorgusu + numara tahmini). Kesimde belge sunucuda
+        // siparişten yeniden üretilir; ekrandaki tutarlar yalnız bilgi amaçlıdır.
+        let faturaSiparisId = null;
+        let faturaVeri = null;
+        const $tbKanal = $('#faturaTbKanal');
+        if ($tbKanal.hasClass('select2-hidden-accessible')) { $tbKanal.select2('destroy'); }
+        initSelect2('#faturaTbKanal', { dropdownParent: $('#faturaModal'), minimumResultsForSearch: 0, allowClear: false });
+
+        function faturaButonlari(durum) {
+            // durum: 'yukleniyor' | 'hazir' | 'belirsiz' | 'kapali'
+            $('#btnFaturaTaslak, #btnFaturaKes').prop('disabled', durum !== 'hazir');
+            $('#btnFaturaTekrar').toggleClass('d-none', durum !== 'belirsiz');
+            $tbKanal.prop('disabled', durum === 'yukleniyor');
+        }
+
+        function faturaYukle(id, tbKanal) {
+            faturaSiparisId = id;
+            faturaVeri = null;
+            faturaButonlari('yukleniyor');
+            $('#faturaBaslik').text('');
+            $('#faturaIcerik').html('<div class="text-center text-muted py-5"><div class="spinner-border spinner-border-sm me-2"></div>'
+                + 'Önizleme hazırlanıyor (mükellef sorgusu, numara)...</div>');
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('faturaModal')).show();
+
+            $.post('', { action: 'faturaOnizle', id: id, tb_kanal: tbKanal || '' }, function (res) {
+                if (!res.success) {
+                    $('#faturaIcerik').html('<div class="alert alert-danger mb-0"><i class="bi bi-x-octagon me-1"></i>'
+                        + kacis(res.message) + '</div>');
+                    faturaButonlari('kapali');
+                    return;
+                }
+                faturaVeri = res.data;
+                faturaCiz(res.data);
+            }, 'json').fail(function () {
+                $('#faturaIcerik').html('<div class="alert alert-danger mb-0">Önizleme alınamadı.</div>');
+                faturaButonlari('kapali');
+            });
+        }
+
+        function faturaCiz(v) {
+            const o = v.onizleme;
+            const efatura = o.belge_turu === 'EFATURA';
+            const para = (t) => paraFormat(t, v.para);
+            $('#faturaBaslik').text(v.pazaryeri + ' · ' + v.siparis_no);
+
+            // Örnek Holding kanalı seçimi
+            $tbKanal.html(v.tb_kanallar.map(k => '<option value="' + k.kanal_id + '">'
+                + kacis(k.kanal_adi + (k.test ? ' (TEST)' : '') + (k.varsayilan ? ' · varsayılan' : '')) + '</option>').join(''));
+            $tbKanal.val(String(v.tb_kanal)).trigger('change.select2');
+            $('#faturaKanalKutu').toggleClass('invisible', v.tb_kanallar.length < 2);
+
+            let html = '<div class="alert ' + (efatura ? 'alert-primary' : 'alert-info') + ' d-flex flex-wrap gap-3 align-items-center">'
+                + '<span class="badge ' + (efatura ? 'text-bg-primary' : 'text-bg-info') + ' fs-6">' + (efatura ? 'e-Fatura' : 'e-Arşiv') + '</span>'
+                + (o.gib_unvan ? '<span><i class="bi bi-building me-1"></i>GİB: ' + kacis(o.gib_unvan) + '</span>' : '')
+                + '<span>Seri <b>' + kacis(o.seri || '-') + '</b> · ' + (o.numara_yontemi === 'sirali' ? 'sıralı' : 'Örnek Holding atar') + '</span>'
+                + (o.tahmini_numara ? '<span>Tahmini no <b>' + kacis(o.tahmini_numara) + '</b></span>' : '')
+                + '<span class="text-muted small">Şablon: ' + kacis(o.xslt || 'Örnek Holding varsayılanı') + '</span>'
+                + (o.kanal && o.kanal.test ? '<span class="badge text-bg-warning">TEST hesabı: kayıt yazılmaz</span>' : '')
+                + '</div>';
+
+            const m = v.mevcut;
+            let durum = 'hazir';
+            if (m && !m.kesinlesmis) {
+                if (m.durum === 'GONDERILIYOR') {
+                    durum = 'belirsiz';
+                    html += '<div class="alert alert-warning"><i class="bi bi-question-octagon me-1"></i>'
+                        + 'Önceki gönderimin sonucu bilinmiyor (ETTN <code>' + kacis(m.ettn) + '</code>). '
+                        + 'Örnek Holding portalında kontrol edin; fatura yoksa <b>aynı ETTN ile tekrar</b> gönderin '
+                        + '(Örnek Holding aynı ETTN\'yi ikinci kez kabul etmez, çift fatura oluşmaz).</div>';
+                } else if (m.durum === 'TASLAK') {
+                    html += '<div class="alert alert-info"><i class="bi bi-file-earmark me-1"></i>'
+                        + 'Bu siparişin Örnek Holding\'de taslağı var (ETTN <code>' + kacis(m.ettn) + '</code>). '
+                        + 'Yeniden yükleme / kesin kesim yeni belge oluşturur; eski taslağı Örnek Holding portalından silin.</div>';
+                } else if (m.durum === 'HATA') {
+                    html += '<div class="alert alert-danger"><i class="bi bi-exclamation-triangle me-1"></i>Önceki deneme hata verdi: '
+                        + kacis(m.aciklama || '-') + '</div>';
+                }
+            }
+            if (v.uyarilar.length) {
+                html += '<div class="alert alert-warning py-2"><ul class="mb-0 ps-3">'
+                    + v.uyarilar.map(u => '<li>' + kacis(u) + '</li>').join('') + '</ul></div>';
+            }
+
+            const a = v.alici;
+            html += '<div class="row g-3 mb-3">'
+                + '<div class="col-md-6"><div class="border rounded p-2 h-100"><div class="small text-muted">Satıcı</div>'
+                + '<div class="fw-semibold">' + kacis(v.satici.unvan) + '</div><div class="small">VKN ' + kacis(v.satici.vkn || '-') + '</div></div></div>'
+                + '<div class="col-md-6"><div class="border rounded p-2 h-100"><div class="small text-muted">Alıcı</div>'
+                + '<div class="fw-semibold">' + kacis(a.unvan) + '</div>'
+                + '<div class="small">' + kacis(a.kimlik_tur) + ' ' + kacis(a.kimlik) + (a.vergi_dairesi ? ' · VD ' + kacis(a.vergi_dairesi) : '') + '</div>'
+                + '<div class="adres-satir">' + kacis([a.adres, a.ilce, a.il].filter(Boolean).join(' / ')) + '</div>'
+                + (a.eposta ? '<div class="small text-muted">' + kacis(a.eposta) + '</div>' : '')
+                + '</div></div></div>';
+
+            html += '<div class="table-responsive"><table class="table table-sm kalem-tablo mb-0"><thead><tr>'
+                + '<th>Kalem</th><th class="text-center">Adet</th><th class="text-end">KDV</th>'
+                + '<th class="text-end">Matrah</th><th class="text-end">KDV Tutarı</th><th class="text-end">Toplam</th></tr></thead><tbody>'
+                + v.kalemler.map(k => '<tr><td>' + kacis(k.ad) + '</td><td class="text-center">' + kacis(k.miktar) + '</td>'
+                    + '<td class="text-end">%' + Number(k.kdv_oran).toLocaleString('tr-TR') + '</td>'
+                    + '<td class="text-end">' + para(k.matrah) + '</td><td class="text-end">' + para(k.kdv) + '</td>'
+                    + '<td class="text-end tutar">' + para(k.brut) + '</td></tr>').join('')
+                + '</tbody><tfoot><tr class="fw-semibold"><td colspan="3" class="text-end small text-muted">'
+                + 'tutar yöntemi: ' + kacis(v.yontem) + '</td>'
+                + '<td class="text-end">' + para(v.toplam.matrah) + '</td><td class="text-end">' + para(v.toplam.kdv) + '</td>'
+                + '<td class="text-end tutar">' + para(v.toplam.genel) + '</td></tr></tfoot></table></div>';
+
+            $('#faturaIcerik').html(html);
+            faturaButonlari(durum);
+        }
+
+        function faturaGonder(taslak, tekrar) {
+            if (!faturaSiparisId || !faturaVeri) return;
+            const v = faturaVeri;
+            const tur = v.onizleme.belge_turu === 'EFATURA' ? 'e-Fatura' : 'e-Arşiv';
+
+            const gonder = () => {
+                faturaButonlari('yukleniyor');
+                $('#faturaIcerik').prepend('<div class="alert alert-secondary" id="faturaIsleniyor">'
+                    + '<span class="spinner-border spinner-border-sm me-2"></span>Örnek Holding\'ye gönderiliyor...</div>');
+                $.post('', {
+                    action: 'faturaKes', id: faturaSiparisId, tb_kanal: $tbKanal.val() || '',
+                    taslak: taslak ? '1' : '0', belirsiz_tekrar: tekrar ? '1' : '0'
+                }, function (res) {
+                    tablo.ajax.reload(null, false);
+                    loadStats();
+                    if (res.success) {
+                        bootstrap.Modal.getOrCreateInstance(document.getElementById('faturaModal')).hide();
+                        showToast(res.message + (res.fatura_no && !/0{9}$/.test(res.fatura_no) ? ' No: ' + res.fatura_no : ''), 'success');
+                        if (res.uyari) { showToast(res.uyari, 'warning'); }
+                        return;
+                    }
+                    // Sonuç (hata / belirsiz) kayda yazıldı; önizleme yeniden alınır
+                    showToast(res.message || 'Fatura kesilemedi', 'error');
+                    faturaYukle(faturaSiparisId, $tbKanal.val());
+                }, 'json').fail(function () {
+                    $('#faturaIsleniyor').remove();
+                    showToast('Bağlantı hatası; sonucu kontrol etmek için önizlemeyi yeniden açın.', 'error');
+                    tablo.ajax.reload(null, false);
+                    faturaButonlari('kapali');
+                });
+            };
+
+            if (taslak && !tekrar) { gonder(); return; }
+
+            Swal.fire({
+                icon: 'warning',
+                title: tekrar ? 'Aynı ETTN ile tekrar gönderilsin mi?' : tur + ' kesilsin mi?',
+                html: (tekrar ? 'Önceki gönderim aynı ETTN ve numarayla tekrarlanır.<br>' : '')
+                    + '<b>' + kacis(v.alici.unvan) + '</b><br>' + paraFormat(v.toplam.genel, v.para)
+                    + (taslak ? '' : '<br><span class="text-danger small">Fatura GİB\'e gönderilir; geri alınamaz, yalnız iptal edilebilir.</span>'),
+                showCancelButton: true,
+                confirmButtonText: tekrar ? 'Tekrar gönder' : 'Kesin kes',
+                cancelButtonText: 'Vazgeç',
+                confirmButtonColor: '#198754'
+            }).then(r => { if (r.isConfirmed) gonder(); });
+        }
+
+        $('#tblSiparisler').on('click', '.btn-fatura', function () { faturaYukle($(this).data('id')); });
+        $tbKanal.on('change', function () {
+            if (faturaVeri && String($(this).val()) !== String(faturaVeri.tb_kanal)) faturaYukle(faturaSiparisId, $(this).val());
+        });
+        $('#btnFaturaTaslak').on('click', () => faturaGonder(true, false));
+        $('#btnFaturaKes').on('click', () => faturaGonder(false, false));
+        // Tekrar: önceki denemenin türü korunur; taslak mı kesin mi bilinmediği için kesin gönderilir
+        $('#btnFaturaTekrar').on('click', () => faturaGonder(false, true));
 
         $('#tblSiparisler').on('click', '.btn-etiket', function () {
             const btn = $(this).prop('disabled', true);
