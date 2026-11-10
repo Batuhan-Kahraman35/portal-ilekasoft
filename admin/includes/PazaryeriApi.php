@@ -757,13 +757,16 @@ abstract class PazaryeriApi
     {
         // Komisyon bazı pazaryerlerinde sipariş servisinden gelmez, sonradan finans servisinden
         // yazılır (Trendyol). Kalemler yeniden yazılırken sipariş verisinde komisyon yoksa eskisi korunur.
+        // KDV oranı da sipariş servisinden gelmeyebilir (n11: ürün servisinden okunur); o servis
+        // bir senkronda yanıt vermezse önceden yazılmış oran kaybolmasın diye aynı şekilde korunur.
         $eskiKomisyon = [];
         foreach ($this->db->fetchAll("
             SELECT PazaryeriSiparisKalemleri_DisId AS disId, PazaryeriSiparisKalemleri_Barkod AS barkod,
-                   PazaryeriSiparisKalemleri_KomisyonOran AS oran, PazaryeriSiparisKalemleri_KomisyonTutar AS tutar
+                   PazaryeriSiparisKalemleri_KomisyonOran AS oran, PazaryeriSiparisKalemleri_KomisyonTutar AS tutar,
+                   PazaryeriSiparisKalemleri_KdvOran AS kdvOran
             FROM dbo.PazaryeriSiparisKalemleri
             WHERE PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id = ?
-              AND PazaryeriSiparisKalemleri_KomisyonTutar IS NOT NULL
+              AND (PazaryeriSiparisKalemleri_KomisyonTutar IS NOT NULL OR PazaryeriSiparisKalemleri_KdvOran IS NOT NULL)
         ", [$siparisId]) ?: [] as $e) {
             $eskiKomisyon[(string)$e['disId'] . '|' . (string)$e['barkod']] = $e;
         }
@@ -773,9 +776,12 @@ abstract class PazaryeriApi
 
         foreach ($kalemler as $k) {
             $eski = $eskiKomisyon[(string)($k['disId'] ?? '') . '|' . (string)($k['barkod'] ?? '')] ?? null;
-            if ($eski && ($k['komisyonTutar'] ?? null) === null) {
+            if ($eski && ($k['komisyonTutar'] ?? null) === null && $eski['tutar'] !== null) {
                 $k['komisyonTutar'] = $eski['tutar'];
                 $k['komisyonOran']  = $k['komisyonOran'] ?? $eski['oran'];
+            }
+            if ($eski && ($k['kdvOran'] ?? null) === null) {
+                $k['kdvOran'] = $eski['kdvOran'];
             }
 
             $this->db->insert('PazaryeriSiparisKalemleri', [

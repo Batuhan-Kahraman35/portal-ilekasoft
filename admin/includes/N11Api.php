@@ -37,6 +37,9 @@ class N11Api extends PazaryeriApi
      */
     const SENKRON_SAYFA_BOYUTU = 200;
 
+    /** KDV haritası için en fazla taranacak ürün sayfası (100'lük; 5.000 ürün) */
+    const URUN_SAYFA_SINIRI = 50;
+
     public function __construct($userId = null, $kanalId = null)
     {
         parent::__construct('n11', $userId, $kanalId);
@@ -290,6 +293,8 @@ class N11Api extends PazaryeriApi
                 'toplamTutar'   => isset($it['sellerInvoiceAmount']) ? (float)$it['sellerInvoiceAmount']
                                  : (isset($it['dueAmount']) ? (float)$it['dueAmount'] : null),
                 'indirimTutar'  => isset($it['sellerDiscount']) ? (float)$it['sellerDiscount'] : null,
+                // Sipariş kaleminde KDV yok; satıcının n11 ürün kaydındaki vatRate (stok kodu ile)
+                'kdvOran'       => $this->urunKdvOrani($it['productSellerCode'] ?? null),
                 'komisyonTutar' => isset($it['commission']) ? (float)$it['commission'] : null,
                 'hamDurum'      => is_scalar($it['status'] ?? null) ? (string)$it['status'] : null,
                 'ham'           => $it
@@ -326,6 +331,45 @@ class N11Api extends PazaryeriApi
             'kalemler'       => $kalemler,
             'ham'            => $s
         ];
+    }
+
+    /** @var array<string,float>|null stockCode → vatRate (nesne ömrü boyunca bir kez yüklenir) */
+    private $kdvHaritasi = null;
+
+    /**
+     * Satıcının n11 ürün kaydındaki KDV oranı (GET /ms/product-query, stockCode ile).
+     * Bulunamazsa null döner; varsayılan oran UYGULANMAZ (fatura kesimi o kalemde durur).
+     * Servis yanıt vermezse harita boş kalır, kalem kaydı önceki oranı korur (siparisKalemleriKaydet).
+     */
+    private function urunKdvOrani($stokKodu)
+    {
+        $stokKodu = trim((string)$stokKodu);
+        if ($stokKodu === '') {
+            return null;
+        }
+
+        if ($this->kdvHaritasi === null) {
+            $this->kdvHaritasi = [];
+            for ($sayfa = 0; $sayfa < self::URUN_SAYFA_SINIRI; $sayfa++) {
+                $r = $this->istek('GET', '/ms/product-query', null,
+                                  ['page' => $sayfa, 'size' => 100], 'Ürün KDV Oranları');
+                if (!$r['basarili']) {
+                    break;
+                }
+                $liste = $r['veri']['content'] ?? [];
+                foreach ($liste as $u) {
+                    $sk = trim((string)($u['stockCode'] ?? ''));
+                    if ($sk !== '' && isset($u['vatRate']) && is_numeric($u['vatRate'])) {
+                        $this->kdvHaritasi[$sk] = (float)$u['vatRate'];
+                    }
+                }
+                if (!$liste || !empty($r['veri']['last'])) {
+                    break;
+                }
+            }
+        }
+
+        return $this->kdvHaritasi[$stokKodu] ?? null;
     }
 
     /** Kargo bilgisi kalem düzeyinde taşınır; ilk dolu olan alınır */
