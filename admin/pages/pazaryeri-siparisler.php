@@ -621,6 +621,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 $taslak  = ($_POST['taslak'] ?? '1') !== '0';
                 $tekrar  = ($_POST['belirsiz_tekrar'] ?? '0') === '1';
+                // Toplu işlem yalnız taslak yükler (karar: kesin kesim tek tek, önizlemeyle yapılır)
+                if (($_POST['toplu'] ?? '0') === '1') {
+                    $taslak = true;
+                    $tekrar = false;
+                }
                 $sonuc   = $fk->kes($belge, $tbKanalId, $taslak, $tekrar);
                 echo json_encode($sonuc + ['success' => false], $jsonBayrak);
                 exit;
@@ -834,6 +839,12 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                         <div class="card-header d-flex align-items-center">
                             <h3 class="card-title flex-grow-1 mb-0">Sipariş Listesi</h3>
                             <?php if ($duzenleyebilir): ?>
+                            <button class="btn btn-sm btn-outline-success me-2" id="btnTopluTaslak" disabled
+                                    title="Seçilen siparişler için Örnek Holding'ye taslak yüklenir (GİB'e gitmez)">
+                                <i class="bi bi-files me-1"></i> Seçilenlere taslak yükle (<span id="seciliSayi">0</span>)
+                            </button>
+                            <?php endif; ?>
+                            <?php if ($duzenleyebilir): ?>
                             <button class="btn btn-sm btn-primary" id="btnSenkron">
                                 <i class="bi bi-cloud-download me-1"></i> Siparişleri Çek
                             </button>
@@ -843,7 +854,14 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                             <table class="table table-hover table-sm align-middle w-100" id="tblSiparisler">
                                 <thead>
                                     <tr>
-                                        <th style="width:28px"></th>
+                                        <th style="width:64px">
+                                            <?php if ($duzenleyebilir): ?>
+                                            <div class="form-check form-switch d-flex justify-content-center mb-0" title="Sayfadaki faturalanabilir siparişlerin tümü">
+                                                <input class="form-check-input chk-tumu" type="checkbox" role="switch" id="chkTumu" value="1">
+                                                <label class="form-check-label" for="chkTumu"></label>
+                                            </div>
+                                            <?php endif; ?>
+                                        </th>
                                         <th>Kanal</th>
                                         <th>Sipariş No</th>
                                         <th>Müşteri</th>
@@ -911,6 +929,33 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                             <i class="bi bi-send-check me-1"></i> Kesin kes
                         </button>
                     </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toplu taslak -->
+    <div class="modal fade" id="topluModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-files"></i> Toplu Taslak Yükleme</h5>
+                </div>
+                <div class="modal-body">
+                    <div class="progress mb-2" style="height:20px">
+                        <div class="progress-bar progress-bar-striped progress-bar-animated" id="topluBar" style="width:0%">0%</div>
+                    </div>
+                    <div class="small text-muted mb-3" id="topluOzet"></div>
+                    <div class="table-responsive">
+                        <table class="table table-sm kalem-tablo mb-0">
+                            <thead><tr><th>Sipariş</th><th>Müşteri</th><th>Sonuç</th></tr></thead>
+                            <tbody id="topluSonuc"></tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-danger" id="btnTopluDurdur">Durdur</button>
+                    <button type="button" class="btn btn-secondary" id="btnTopluKapat" data-bs-dismiss="modal" disabled>Kapat</button>
                 </div>
             </div>
         </div>
@@ -1057,6 +1102,8 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
         }
 
         function yenileHepsi() {
+            seciliSiparisler.clear();
+            seciliGuncelle();
             // Tek kanal seçiliyken Kanal kolonu tekrar eden bilgi olur
             tablo.column(1).visible(!$('#fKanal').val(), false);
             tablo.columns.adjust();
@@ -1098,6 +1145,15 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
             return html;
         }
 
+        // Toplu taslak seçimi: id → {no, musteri}; sayfalar arası korunur, filtre değişince temizlenir
+        const seciliSiparisler = new Map();
+        function seciliGuncelle() {
+            $('#seciliSayi').text(seciliSiparisler.size);
+            $('#btnTopluTaslak').prop('disabled', seciliSiparisler.size === 0);
+            const $sayfa = $('#tblSiparisler .chk-siparis');
+            $('.chk-tumu').prop('checked', $sayfa.length > 0 && $sayfa.filter(':checked').length === $sayfa.length);
+        }
+
         // İlk istekten önce filtre değerleri hazır olmalı (tarih aralığı + kanal listesi)
         varsayilanTarihler();
         kanallariDoldur(false);
@@ -1119,8 +1175,15 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
             columns: [
                 {
                     data: 'PazaryeriSiparisleri_id', orderable: false, className: 'text-center',
-                    render: (d) => '<button class="btn btn-sm btn-link p-0 btn-detay" data-id="' + d + '" title="Detay">'
-                                 + '<i class="bi bi-chevron-expand"></i></button>'
+                    render: (d, t, r) => '<div class="d-flex align-items-center justify-content-center gap-1">'
+                        + (DUZENLEYEBILIR && r.fatura_kesilebilir
+                            ? '<div class="form-check form-switch d-flex justify-content-center mb-0">'
+                              + '<input class="form-check-input chk-siparis" type="checkbox" role="switch" id="chk' + d + '" value="1"'
+                              + ' data-id="' + d + '"' + (seciliSiparisler.has(String(d)) ? ' checked' : '') + '>'
+                              + '<label class="form-check-label" for="chk' + d + '"></label></div>'
+                            : '')
+                        + '<button class="btn btn-sm btn-link p-0 btn-detay" data-id="' + d + '" title="Detay">'
+                        + '<i class="bi bi-chevron-expand"></i></button></div>'
                 },
                 {
                     data: 'Pazaryerleri_Ad', orderable: false,
@@ -1566,6 +1629,91 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
         }
 
         $('#tblSiparisler').on('click', '.btn-fatura', function () { faturaYukle($(this).data('id')); });
+
+        // ---------------------------------------------------------------
+        // Toplu taslak: siparişler sırayla faturaKes (toplu=1 → sunucu yalnız taslak yükler)
+        $('#tblSiparisler').on('change', '.chk-siparis', function () {
+            const id = String($(this).data('id'));
+            const r = tablo.row($(this).closest('tr')).data() || {};
+            if (this.checked) {
+                seciliSiparisler.set(id, { no: r.PazaryeriSiparisleri_SiparisNo || r.PazaryeriSiparisleri_DisId,
+                                           musteri: r.PazaryeriSiparisleri_MusteriAdi || '', pazaryeri: r.Pazaryerleri_Ad || '' });
+            } else {
+                seciliSiparisler.delete(id);
+            }
+            seciliGuncelle();
+        });
+        // scrollX başlığı kopyaladığı için başlık kutusu belge düzeyinde dinlenir
+        $(document).on('change', '.chk-tumu', function () {
+            const ac = this.checked;
+            $('#tblSiparisler .chk-siparis').each(function () {
+                if (this.checked !== ac) { $(this).prop('checked', ac).trigger('change'); }
+            });
+        });
+        tablo.on('draw', seciliGuncelle);
+
+        let topluDurdur = false;
+        $('#btnTopluDurdur').on('click', function () { topluDurdur = true; $(this).prop('disabled', true).text('Durduruluyor...'); });
+
+        $('#btnTopluTaslak').on('click', function () {
+            const liste = Array.from(seciliSiparisler.entries());
+            if (!liste.length) return;
+            Swal.fire({
+                icon: 'question',
+                title: liste.length + ' sipariş için taslak yüklensin mi?',
+                html: 'Her sipariş için mükellef sorgusu yapılıp e-Fatura ya da e-Arşiv <b>taslağı</b> Örnek Holding\'ye yüklenir.<br>'
+                    + '<span class="small text-muted">Taslaklar GİB\'e gitmez ve numara tüketmez; kesinleştirme Örnek Holding portalından ya da tek tek yapılır.</span>',
+                showCancelButton: true, confirmButtonText: 'Taslak yükle', cancelButtonText: 'Vazgeç', confirmButtonColor: '#198754'
+            }).then(c => { if (c.isConfirmed) topluCalistir(liste); });
+        });
+
+        function topluCalistir(liste) {
+            topluDurdur = false;
+            let basarili = 0, hatali = 0;
+            $('#topluSonuc').html(liste.map(([id, s]) => '<tr id="toplu' + id + '"><td>' + kacis(s.pazaryeri) + ' · <b>' + kacis(s.no)
+                + '</b></td><td>' + kacis(s.musteri) + '</td><td class="text-muted small">bekliyor</td></tr>').join(''));
+            $('#btnTopluDurdur').prop('disabled', false).text('Durdur').removeClass('d-none');
+            $('#btnTopluKapat').prop('disabled', true);
+            const ilerleme = (i) => {
+                const yuzde = Math.round(i * 100 / liste.length);
+                $('#topluBar').css('width', yuzde + '%').text(yuzde + '%');
+                $('#topluOzet').text(i + ' / ' + liste.length + ' · ' + basarili + ' başarılı · ' + hatali + ' hatalı');
+            };
+            ilerleme(0);
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('topluModal')).show();
+
+            const bitir = () => {
+                $('#topluBar').removeClass('progress-bar-animated');
+                $('#btnTopluDurdur').addClass('d-none');
+                $('#btnTopluKapat').prop('disabled', false);
+                seciliSiparisler.clear();
+                tablo.ajax.reload(null, false);
+                loadStats();
+                showToast(basarili + ' taslak yüklendi' + (hatali ? ', ' + hatali + ' hatalı' : '')
+                    + (topluDurdur ? ' (durduruldu)' : ''), hatali ? 'warning' : 'success');
+            };
+
+            const sonraki = (i) => {
+                if (i >= liste.length || topluDurdur) { bitir(); return; }
+                const [id] = liste[i];
+                const $hucre = $('#toplu' + id + ' td:last');
+                $hucre.html('<span class="spinner-border spinner-border-sm"></span>');
+                $.post('', { action: 'faturaKes', id: id, toplu: '1', taslak: '1' }, function (res) {
+                    if (res.success) {
+                        basarili++;
+                        $hucre.html('<span class="badge text-bg-info">' + (res.belge_turu === 'EARSIV' ? 'e-Arşiv' : 'e-Fatura')
+                            + ' taslak</span>' + (res.uyari ? ' <small class="text-warning">' + kacis(res.uyari) + '</small>' : ''));
+                    } else {
+                        hatali++;
+                        $hucre.html('<span class="text-danger small"><i class="bi bi-x-circle me-1"></i>' + kacis(res.message || 'Hata') + '</span>');
+                    }
+                }, 'json').fail(function () {
+                    hatali++;
+                    $hucre.html('<span class="text-danger small">Bağlantı hatası; sonucu önizlemeden kontrol edin</span>');
+                }).always(function () { ilerleme(i + 1); sonraki(i + 1); });
+            };
+            sonraki(0);
+        }
         $tbKanal.on('change', function () {
             if (faturaVeri && String($(this).val()) !== String(faturaVeri.tb_kanal)) faturaYukle(faturaSiparisId, $(this).val());
         });

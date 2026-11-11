@@ -47,7 +47,7 @@ $kisitFirmaId = PageAuth::firmaKisiti($pagePermissions, $user['kullanici_id']);
 $ayarYetki = $kisitFirmaId === null && !empty($pagePermissions['can_edit']);
 
 /** Rapor kapsam notu: sayfada InfoBox altında, Excel'de en üst satırda */
-const RAPOR_NOTU = 'Gelir tutarları KDV dahildir ve müşterinin ödediği tutardır (indirimler düşülmüş). Pazaryeri komisyonu ve kargo ayrı gider kalemi olarak gösterilir.';
+const RAPOR_NOTU = 'Gelir tutarları KDV dahildir ve müşterinin ödediği tutardır (indirimler düşülmüş). Pazaryeri komisyonu (KDV dahil) ve kargo ayrı gider kalemi olarak gösterilir.';
 
 /**
  * Platform (iş kolu) kodu: tanim_GelirGiderPlatformlari.Kod ile eşleşir.
@@ -199,12 +199,36 @@ function bankaMasrafKosulu($atlaKuralId = 0)
 // detayında da aynen kullanılır: detay toplamı kırılım toplamıyla aynı kalır.
 // =====================================================================
 
+/**
+ * Komisyon KDV oranı (kkdv.oran): pazaryerleri komisyonu KDV hariç bildirir, rapor KDV dahil gösterir.
+ * Kaynak: PazaryeriAyarlari 'KomisyonKdvOran' (kanal → pazaryeri → genel). Ayar yoksa 0 (tutar olduğu gibi).
+ * Gereken takma adlar: s = PazaryeriSiparisleri, k = EntegrasyonKanallari.
+ */
+const KOMISYON_KDV_APPLY = "
+        OUTER APPLY (
+            SELECT TOP 1 TRY_CAST(pa.PazaryeriAyarlari_Deger AS DECIMAL(5,2)) AS oran
+            FROM dbo.PazaryeriAyarlari pa
+            WHERE pa.PazaryeriAyarlari_Anahtar = 'KomisyonKdvOran' AND pa.PazaryeriAyarlari_Durum = 1
+              AND (pa.PazaryeriAyarlari_EntegrasyonKanallari_id = k.EntegrasyonKanallari_id
+                   OR (pa.PazaryeriAyarlari_EntegrasyonKanallari_id IS NULL AND pa.PazaryeriAyarlari_Pazaryerleri_id = s.PazaryeriSiparisleri_Pazaryerleri_id)
+                   OR (pa.PazaryeriAyarlari_EntegrasyonKanallari_id IS NULL AND pa.PazaryeriAyarlari_Pazaryerleri_id IS NULL))
+            ORDER BY CASE WHEN pa.PazaryeriAyarlari_EntegrasyonKanallari_id IS NOT NULL THEN 1
+                          WHEN pa.PazaryeriAyarlari_Pazaryerleri_id IS NOT NULL THEN 2 ELSE 3 END
+        ) kkdv
+";
+
+/** KDV dahil komisyon çarpanı (KOMISYON_KDV_APPLY ile birlikte kullanılır) */
+const KOMISYON_KDV_CARPAN = '(1 + ISNULL(kkdv.oran, 0) / 100.0)';
+
+/** Kalem komisyonu KDV dahil; komisyonu henüz gelmemiş kalemde NULL kalır */
+const KOMISYON_KDV_DAHIL = '(c.PazaryeriSiparisKalemleri_KomisyonTutar * ' . KOMISYON_KDV_CARPAN . ')';
+
 /** Komisyon kalemleri: kaynakKomisyon ve komisyon detayı aynı JOIN'i kullanır (c = kalem) */
 const KOMISYON_KALEM_JOIN = "
         INNER JOIN dbo.PazaryeriSiparisKalemleri c
                 ON c.PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id = s.PazaryeriSiparisleri_id
                AND c.PazaryeriSiparisKalemleri_Durum = 1
-";
+" . KOMISYON_KDV_APPLY;
 
 /** Pazaryeri siparişleri ortak FROM + WHERE (iptal / iade hariç, sipariş tarihine göre) */
 function pazaryeriKosulu($firmaIdler, $kalemJoin = '')
@@ -259,7 +283,7 @@ function kaynakKomisyon($bas, $bit, $firmaIdler)
             k.EntegrasyonKanallari_Firmalar_id                         AS firma_id,
             ISNULL(NULLIF(f.firma_adi, ''), f.firma_unvan)             AS firma_adi,
             p.Pazaryerleri_Ad                                          AS alt_kirilim,
-            SUM(ISNULL(c.PazaryeriSiparisKalemleri_KomisyonTutar, 0))  AS tutar,
+            SUM(ISNULL(" . KOMISYON_KDV_DAHIL . ", 0))                AS tutar,
             COUNT(DISTINCT s.PazaryeriSiparisleri_id)                  AS adet,
             " . platformSql(PLATFORM_ETICARET) . "                     AS platform,
             CAST('komisyon_pazaryeri' AS VARCHAR(30))                  AS detay_tur,
@@ -782,9 +806,9 @@ function detayTanim(array $d, array $f)
                     4 => FIRMA_AD_SQL,
                     5 => 's.PazaryeriSiparisleri_MusteriAdi',
                     7 => 's.PazaryeriSiparisleri_DurumKod',
-                    9 => 's.PazaryeriSiparisleri_ToplamTutar',
+                    10 => 's.PazaryeriSiparisleri_ToplamTutar',
                 ],
-                // Kalem sayısı ve ürün adları yalnız bu sayfanın satırlarına (ağır alt sorgu CTE'de yok)
+                // Kalem sayısı, komisyon ve ürün adları yalnız bu sayfanın satırlarına (ağır alt sorgu CTE'de yok)
                 'dis' => "
                     SELECT s.PazaryeriSiparisleri_id                                  AS id,
                            CONVERT(VARCHAR(16), s.PazaryeriSiparisleri_SiparisTarihi, 120) AS tarih,
@@ -796,14 +820,18 @@ function detayTanim(array $d, array $f)
                            s.PazaryeriSiparisleri_DurumKod                            AS durum,
                            kl.adet                                                    AS kalem,
                            ur.urunler                                                 AS urunler,
+                           kl.komisyon                                                AS komisyon,
                            ISNULL(s.PazaryeriSiparisleri_ToplamTutar, 0)              AS tutar
                     FROM sayfa x
                     INNER JOIN dbo.PazaryeriSiparisleri s ON s.PazaryeriSiparisleri_id = x.id
                     INNER JOIN dbo.EntegrasyonKanallari k ON k.EntegrasyonKanallari_id = s.PazaryeriSiparisleri_EntegrasyonKanallari_id
                     INNER JOIN dbo.tanim_Pazaryerleri p   ON p.Pazaryerleri_id = s.PazaryeriSiparisleri_Pazaryerleri_id
                     LEFT JOIN dbo.Firmalar f              ON f.firma_id = k.EntegrasyonKanallari_Firmalar_id
+                    -- Komisyon (KDV dahil): hiçbir kalemde gelmemişse NULL kalır (teslim sonrası dolar), arayüzde tire gösterilir
+                    " . KOMISYON_KDV_APPLY . "
                     OUTER APPLY (
-                        SELECT COUNT(*) AS adet
+                        SELECT COUNT(*) AS adet,
+                               SUM(" . KOMISYON_KDV_DAHIL . ") AS komisyon
                         FROM dbo.PazaryeriSiparisKalemleri c
                         WHERE c.PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id = s.PazaryeriSiparisleri_id
                           AND c.PazaryeriSiparisKalemleri_Durum = 1
@@ -830,6 +858,7 @@ function detayTanim(array $d, array $f)
                     'durum'      => (string)($r['durum'] ?? ''),
                     'kalem'      => (int)$r['kalem'],
                     'urunler'    => (string)($r['urunler'] ?? ''),
+                    'komisyon'   => $r['komisyon'] !== null ? round((float)$r['komisyon'], 2) : null,
                     'tutar'      => round((float)$r['tutar'], 2),
                 ],
             ];
@@ -844,7 +873,7 @@ function detayTanim(array $d, array $f)
                 'id'     => 'c.PazaryeriSiparisKalemleri_id',
                 'ozet'   => 'COUNT(DISTINCT s.PazaryeriSiparisleri_id) AS adet, COUNT(*) AS kalem,
                              SUM(CASE WHEN c.PazaryeriSiparisKalemleri_KomisyonTutar IS NULL THEN 1 ELSE 0 END) AS bos,
-                             ISNULL(SUM(ISNULL(c.PazaryeriSiparisKalemleri_KomisyonTutar, 0)), 0) AS toplam',
+                             ISNULL(SUM(ISNULL(' . KOMISYON_KDV_DAHIL . ', 0)), 0) AS toplam',
                 'ara'    => 's.PazaryeriSiparisleri_SiparisNo LIKE ? OR c.PazaryeriSiparisKalemleri_UrunAdi LIKE ? OR c.PazaryeriSiparisKalemleri_Barkod LIKE ?',
                 'siralama' => [
                     0 => 's.PazaryeriSiparisleri_SiparisTarihi',
@@ -856,7 +885,7 @@ function detayTanim(array $d, array $f)
                     6 => 'c.PazaryeriSiparisKalemleri_Miktar',
                     7 => 'c.PazaryeriSiparisKalemleri_ToplamTutar',
                     8 => 'c.PazaryeriSiparisKalemleri_KomisyonOran',
-                    9 => 'c.PazaryeriSiparisKalemleri_KomisyonTutar',
+                    11 => KOMISYON_KDV_DAHIL,
                 ],
                 'dis' => "
                     SELECT c.PazaryeriSiparisKalemleri_id                             AS id,
@@ -869,13 +898,16 @@ function detayTanim(array $d, array $f)
                            c.PazaryeriSiparisKalemleri_Miktar                         AS miktar,
                            c.PazaryeriSiparisKalemleri_ToplamTutar                    AS kalem_tutar,
                            c.PazaryeriSiparisKalemleri_KomisyonOran                   AS komisyon_oran,
-                           c.PazaryeriSiparisKalemleri_KomisyonTutar                  AS komisyon_tutar
+                           c.PazaryeriSiparisKalemleri_KomisyonTutar                  AS komisyon_kdvsiz,
+                           kkdv.oran                                                  AS komisyon_kdv_oran,
+                           " . KOMISYON_KDV_DAHIL . "                                 AS komisyon_tutar
                     FROM sayfa x
                     INNER JOIN dbo.PazaryeriSiparisKalemleri c ON c.PazaryeriSiparisKalemleri_id = x.id
                     INNER JOIN dbo.PazaryeriSiparisleri s      ON s.PazaryeriSiparisleri_id = c.PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id
                     INNER JOIN dbo.EntegrasyonKanallari k      ON k.EntegrasyonKanallari_id = s.PazaryeriSiparisleri_EntegrasyonKanallari_id
                     INNER JOIN dbo.tanim_Pazaryerleri p        ON p.Pazaryerleri_id = s.PazaryeriSiparisleri_Pazaryerleri_id
-                    LEFT JOIN dbo.Firmalar f                   ON f.firma_id = k.EntegrasyonKanallari_Firmalar_id",
+                    LEFT JOIN dbo.Firmalar f                   ON f.firma_id = k.EntegrasyonKanallari_Firmalar_id
+                    " . KOMISYON_KDV_APPLY,
                 // Komisyonu henüz gelmemiş kalem (teslim sonrası dolar): NULL korunur, arayüzde "—"
                 'bicim' => fn($r) => [
                     'tarih'          => (string)$r['tarih'],
@@ -887,7 +919,9 @@ function detayTanim(array $d, array $f)
                     'miktar'         => (int)$r['miktar'],
                     'kalem_tutar'    => round((float)$r['kalem_tutar'], 2),
                     'komisyon_oran'  => $r['komisyon_oran'] !== null ? round((float)$r['komisyon_oran'], 2) : null,
-                    'komisyon_tutar' => $r['komisyon_tutar'] !== null ? round((float)$r['komisyon_tutar'], 2) : null,
+                    'komisyon_kdvsiz'   => $r['komisyon_kdvsiz'] !== null ? round((float)$r['komisyon_kdvsiz'], 2) : null,
+                    'komisyon_kdv_oran' => $r['komisyon_kdv_oran'] !== null ? round((float)$r['komisyon_kdv_oran'], 2) : 0,
+                    'komisyon_tutar'    => $r['komisyon_tutar'] !== null ? round((float)$r['komisyon_tutar'], 2) : null,
                 ],
             ];
 
@@ -1087,13 +1121,15 @@ const DETAY_EXCEL_KOLONLARI = [
     'satis' => [
         ['Sipariş Tarihi', 'tarih', 'metin'], ['Sipariş No', 'siparis_no', 'metin'], ['Pazaryeri', 'pazaryeri', 'metin'],
         ['Kanal', 'kanal', 'metin'], ['Firma', 'firma', 'metin'], ['Müşteri', 'musteri', 'metin'],
-        ['Ürün', 'urunler', 'metin'], ['Durum', 'durum', 'metin'], ['Kalem', 'kalem', 'sayi'], ['Tutar', 'tutar', 'para'],
+        ['Ürün', 'urunler', 'metin'], ['Durum', 'durum', 'metin'], ['Kalem', 'kalem', 'sayi'], ['Komisyon', 'komisyon', 'para'],
+        ['Tutar', 'tutar', 'para'],
     ],
     'komisyon_pazaryeri' => [
         ['Sipariş Tarihi', 'tarih', 'metin'], ['Sipariş No', 'siparis_no', 'metin'], ['Pazaryeri', 'pazaryeri', 'metin'],
         ['Firma', 'firma', 'metin'], ['Ürün Adı', 'urun', 'metin'], ['Barkod', 'barkod', 'metin'],
         ['Miktar', 'miktar', 'sayi'], ['Kalem Tutarı', 'kalem_tutar', 'para'],
-        ['Komisyon Oranı (%)', 'komisyon_oran', 'sayi'], ['Komisyon Tutarı', 'komisyon_tutar', 'para'],
+        ['Komisyon Oranı (%)', 'komisyon_oran', 'sayi'], ['Komisyon (KDV Hariç)', 'komisyon_kdvsiz', 'para'],
+        ['Komisyon KDV (%)', 'komisyon_kdv_oran', 'sayi'], ['Komisyon (KDV Dahil)', 'komisyon_tutar', 'para'],
     ],
     'banka' => [
         ['Tarih', 'tarih', 'metin'], ['Banka', 'banka', 'metin'], ['IBAN', 'iban', 'metin'],
@@ -2390,6 +2426,8 @@ $platformlar = platformListesi();
                       render: (v) => v ? v.split(' ¦ ').map((u) => '<div>' + kacis(u) + '</div>').join('') : '—' },
                     { title: 'Durum', data: 'durum', render: (v) => '<span class="badge text-bg-light border">' + kacis(v || '-') + '</span>' },
                     { title: 'Kalem', data: 'kalem', orderable: false, className: 'text-end', render: sayi },
+                    { title: 'Komisyon', data: 'komisyon', orderable: false, className: 'text-end tutar text-danger',
+                      render: (v) => v === null ? '<span class="text-muted" title="Komisyon henüz yok: pazaryeri teslim sonrası bildirir">—</span>' : para(v) },
                     { title: 'Tutar', data: 'tutar', className: 'text-end tutar', render: para }
                 ]
             },
@@ -2405,7 +2443,9 @@ $platformlar = platformListesi();
                     { title: 'Miktar', data: 'miktar', className: 'text-end', render: sayi },
                     { title: 'Kalem Tutarı', data: 'kalem_tutar', className: 'text-end tutar', render: para },
                     { title: 'Komisyon Oranı', data: 'komisyon_oran', className: 'text-end', render: yuzde },
-                    { title: 'Komisyon Tutarı', data: 'komisyon_tutar', className: 'text-end tutar', render: (v) => v === null ? '—' : para(v) }
+                    { title: 'Komisyon (KDV Hariç)', data: 'komisyon_kdvsiz', orderable: false, className: 'text-end tutar', render: (v) => v === null ? '—' : para(v) },
+                    { title: 'KDV', data: 'komisyon_kdv_oran', orderable: false, className: 'text-end', render: yuzde },
+                    { title: 'Komisyon (KDV Dahil)', data: 'komisyon_tutar', className: 'text-end tutar', render: (v) => v === null ? '—' : para(v) }
                 ],
                 // Komisyonu henüz gelmemiş kalem: soluk satır
                 satirSinif: (tr, r) => {

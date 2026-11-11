@@ -364,6 +364,9 @@ class FaturaKesim
         // Sıralıda kesin kesimde kullanılacak numara (kilitsiz tahmin; kesimde yeniden hesaplanır)
         $tahmini = '';
         $uyarilar = [];
+        if ($yontem !== 'sirali') {
+            $uyarilar[] = 'NumaraYontemi "sirali" değil; kesin kesim yapılamaz (yalnız taslak).';
+        }
         if (!preg_match('/^[A-Z0-9]{3}$/', $seri)) {
             $uyarilar[] = ($tur['earsiv'] ? 'EArsivSeri' : 'EFaturaSeri') . ' tanımlı değil veya 3 karakter değil.';
         } elseif ($yontem === 'sirali') {
@@ -420,10 +423,14 @@ class FaturaKesim
         }
 
         // Numaralandırma (kanal ayarı NumaraYontemi):
-        //   seri   : cbc:ID yer tutucu + SERI; numarayı Örnek Holding atar
-        //   sirali : max(Örnek Holding, sistem) + 1, cbc:ID'ye yazılır
-        // Taslakta her iki yöntemde de yer tutucu kullanılır (taslak numara tüketmez).
-        $sirali = !$taslak && $this->numaraYontemi($api) === 'sirali';
+        //   sirali : max(Örnek Holding, sistem) + 1, cbc:ID'ye yazılır — kesin kesimde ZORUNLU
+        //   seri   : yalnız taslakta (yer tutucu; taslak numara tüketmez)
+        // Son numara Örnek Holding'den sorgulanmadan kesin fatura kesilmez (çakışma riski).
+        if (!$taslak && $this->numaraYontemi($api) !== 'sirali') {
+            return ['success' => false, 'message' => 'Örnek Holding kanalında NumaraYontemi "sirali" değil. '
+                . 'Son fatura numarası sorgulanmadan kesin fatura kesilmez; kanal ayarına NumaraYontemi=sirali ekleyin.'];
+        }
+        $sirali = !$taslak;
 
         // Hesaplama → kayıt → gönderim aynı seride tek sırada yürür
         $kilit = $sirali ? 'ornekholding_numara_' . $api->kanalBilgi()['kanal_id'] . '_' . $seri : null;

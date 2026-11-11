@@ -359,17 +359,20 @@ class TrendyolApi extends PazaryeriApi
 
         $kalemler = [];
         foreach ($s['lines'] ?? [] as $line) {
+            // Trendyol satır alanları BİRİM değerdir: amount = indirimsiz birim, price = indirimli birim,
+            // discount = birim indirim. Satır tutarı = price × quantity (komisyon paylaştırması buna dayanır).
+            $adet  = (int)($line['quantity'] ?? 1) ?: 1;
+            $birim = isset($line['price']) ? (float)$line['price'] : (isset($line['amount']) ? (float)$line['amount'] : null);
             $kalemler[] = [
                 'disId'         => (string)($line['id'] ?? ''),
                 'barkod'        => $line['barcode'] ?? null,
                 'stokKodu'      => $line['merchantSku'] ?? null,
                 'disUrunId'     => (string)($line['productCode'] ?? ''),
                 'urunAdi'       => $line['productName'] ?? null,
-                'miktar'        => (int)($line['quantity'] ?? 1),
+                'miktar'        => $adet,
                 'birimFiyat'    => $line['price'] ?? null,
-                'toplamFiyat'   => $line['amount'] ?? null,
-                'toplamTutar'   => $line['amount'] ?? null,
-                'indirimTutar'  => $line['discount'] ?? null,
+                'toplamTutar'   => $birim !== null ? round($birim * $adet, 2) : null,
+                'indirimTutar'  => isset($line['discount']) ? round((float)$line['discount'] * $adet, 2) : null,
                 'kdvOran'       => $line['vatBaseAmount'] ?? null,
                 'komisyonOran'  => $line['commissionRate'] ?? null,
                 'hamDurum'      => $line['orderLineItemStatusName'] ?? null,

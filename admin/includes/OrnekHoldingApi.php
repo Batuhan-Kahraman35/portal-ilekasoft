@@ -549,21 +549,32 @@ class OrnekHoldingApi
         $desen = '/^' . preg_quote($seri, '/') . $yil . '(\d{9})$/';
         $bitis = min(date('Y-m-d'), $yil . '-12-31');
 
+        // Liste sınırına dayanan sorguda kayıt eksik olabilir → son numara güvenilmez, hata dönülür
         $numaralar = [];
         if ($belgeTuru === 'EARSIV') {
-            $r = $this->earsivListesi(['start_date' => $yil . '-01-01', 'end_date' => $bitis, 'limit' => 10000]);
+            $sinir = 10000;
+            $r = $this->earsivListesi(['start_date' => $yil . '-01-01', 'end_date' => $bitis, 'limit' => $sinir]);
             if (!$r['success']) {
                 return ['success' => false, 'message' => $r['message'], 'sira' => 0];
+            }
+            if (count($r['data']) >= $sinir) {
+                return ['success' => false, 'sira' => 0, 'message' => "e-Arşiv listesi {$sinir} kayıt sınırına ulaştı; "
+                    . 'son numara güvenilir okunamadı (sorgu dönemi küçültülmeli).'];
             }
             $numaralar = array_column($r['data'], 'fatura_no');
         } else {
             // e-Fatura listesinde istek başına sınır var (10010); ay ay taranır
+            $sinir = 1000;
             $ay = new DateTime($yil . '-01-01');
             while ($ay->format('Y-m-d') <= $bitis) {
                 $son = min((clone $ay)->modify('last day of this month')->format('Y-m-d'), $bitis);
-                $r = $this->faturaListesi('OUT', ['start_date' => $ay->format('Y-m-d'), 'end_date' => $son, 'limit' => 1000]);
+                $r = $this->faturaListesi('OUT', ['start_date' => $ay->format('Y-m-d'), 'end_date' => $son, 'limit' => $sinir]);
                 if (!$r['success']) {
                     return ['success' => false, 'message' => $r['message'], 'sira' => 0];
+                }
+                if (count($r['data'] ?? []) >= $sinir) {
+                    return ['success' => false, 'sira' => 0, 'message' => 'e-Fatura listesi ' . $ay->format('m.Y')
+                        . " için {$sinir} kayıt sınırına ulaştı; son numara güvenilir okunamadı (sorgu dönemi küçültülmeli)."];
                 }
                 $numaralar = array_merge($numaralar, array_column($r['data'] ?? [], 'fatura_no'));
                 $ay->modify('first day of next month');
