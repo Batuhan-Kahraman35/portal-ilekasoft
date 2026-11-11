@@ -831,7 +831,8 @@ function detayTanim(array $d, array $f)
                     " . KOMISYON_KDV_APPLY . "
                     OUTER APPLY (
                         SELECT COUNT(*) AS adet,
-                               SUM(" . KOMISYON_KDV_DAHIL . ") AS komisyon
+                               -- Çarpan SUM dışında: dış referans (kkdv) toplama ifadesine giremez (Msg 8124)
+                               SUM(c.PazaryeriSiparisKalemleri_KomisyonTutar) * " . KOMISYON_KDV_CARPAN . " AS komisyon
                         FROM dbo.PazaryeriSiparisKalemleri c
                         WHERE c.PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id = s.PazaryeriSiparisleri_id
                           AND c.PazaryeriSiparisKalemleri_Durum = 1
