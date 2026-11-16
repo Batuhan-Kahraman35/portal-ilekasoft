@@ -664,8 +664,120 @@ function gorevGelmediSmsGonder(array $params, $db): array
 //   php admin/cron/worker.php gorev=ornekholding_senkron gun=30
 //
 // params: gun (varsayılan 30), dilim (varsayılan 5), kanal, tur (EFATURA|EARSIV),
-//         yon (GELEN|GIDEN), detay (0 = kalem detayı çekme), detay-limit
+//         yon (GELEN|GIDEN), detay (0 = kalem detayı çekme), detay-limit,
+//         xslt (0 = XSLT eşitleme yapma; detay=0 çalışmasında zaten yapılmaz)
 // ================================================================
+/**
+ * Pazaryeri siparişi ↔ giden fatura otomatik eşleştirme (yalnız tekil eşleşmeler).
+ * ornekholding_senkron ve pazaryeri_senkron sonunda çalışır; hatası görevi düşürmez.
+ * Dönen metin görev özetine eklenir.
+ */
+function cronFaturaEslestir($db): string
+{
+    try {
+        require_once __DIR__ . '/../includes/FaturaEslestirme.php';
+        $o = (new FaturaEslestirme($db, 1))->otomatik(FaturaEslestirme::tumPazaryeriKanallari($db));
+        echo "[OK] Fatura eslestirme: {$o['eslesen']} baglandi, {$o['belirsiz']} secim bekliyor\n";
+        $ozet = " | Fatura eslesen: {$o['eslesen']}, secim bekleyen: {$o['belirsiz']}";
+    } catch (Throwable $e) {
+        echo "[HATA] Fatura eslestirme: " . $e->getMessage() . "\n";
+        $ozet = ' | Fatura eslestirme HATA';
+    }
+    // Eşleşen / kesilen faturaların linki pazaryerine bildirilir
+    return $ozet . cronFaturaBildir($db);
+}
+
+/**
+ * Kesinleşmiş ama pazaryerine bildirilmemiş faturaları bildirir (FaturaKesim::pazaryeriBildir).
+ * Daha önce bildirim hatası almış siparişler tekrar denenmez (panelden elle bildirilir);
+ * her çalışmada en fazla $limit sipariş. Hatası görevi düşürmez.
+ * Yalnız PazaryeriAyarlari 'fatura_bildirim_otomatik' = 1 olan kanallarda çalışır
+ * (kanal → pazaryeri → genel; ayar yoksa kapalı).
+ */
+function cronFaturaBildir($db, int $limit = 50): string
+{
+    try {
+        // Açma/kapama: PazaryeriAyarlari 'fatura_bildirim_otomatik' (1/0), öncelik
+        // kanal → pazaryeri → genel. Bildirimi başka sistemin yaptığı mağaza (ör. Örnek Müşteri
+        // kendi panelinden bildirir) kanal düzeyinde 0 yapılır; hiç ayar yoksa kapalıdır.
+        $ayarlar = $db->fetchAll("
+            SELECT PazaryeriAyarlari_EntegrasyonKanallari_id AS k, PazaryeriAyarlari_Pazaryerleri_id AS p,
+                   LTRIM(RTRIM(PazaryeriAyarlari_Deger)) AS d
+            FROM dbo.PazaryeriAyarlari
+            WHERE PazaryeriAyarlari_Anahtar = 'fatura_bildirim_otomatik' AND PazaryeriAyarlari_Durum = 1
+        ") ?: [];
+        $kanalAyar = $pyAyar = [];
+        $genel = null;
+        foreach ($ayarlar as $a) {
+            if ($a['k'] !== null)      $kanalAyar[(int)$a['k']] = $a['d'];
+            elseif ($a['p'] !== null)  $pyAyar[(int)$a['p']]    = $a['d'];
+            else                       $genel                   = $a['d'];
+        }
+        $acikKanallar = [];
+        foreach ($db->fetchAll("
+            SELECT DISTINCT s.PazaryeriSiparisleri_EntegrasyonKanallari_id AS k, s.PazaryeriSiparisleri_Pazaryerleri_id AS p
+            FROM dbo.PazaryeriSiparisleri s
+            WHERE s.PazaryeriSiparisleri_Faturalar_id IS NOT NULL AND s.PazaryeriSiparisleri_FaturaBildirimTarihi IS NULL
+        ") ?: [] as $kp) {
+            $deger = $kanalAyar[(int)$kp['k']] ?? $pyAyar[(int)$kp['p']] ?? $genel;
+            if ((string)$deger === '1') $acikKanallar[] = (int)$kp['k'];
+        }
+        if (!$acikKanallar) {
+            return '';
+        }
+
+        require_once __DIR__ . '/../includes/OrnekHoldingApi.php';
+        require_once __DIR__ . '/../includes/FaturaKesim.php';
+        $fk  = new FaturaKesim(1, $db);
+        $ids = $fk->bildirimBekleyenler(array_values(array_unique($acikKanallar)), $limit, false);
+        $ok = 0; $hata = 0;
+        foreach ($ids as $id) {
+            try {
+                $r = $fk->pazaryeriBildir($id);
+            } catch (Throwable $e) {
+                $r = ['success' => false, 'message' => $e->getMessage()];
+            }
+            if (!empty($r['success'])) {
+                $ok++;
+            } else {
+                $hata++;
+                echo "[UYARI] Fatura bildirimi (siparis $id): " . ($r['message'] ?? '') . "\n";
+            }
+        }
+        echo "[OK] Fatura bildirimi: $ok bildirildi, $hata hatali (" . count($ids) . " bekleyen)\n";
+        return count($ids) ? " | Fatura bildirilen: $ok" . ($hata ? ", hatali: $hata" : '') : '';
+    } catch (Throwable $e) {
+        echo "[HATA] Fatura bildirimi: " . $e->getMessage() . "\n";
+        return ' | Fatura bildirimi HATA';
+    }
+}
+
+/**
+ * Örnek Holding XSLT eşitleme (ornekholding-xslt-senkron.php --uygula), ornekholding_senkron sonunda.
+ * Portaldan kesilen son faturalardaki gömülü şablonla assets/xslt/<XsltKlasoru>/ güncellenir.
+ * Ayrı süreçte çalışır; hatası görevi düşürmez.
+ *
+ * @return array [özet eki, çıktı]
+ */
+function cronXsltEsitle(array $params): array
+{
+    $argumanlar = ['--uygula'];
+    if (!empty($params['kanal'])) $argumanlar[] = '--kanal=' . (int)$params['kanal'];
+    if (!empty($params['tur']))   $argumanlar[] = '--tur=' . strtoupper((string)$params['tur']);
+
+    $sonuc = cronHariciSurec('ornekholding-xslt-senkron.php', $argumanlar, 600);
+    $cikti = "\n----- XSLT eşitleme -----\n" . $sonuc['cikti'];
+
+    $ozet = '';
+    if (preg_match('/Özet: (.+)$/mu', $sonuc['cikti'], $m)) {
+        $ozet = trim($m[1]);
+    }
+    if ($sonuc['kod'] !== 0) {
+        return [' | XSLT HATA' . ($ozet ? ' (' . $ozet . ')' : ''), $cikti];
+    }
+    return [' | XSLT ' . ($ozet ?: 'tamamlandi'), $cikti];
+}
+
 function gorevOrnekHoldingSenkron(array $params, $db): array
 {
     global $argv;
@@ -695,6 +807,21 @@ function gorevOrnekHoldingSenkron(array $params, $db): array
     // Özet: çıktının son anlamlı satırı (servis ilerlemeyi echo ile yazıyor)
     $satirlar = array_values(array_filter(array_map('trim', explode("\n", $cikti)), fn($s) => $s !== ''));
     $sonSatir = $satirlar ? end($satirlar) : 'Senkronizasyon tamamlandi';
+
+    // Yeni gelen giden faturalar faturasız pazaryeri siparişleriyle eşleşsin
+    if (empty($params['yon']) || strtoupper((string)$params['yon']) === 'GIDEN') {
+        $sonSatir .= cronFaturaEslestir($db);
+    }
+
+    // XSLT eşitleme: durum tazeleme (detay=0) çalışmasında ve xslt=0 verilince atlanır
+    $detayKapali = isset($params['detay']) && (string)$params['detay'] === '0';
+    $xsltKapali  = isset($params['xslt']) && (string)$params['xslt'] === '0';
+    if (!$detayKapali && !$xsltKapali
+        && (empty($params['yon']) || strtoupper((string)$params['yon']) === 'GIDEN')) {
+        [$xsltOzet, $xsltCikti] = cronXsltEsitle($params);
+        $sonSatir .= $xsltOzet;
+        $cikti    .= $xsltCikti;
+    }
 
     return [
         'durum' => 1,
@@ -965,8 +1092,10 @@ function gorevPazaryeriSenkron(array $params, $db): array
         }
     }
 
+    $eslesme = ($tip !== 'iade') ? cronFaturaEslestir($db) : '';
+
     $hatalar = array_unique($hatalar);
-    $ozet = "Siparis: {$toplamSiparis}, iade: {$toplamIade}"
+    $ozet = "Siparis: {$toplamSiparis}, iade: {$toplamIade}" . $eslesme
           . ($hatalar ? ' | Hatali kanal: ' . implode(', ', $hatalar) : '');
 
     return [

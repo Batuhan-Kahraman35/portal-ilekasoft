@@ -9,7 +9,8 @@
  * faturasının XML'inden birebir alınmıştır (DGT2026000000038, 2026-09-17).
  * Portal ile aynı görüntüyü vermesi için:
  *   - Boş kalan alanlar da (BuildingName, Telefax, Region...) boş eleman olarak yazılır
- *   - Sipariş referansı ve not yazılmaz (şablon bunları "Sipariş No" / not olarak basar)
+ *   - Sipariş referansı cac:OrderReference'a (şablon başlıkta "Sipariş No / Sipariş Tarihi"
+ *     basar), açıklama notu cbc:Note'a yazılır (pazaryeri · sipariş no · paket no)
  *   - "İrsaliye yerine geçer." şablon tarafından DespatchDocumentReference yoksa eklenir
  *   - IBAN tablosu PaymentMeans/PayeeFinancialAccount'tan çizilir
  * Eleman sırası UBL 2.1 Invoice şemasına uyar; sıra bozulursa Örnek Holding 10003 döner.
@@ -50,6 +51,8 @@ class FaturaUbl
      *   ettn, no, earsiv(bool), senaryo, tip, tarih(Y-m-d), saat(H:i:s), para,
      *   gonderim_sekli (e-Arşiv: ELEKTRONIK | KAGIT),
      *   xslt_ad, xslt_icerik (isteğe bağlı; boşsa XSLT gömülmez),
+     *   notlar  [string, ...]  (cbc:Note)
+     *   siparis [no, tarih(Y-m-d)]  (isteğe bağlı; cac:OrderReference)
      *   satici  [vkn, unvan, vergi_dairesi, adres, il, ilce, telefon, eposta],
      *   alici   [kimlik, kimlik_tur VKN|TCKN, unvan, ad, soyad, vergi_dairesi, adres, il, ilce, ulke, telefon, eposta],
      *   odeme   [kod, hesaplar[ [iban, banka, sube, para] ]]  (boşsa PaymentMeans yazılmaz)
@@ -84,6 +87,16 @@ class FaturaUbl
         }
         $x .= '<cbc:DocumentCurrencyCode>' . $e($para) . '</cbc:DocumentCurrencyCode>' . "\n";
         $x .= '<cbc:LineCountNumeric>' . count($b['kalemler']) . '</cbc:LineCountNumeric>' . "\n";
+
+        // Sipariş referansı (UBL sırası: LineCountNumeric → InvoicePeriod → OrderReference
+        // → BillingReference → DespatchDocumentReference → ... → AdditionalDocumentReference)
+        $sipNo = trim((string)($b['siparis']['no'] ?? ''));
+        if ($sipNo !== '') {
+            $sipTarih = (string)($b['siparis']['tarih'] ?? '');
+            $x .= '<cac:OrderReference><cbc:ID>' . $e(mb_substr($sipNo, 0, 50)) . '</cbc:ID>'
+                . '<cbc:IssueDate>' . $e(preg_match('/^\d{4}-\d{2}-\d{2}$/', $sipTarih) ? $sipTarih : $b['tarih']) . '</cbc:IssueDate>'
+                . '</cac:OrderReference>' . "\n";
+        }
 
         // Görüntüleme şablonu (GİB: XSLT belge içine gömülür).
         // İsteğe bağlı: şablon verilmezse Örnek Holding'nin varsayılan görüntüsü kullanılır.

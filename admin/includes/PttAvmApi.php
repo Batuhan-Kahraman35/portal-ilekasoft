@@ -239,6 +239,11 @@ class PttAvmApi extends PazaryeriApi
                     $tutarVar = true;
                 }
 
+                // PttAVM 'komisyon' alanı ORANDIR (%12, %14), tutar değil. Tutar KDV dahil kalem tutarı
+                // üzerinden hesaplanır; komisyona KDV eklenmesi PazaryeriAyarlari 'KomisyonKdvOran' ile yönetilir.
+                $komisyonOran  = $this->sayi($it['komisyon'] ?? null);
+                $komisyonTutar = ($komisyonOran !== null && $dahil !== null) ? round($dahil * $komisyonOran / 100, 2) : null;
+
                 $kalemler[] = [
                     'disId'         => isset($it['lineItemId']) ? (string)$it['lineItemId'] : null,
                     'barkod'        => ($it['urunBarkod'] ?? '') !== '' ? $it['urunBarkod'] : null,
@@ -251,7 +256,8 @@ class PttAvmApi extends PazaryeriApi
                     'indirimTutar'  => $this->sayi($it['indirimToplam'] ?? null),
                     'kdvOran'       => $this->sayi($it['kdvOrani'] ?? null),
                     'kdvTutar'      => ($dahil !== null && $haric !== null) ? round($dahil - $haric, 2) : null,
-                    'komisyonTutar' => $this->sayi($it['komisyon'] ?? null),
+                    'komisyonOran'  => $komisyonOran,
+                    'komisyonTutar' => $komisyonTutar,
                     'hamDurum'      => is_scalar($hamDurum) ? (string)$hamDurum : null,
                     'ham'           => $it
                 ];

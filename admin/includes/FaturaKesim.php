@@ -14,8 +14,11 @@
  *    (EntegrasyonKanallari_Firmalar_id). Seçilen Örnek Holding kanalı da aynı firmaya bağlı olmalıdır.
  *  - Seri: PazaryeriAyarlari EFaturaSeri / EArsivSeri (kanal → pazaryeri → genel) varsa o,
  *    yoksa Örnek Holding kanal JSON'undaki EFaturaSeri / EArsivSeri.
- *  - XSLT isteğe bağlı: Örnek Holding kanal JSON'unda XsltKlasoru varsa
- *    <xsltKok>/<klasor>/0_fatura.xslt | 0_arsivfatura.xslt gömülür.
+ *  - Şablon: Örnek Holding kanal JSON'unda XsltAdi (ör. "DEFAULT") varsa XSLT gömülmez,
+ *    Örnek Holding portalındaki şablon adıyla istenir (imza/logo/IBAN orada güncel tutulur).
+ *    Yoksa XsltKlasoru varsa <xsltKok>/<klasor>/0_fatura.xslt | 0_arsivfatura.xslt gömülür.
+ *    e-Arşiv'de ikisinden biri zorunludur (Örnek Holding şablonsuz belgeyi reddeder).
+ *    OrnekHoldingApi: earsivGonder(..., $earsivTipi, $xsltAdi), efaturaGonder(..., $taslak, $xsltAdi)
  *  - Mükellef sorgusu hata verirse işlem DURUR (yanlışlıkla e-Arşiv kesilmez).
  *  - ETTN gönderimden ÖNCE Faturalar'a yazılır ve siparişe bağlanır. Sonucu belirsiz
  *    kalan gönderim tekrar edilirse aynı ETTN kullanılır; Örnek Holding aynı ETTN'yi ikinci
@@ -280,6 +283,17 @@ class FaturaKesim
             SELECT Pazaryerleri_Ad FROM dbo.tanim_Pazaryerleri WHERE Pazaryerleri_id = ?
         ", [$pazaryeriId]);
 
+        // Sipariş referansı: UBL cac:OrderReference (şablon başlıkta "Sipariş No / Sipariş Tarihi"
+        // basar) + açıklama notu (pazaryeri ve paket görünsün). Bkz. docs/10-fatura-kesim.md
+        $siparisNo = (string)($s['PazaryeriSiparisleri_SiparisNo'] ?: $s['PazaryeriSiparisleri_DisId']);
+        $paketNo   = (string)($s['PazaryeriSiparisleri_PaketNo'] ?? '');
+        $pyAd      = (string)($pazaryeri['Pazaryerleri_Ad'] ?? '');
+        $not = implode(' · ', array_filter([
+            $pyAd,
+            $siparisNo !== '' ? 'Sipariş No: ' . $siparisNo : '',
+            ($paketNo !== '' && $paketNo !== $siparisNo) ? 'Paket No: ' . $paketNo : '',
+        ]));
+
         $belge = [
             'kaynak_tip'     => 'pazaryeri',
             'kaynak_id'      => (int)$siparisId,
@@ -290,11 +304,10 @@ class FaturaKesim
             'kalemler'       => $kalemler,
             'toplam'         => self::toplamlar($kalemler),
             'para'           => $s['PazaryeriSiparisleri_ParaBirimi'] ?: 'TRY',
-            'siparis_no'     => $s['PazaryeriSiparisleri_SiparisNo'] ?: $s['PazaryeriSiparisleri_DisId'],
+            'siparis_no'     => $siparisNo,
             'siparis_tarihi' => $s['SiparisGunu'],
-            'pazaryeri'      => $pazaryeri['Pazaryerleri_Ad'] ?? '',
-            // Örnek Holding portal faturasında not / sipariş referansı yok; şablon bunları ayrı satır basar
-            'notlar'         => [],
+            'pazaryeri'      => $pyAd,
+            'notlar'         => $not !== '' ? [$not] : [],
             'tutar_yontemi'  => $yontem,
         ];
 
@@ -380,15 +393,23 @@ class FaturaKesim
             $uyarilar[] = $xslt['message'];
         }
 
+        // Çift fatura: kesin kesimde engeller / onay ister; önizlemede önceden gösterilir
+        $cift = $this->ciftFaturaKontrol($belge);
+        if ($cift['durum'] !== 'temiz') {
+            $uyarilar[] = $cift['mesaj'];
+        }
+
         return [
             'success'        => true,
+            'cift'           => $cift,
             'belge_turu'     => $belgeTuru,
             'alias'          => $tur['alias'],
             'gib_unvan'      => $tur['unvan'],
             'seri'           => $seri,
             'numara_yontemi' => $yontem,
             'tahmini_numara' => $tahmini,
-            'xslt'           => $xslt['success'] ? $xslt['ad'] : '',
+            'xslt'           => !$xslt['success'] ? ''
+                                : (($xslt['sablon_adi'] ?? '') !== '' ? 'Örnek Holding: ' . $xslt['sablon_adi'] : $xslt['ad']),
             'kanal'          => $api->kanalBilgi(),
             'uyarilar'       => $uyarilar,
         ];
@@ -397,12 +418,25 @@ class FaturaKesim
     /**
      * @param bool $taslak         true: e-Arşiv DRAFT / e-Fatura LoadInvoice (GİB'e gitmez)
      * @param bool $belirsizTekrar Sonucu belirsiz (GONDERILIYOR) kalan gönderimi aynı ETTN ile tekrarla
+     * @param bool $ciftOnay       Olası çift fatura uyarısına rağmen kesin kesim (kullanıcı onayı)
      */
-    public function kes(array $belge, $kanalId, $taslak = true, $belirsizTekrar = false)
+    public function kes(array $belge, $kanalId, $taslak = true, $belirsizTekrar = false, $ciftOnay = false)
     {
         [$api, $hata] = $this->api($belge, $kanalId);
         if (!$api) {
             return ['success' => false, 'message' => $hata];
+        }
+
+        // Çift fatura kontrolü (yalnız kesin kesim; sonucu belirsiz gönderimin tekrarı hariç —
+        // o durumda kendi faturası Örnek Holding'de oluşmuş olabilir)
+        if (!$taslak && !$belirsizTekrar && !$api->testMi()) {
+            $cift = $this->ciftFaturaKontrol($belge);
+            if ($cift['durum'] === 'kesin' || $cift['durum'] === 'hata') {
+                return ['success' => false, 'cift' => $cift, 'message' => $cift['mesaj']];
+            }
+            if ($cift['durum'] === 'olasi' && !$ciftOnay) {
+                return ['success' => false, 'cift' => $cift, 'onay_gerekli' => true, 'message' => $cift['mesaj']];
+            }
         }
 
         $tur = $this->belgeTuru($api, $belge);
@@ -417,7 +451,7 @@ class FaturaKesim
                 . ' tanımlı değil veya 3 karakter değil (Örnek Holding kanal ayarı ya da Pazaryeri Ayarları).'];
         }
 
-        $xslt = $this->xslt($api, $earsiv);
+        $xslt = $this->xslt($api, $earsiv, $taslak);
         if (!$xslt['success']) {
             return $xslt;
         }
@@ -507,9 +541,10 @@ class FaturaKesim
             $ubl = $this->ublUret($api, $belge, $xslt, $earsiv, $ettn, $no);
             // Sıralıda numara cbc:ID'dedir; SERI/SERI_PREFIX gönderilmez
             $gonderSeri = $sirali ? '' : $seri;
+            $sablonAdi = (string)($xslt['sablon_adi'] ?? '');
             $sonuc = $earsiv
-                ? $api->earsivGonder($ubl, $ettn, $gonderSeri, $taslak)
-                : $api->efaturaGonder($ubl, $ettn, $belge['alici']['kimlik'], $tur['alias'], $gonderSeri, $taslak);
+                ? $api->earsivGonder($ubl, $ettn, $gonderSeri, $taslak, 'NORMAL', $sablonAdi)
+                : $api->efaturaGonder($ubl, $ettn, $belge['alici']['kimlik'], $tur['alias'], $gonderSeri, $taslak, $sablonAdi);
 
             if (!$sonuc['success'] && $sirali && $deneme < 3 && self::numaraCakismasi($sonuc['message'])
                 && preg_match($desen, $no, $m)) {
@@ -581,6 +616,7 @@ class FaturaKesim
             'saat'           => date('H:i:s'),
             'para'           => $belge['para'],
             'notlar'         => $belge['notlar'],
+            'siparis'        => ['no' => $belge['siparis_no'] ?? '', 'tarih' => $belge['siparis_tarihi'] ?? ''],
             // Kanal ayarları: EArsivGonderimSekli (ELEKTRONIK|KAGIT), OdemeKodu, BankaHesaplari
             'gonderim_sekli' => strtoupper((string)$api->ayar('EArsivGonderimSekli', 'ELEKTRONIK')),
             'odeme'          => [
@@ -711,14 +747,27 @@ class FaturaKesim
     }
 
     /**
-     * XSLT (isteğe bağlı): <xsltKok>/<XsltKlasoru>/0_fatura.xslt | 0_arsivfatura.xslt
-     * Klasör tanımlı değilse boş döner (Örnek Holding varsayılan görüntüsü); tanımlı ama dosya yoksa hata.
+     * Görüntüleme şablonu. Öncelik:
+     *  1. Kanal ayarı XsltAdi (ör. "DEFAULT"): XSLT gömülmez, Örnek Holding portalındaki şablon
+     *     adıyla istenir (XSLT_NAME); imza/logo/IBAN Örnek Holding'de güncellenince faturaya
+     *     kendiliğinden yansır. e-Fatura taslağında (LoadInvoice) XSLT_NAME gönderilemediği
+     *     için bu durumda 2. adıma düşülür.
+     *  2. XsltKlasoru: <xsltKok>/<klasor>/0_fatura.xslt | 0_arsivfatura.xslt gömülür
+     *     (tanımlı ama dosya yoksa hata).
+     *  3. İkisi de yoksa boş. Not: e-Arşiv'de Örnek Holding şablonsuz belgeyi reddeder [10013].
+     *
+     * @return array ['success', 'ad', 'icerik', 'sablon_adi'] | ['success' => false, 'message']
      */
-    private function xslt($api, $earsiv)
+    private function xslt($api, $earsiv, $taslak = false)
     {
+        $sablonAdi = trim((string)$api->ayar('XsltAdi', ''));
+        if ($sablonAdi !== '' && ($earsiv || !$taslak)) {
+            return ['success' => true, 'ad' => '', 'icerik' => '', 'sablon_adi' => $sablonAdi];
+        }
+
         $klasor = preg_replace('/[^a-zA-Z0-9_-]/', '', (string)$api->ayar('XsltKlasoru', ''));
         if ($klasor === '') {
-            return ['success' => true, 'ad' => '', 'icerik' => ''];
+            return ['success' => true, 'ad' => '', 'icerik' => '', 'sablon_adi' => ''];
         }
         $ad  = $earsiv ? '0_arsivfatura.xslt' : '0_fatura.xslt';
         $kok = self::$xsltKok ?: __DIR__ . '/../assets/xslt';
@@ -726,7 +775,7 @@ class FaturaKesim
         if (!is_file($yol)) {
             return ['success' => false, 'message' => 'XSLT şablonu bulunamadı: assets/xslt/' . $klasor . '/' . $ad];
         }
-        return ['success' => true, 'ad' => $ad, 'icerik' => file_get_contents($yol)];
+        return ['success' => true, 'ad' => $ad, 'icerik' => file_get_contents($yol), 'sablon_adi' => ''];
     }
 
     private function firma($firmaId)
@@ -928,6 +977,419 @@ class FaturaKesim
         ", [$anahtar, (int)$kanalId, (int)$pazaryeriId]);
         $deger = trim((string)($row['PazaryeriAyarlari_Deger'] ?? ''));
         return $deger !== '' ? $deger : null;
+    }
+
+    // =================================================================
+    // Çift fatura kontrolü (kesimden önce)
+    // =================================================================
+
+    /** Ad karşılaştırma anahtarı: Türkçe büyük harf, Türkçe/şapkalı harf → Latin, tek boşluk, noktasız */
+    private static function adAnahtar($ad)
+    {
+        $s = self::buyukHarf(trim((string)$ad));
+        $s = strtr($s, ['Ç' => 'C', 'Ğ' => 'G', 'İ' => 'I', 'Ö' => 'O', 'Ş' => 'S', 'Ü' => 'U', 'Â' => 'A', 'Î' => 'I', 'Û' => 'U', '.' => '']);
+        return preg_replace('/\s+/u', ' ', $s);
+    }
+
+    /**
+     * Sipariş başka yerden (Örnek Müşteri sitesi, Örnek Holding paneli, başka yazılım, başka firmanın
+     * hesabı) faturalanmış mı? Firmaya bakmaz.
+     *
+     *   1. Pazaryeri: sipariş kaydında pazaryerinin fatura linki (Trendyol invoiceLink) → kesin
+     *   2. Örnek Holding — portal kaydı (gece senkronu): giden, kesinleşmiş, aynı ad + tutar (±tolerans),
+     *      sipariş gününden bugüne; başka siparişe bağlı olmayan → olası
+     *   3. Örnek Holding — canlı (senkron sonrası: dün + bugün), tüm aktif hesaplar (VKN başına bir):
+     *      aynı ad + tutar → XML'de OrderReference = sipariş no ise kesin, değilse olası
+     * Siparişin kendi fatura kaydı (ETTN) ve taslaklar sayılmaz.
+     *
+     * @return array ['durum' => temiz|olasi|kesin|hata, 'mesaj' => string, 'faturalar' => [[no, tarih, unvan, tutar, kaynak]]]
+     */
+    public function ciftFaturaKontrol(array $belge)
+    {
+        $s = $this->db->fetchOne("
+            SELECT s.PazaryeriSiparisleri_HamVeri AS ham, s.PazaryeriSiparisleri_FaturaBildirimTarihi AS bildirim,
+                   fa.Faturalar_ETTN AS kendi_ettn, fa.Faturalar_FaturaNo AS kendi_no
+            FROM dbo.PazaryeriSiparisleri s
+            LEFT JOIN dbo.Faturalar fa ON fa.Faturalar_id = s.PazaryeriSiparisleri_Faturalar_id
+            WHERE s.PazaryeriSiparisleri_id = ?
+        ", [(int)$belge['kaynak_id']]);
+
+        $kendi    = strtolower(trim((string)($s['kendi_ettn'] ?? '')));
+        $sipNo    = trim((string)($belge['siparis_no'] ?? ''));
+        $tutar    = (float)$belge['toplam']['genel'];
+        $bas      = (string)($belge['siparis_tarihi'] ?: date('Y-m-d'));
+        $al       = $belge['alici'];
+        $adlar    = array_values(array_unique(array_filter([
+            self::adAnahtar($al['unvan'] ?? ''),
+            self::adAnahtar(trim(($al['ad'] ?? '') . ' ' . ($al['soyad'] ?? ''))),
+        ])));
+        $bulunan = [];
+        $kesin   = false;
+
+        // 1) Pazaryeri kaydında fatura linki (bizim bildirimimiz değilse başka yerden yüklenmiş)
+        $ham = json_decode((string)($s['ham'] ?? ''), true);
+        $pyLink = is_array($ham) ? trim((string)($ham['invoiceLink'] ?? '')) : '';
+        if ($pyLink !== '' && empty($s['bildirim'])) {
+            $kesin = true;
+            $bulunan[] = ['no' => (string)($ham['invoiceNumber'] ?? ''), 'tarih' => '', 'unvan' => '',
+                          'tutar' => null, 'kaynak' => 'pazaryerinde fatura linki var'];
+        }
+
+        // 2) Portal kaydı (senkronla gelen giden faturalar, tüm firmalar)
+        if ($adlar) {
+            $satirlar = $this->db->fetchAll("
+                SELECT f.Faturalar_FaturaNo AS no, CONVERT(VARCHAR(10), f.Faturalar_Tarih, 120) AS tarih,
+                       f.Faturalar_CariUnvan AS unvan, f.Faturalar_OdenecekTutar AS tutar, f.Faturalar_ETTN AS ettn
+                FROM dbo.Faturalar f
+                WHERE f.Faturalar_Yon = 'GIDEN' AND f.Faturalar_Durum = 1 AND f.Faturalar_IptalDurumu = 0
+                  AND f.Faturalar_FaturaNo IS NOT NULL AND f.Faturalar_FaturaNo NOT LIKE '%000000000'
+                  AND f.Faturalar_Tarih >= ? AND ABS(f.Faturalar_OdenecekTutar - ?) <= ?
+                  AND NOT EXISTS (SELECT 1 FROM dbo.PazaryeriSiparisleri p WHERE p.PazaryeriSiparisleri_Faturalar_id = f.Faturalar_id)
+            ", [$bas, $tutar, self::TOPLAM_TOLERANS]) ?: [];
+            foreach ($satirlar as $f) {
+                if (strtolower((string)$f['ettn']) === $kendi || !in_array(self::adAnahtar($f['unvan']), $adlar, true)) continue;
+                $bulunan[strtolower((string)$f['ettn'])] = ['no' => $f['no'], 'tarih' => $f['tarih'], 'unvan' => $f['unvan'],
+                                                            'tutar' => (float)$f['tutar'], 'kaynak' => 'Örnek Holding (senkron)'];
+            }
+        }
+
+        // 3) Canlı Örnek Holding: senkrondan sonra kesilmiş olabilecekler (dün + bugün), her VKN bir kez
+        $hata = '';
+        if ($adlar) {
+            $gunler = array_values(array_filter([date('Y-m-d', strtotime('-1 day')), date('Y-m-d')], fn($g) => $g >= $bas));
+            $vknler = [];
+            foreach (OrnekHoldingApi::aktifKanallar($this->db) as $k) {
+                $tb = new OrnekHoldingApi($k, $this->userId);
+                $vkn = (string)($tb->kanalBilgi()['vkn'] ?? '');
+                if (!$tb->hazirMi() || $tb->testMi() || $vkn === '' || isset($vknler[$vkn])) continue;
+                $vknler[$vkn] = true;
+                foreach ($gunler as $gun) {
+                    foreach (['EFATURA', 'EARSIV'] as $tur) {
+                        if ($tur === 'EARSIV' && !$tb->earsivVarMi()) continue;
+                        $l = $tur === 'EFATURA'
+                            ? $tb->faturaListesi('OUT', ['start_date' => $gun, 'end_date' => $gun, 'limit' => 1000])
+                            : $tb->earsivListesi(['start_date' => $gun, 'end_date' => $gun, 'limit' => 1000]);
+                        if (!$l['success']) { $hata = $l['message']; continue; }
+                        foreach ($l['data'] ?? [] as $f) {
+                            $ettn = strtolower((string)$f['ettn']);
+                            if ($ettn === '' || $ettn === $kendi || isset($bulunan[$ettn]) || !empty($f['iptal'])) continue;
+                            $taslak = preg_match('/0{9}$/', (string)$f['fatura_no'])
+                                   || ($tur === 'EARSIV' && trim((string)$f['durum']) === '' && trim((string)$f['gib_durum_kod']) === '');
+                            if ($taslak || abs((float)$f['tutar'] - $tutar) > self::TOPLAM_TOLERANS
+                                || !in_array(self::adAnahtar($f['alici_unvan'] ?? ''), $adlar, true)) continue;
+                            // Aday: XML'de sipariş no varsa kesin
+                            $x = $tur === 'EFATURA' ? $tb->faturaXml($f['ettn'], 'OUT') : $tb->earsivXml($f['ettn']);
+                            $ayni = !empty($x['success']) && $sipNo !== ''
+                                 && preg_match('#<cac:OrderReference>\s*<cbc:ID>\s*' . preg_quote($sipNo, '#') . '\s*</cbc:ID>#', $x['xml']);
+                            if ($ayni) $kesin = true;
+                            $bulunan[$ettn] = ['no' => $f['fatura_no'], 'tarih' => substr((string)$f['fatura_tarihi'], 0, 10),
+                                               'unvan' => $f['alici_unvan'], 'tutar' => (float)$f['tutar'],
+                                               'kaynak' => $tb->getKanalAdi() . ($ayni ? ' (sipariş no aynı)' : '')];
+                        }
+                    }
+                }
+            }
+        }
+
+        $bulunan = array_values($bulunan);
+        if ($kesin) {
+            return ['durum' => 'kesin', 'faturalar' => $bulunan,
+                    'mesaj' => 'Bu sipariş başka yerden faturalanmış: ' . self::faturaOzet($bulunan) . '. Yeniden kesilmez.'];
+        }
+        if ($bulunan) {
+            return ['durum' => 'olasi', 'faturalar' => $bulunan,
+                    'mesaj' => 'Aynı alıcı ve tutarda fatura var (olası çift fatura): ' . self::faturaOzet($bulunan) . '.'];
+        }
+        if ($hata !== '') {
+            return ['durum' => 'hata', 'faturalar' => [], 'mesaj' => 'Çift fatura kontrolü yapılamadı (Örnek Holding): ' . $hata];
+        }
+        return ['durum' => 'temiz', 'faturalar' => [], 'mesaj' => ''];
+    }
+
+    private static function faturaOzet(array $f)
+    {
+        return implode(', ', array_map(fn($x) => trim(($x['no'] ?: '?') . ($x['tarih'] ? ' ' . $x['tarih'] : '')
+                                                       . ' — ' . $x['kaynak']), $f));
+    }
+
+    // =================================================================
+    // Pazaryerine fatura bildirimi (fatura linki)
+    // =================================================================
+
+    /**
+     * Siparişin kesinleşmiş faturasını pazaryerine bildir (fatura linki + varsa paket "Invoiced").
+     * Sonuç PazaryeriSiparisleri_FaturaBildirimTarihi / _FaturaBildirimHata kolonlarına yazılır.
+     * Fatura portaldan kesilmiş ya da Örnek Holding panelinden kesilip eşleştirilmiş olabilir;
+     * link faturanın kendi Örnek Holding kanalından (Faturalar_EntegrasyonKanallari_id) alınır.
+     *
+     * @param string $link Kesimden dönen girişsiz link (e-Arşiv WEB_KEY); boşsa üretilir
+     * @return array ['success', 'message', 'desteklenmiyor'?]
+     */
+    public function pazaryeriBildir($siparisId, $link = '')
+    {
+        if (!class_exists('PazaryeriFabrika')) {
+            require_once __DIR__ . '/PazaryeriFabrika.php';
+        }
+
+        $s = $this->db->fetchOne("
+            SELECT s.PazaryeriSiparisleri_id, s.PazaryeriSiparisleri_EntegrasyonKanallari_id AS PyKanalId,
+                   s.PazaryeriSiparisleri_PaketNo, s.PazaryeriSiparisleri_DisId, s.PazaryeriSiparisleri_SiparisNo,
+                   s.PazaryeriSiparisleri_HamDurum, s.PazaryeriSiparisleri_DurumKod,
+                   s.PazaryeriSiparisleri_FaturaBildirimTarihi,
+                   fa.Faturalar_FaturaNo, fa.Faturalar_ETTN, fa.Faturalar_Tur, fa.Faturalar_Durum,
+                   fa.Faturalar_IptalDurumu, fa.Faturalar_KesimDurumu, fa.Faturalar_Yon,
+                   fa.Faturalar_EntegrasyonKanallari_id AS TbKanalId,
+                   CONVERT(VARCHAR(10), fa.Faturalar_Tarih, 120) AS FaturaGunu
+            FROM dbo.PazaryeriSiparisleri s
+            LEFT JOIN dbo.Faturalar fa ON fa.Faturalar_id = s.PazaryeriSiparisleri_Faturalar_id
+            WHERE s.PazaryeriSiparisleri_id = ? AND s.PazaryeriSiparisleri_Durum = 1
+        ", [(int)$siparisId]);
+
+        if (!$s) {
+            return ['success' => false, 'message' => 'Sipariş bulunamadı.'];
+        }
+        if ($s['PazaryeriSiparisleri_FaturaBildirimTarihi']) {
+            return ['success' => true, 'message' => 'Fatura pazaryerine daha önce bildirilmiş.'];
+        }
+        if ($s['PazaryeriSiparisleri_DurumKod'] === 'iptal') {
+            return ['success' => false, 'message' => 'İptal edilmiş sipariş bildirilmez.'];
+        }
+        if ($s['Faturalar_Durum'] === null || !self::kesinlesmisMi($s) || $s['Faturalar_Yon'] !== 'GIDEN') {
+            return ['success' => false, 'message' => 'Siparişin kesinleşmiş giden faturası yok.'];
+        }
+
+        $api = PazaryeriFabrika::olusturKanaldan((int)$s['PyKanalId'], $this->userId);
+        if (!$api || !$api->hazirMi()) {
+            return ['success' => false, 'message' => $api ? $api->getHata() : PazaryeriFabrika::sonHata()];
+        }
+        $pazaryeri = $api->getPazaryeriAdi();
+        if (!$api->yetenek('faturaBildirim')) {
+            return ['success' => false, 'desteklenmiyor' => true,
+                    'message' => $pazaryeri . ' fatura bildirimini desteklemiyor.'];
+        }
+
+        $paketId = $s['PazaryeriSiparisleri_PaketNo'] ?: $s['PazaryeriSiparisleri_DisId'];
+        $notlar  = [];
+
+        // 1) Paket durumu "Invoiced" (yalnız destekleyen pazaryerinde; başarısızlığı linki engellemez)
+        if ($api->yetenek('paketDurum')) {
+            $notlar[] = $this->paketFaturalandi($api, $s, $paketId);
+        }
+
+        // 2) Girişsiz fatura linki. Uzantı isteyen pazaryerinde (n11) WEB_KEY adresi geçmez.
+        $pdfZorunlu = $api->faturaLinkPdfZorunlu();
+        if (!preg_match('~^https?://~i', (string)$link)
+            || ($pdfZorunlu && !preg_match('~\.(pdf|png|jpe?g)$~i', (string)$link))) {
+            $link = $pdfZorunlu ? $this->girissizLink($s['Faturalar_ETTN'], true) : $this->faturaLinki($s);
+        }
+        if ($link === '') {
+            $hata = 'Fatura linki üretilemedi (site adresi ya da ETTN yok).';
+            $this->bildirimYaz($siparisId, false, $hata);
+            return ['success' => false, 'message' => $hata];
+        }
+
+        $sonuc = $api->faturaLinkGonder($paketId, [
+            'link'      => $link,
+            'numara'    => $s['Faturalar_FaturaNo'],
+            'tarih'     => strtotime($s['FaturaGunu'] ?: date('Y-m-d')) * 1000,
+            'siparisNo' => $s['PazaryeriSiparisleri_SiparisNo'] ?? '',
+        ]);
+
+        $this->bildirimYaz($siparisId, $sonuc['basarili'], $sonuc['hata'] ?? '');
+        $notlar = array_filter($notlar);
+
+        if (!$sonuc['basarili']) {
+            return ['success' => false, 'message' => 'Fatura linki ' . $pazaryeri . "'a iletilemedi: " . $sonuc['hata']
+                    . ($notlar ? ' ' . implode(' ', $notlar) : '')];
+        }
+        return ['success' => true, 'link' => $link, 'message' => 'Fatura linki ' . $pazaryeri . "'a iletildi."
+                . (!empty($sonuc['onceden']) ? ' (Link zaten kayıtlıymış.)' : '')
+                . ($notlar ? ' ' . implode(' ', $notlar) : '')];
+    }
+
+    /**
+     * Bildirim bekleyen siparişler: bildirim destekleyen pazaryeri, kesinleşmiş giden fatura,
+     * bildirilmemiş ve pazaryeri kaydında link yok. Liste filtresi "bildirilmedi" ile aynı kapsam.
+     *
+     * @param int[]|null $kanallar        Pazaryeri kanalları (null = tümü)
+     * @param bool       $hatalilarDahil  Daha önce bildirim hatası almışları da getir (cron: hayır)
+     * @return int[] PazaryeriSiparisleri_id
+     */
+    public function bildirimBekleyenler(?array $kanallar = null, $limit = 50, $hatalilarDahil = false)
+    {
+        $params = [];
+        $kanalSql = '';
+        if ($kanallar !== null) {
+            $kanallar = array_values(array_filter(array_map('intval', $kanallar)));
+            if (!$kanallar) return [];
+            $kanalSql = ' AND s.PazaryeriSiparisleri_EntegrasyonKanallari_id IN (' . implode(',', array_fill(0, count($kanallar), '?')) . ')';
+            $params = $kanallar;
+        }
+
+        $satirlar = $this->db->fetchAll("
+            SELECT TOP " . max(1, (int)$limit) . " s.PazaryeriSiparisleri_id
+            FROM dbo.PazaryeriSiparisleri s
+            INNER JOIN dbo.tanim_Pazaryerleri p ON p.Pazaryerleri_id = s.PazaryeriSiparisleri_Pazaryerleri_id
+            INNER JOIN dbo.Faturalar fa ON fa.Faturalar_id = s.PazaryeriSiparisleri_Faturalar_id
+            WHERE s.PazaryeriSiparisleri_Durum = 1
+              AND ISNULL(s.PazaryeriSiparisleri_DurumKod, '') <> 'iptal'
+              AND s.PazaryeriSiparisleri_FaturaBildirimTarihi IS NULL
+              " . ($hatalilarDahil ? '' : "AND s.PazaryeriSiparisleri_FaturaBildirimHata IS NULL") . "
+              AND JSON_VALUE(p.Pazaryerleri_Yetenekler, '$.faturaBildirim') = 'true'
+              AND fa.Faturalar_Yon = 'GIDEN' AND fa.Faturalar_Durum = 1 AND fa.Faturalar_IptalDurumu = 0
+              AND (ISNULL(fa.Faturalar_KesimDurumu, '') <> 'TASLAK'
+                   OR (LEN(fa.Faturalar_FaturaNo) = 16 AND RIGHT(fa.Faturalar_FaturaNo, 9) <> '000000000'))
+              AND NOT (ISJSON(s.PazaryeriSiparisleri_HamVeri) = 1
+                       AND NULLIF(JSON_VALUE(s.PazaryeriSiparisleri_HamVeri, '$.invoiceLink'), '') IS NOT NULL)
+              $kanalSql
+            ORDER BY s.PazaryeriSiparisleri_SiparisTarihi
+        ", $params) ?: [];
+
+        return array_map(fn($r) => (int)$r['PazaryeriSiparisleri_id'], $satirlar);
+    }
+
+    /** Paketi "Invoiced" yap; sonuç notu döner (boş = sorun yok) */
+    private function paketFaturalandi($api, array $s, $paketId)
+    {
+        $ham = (string)$s['PazaryeriSiparisleri_HamDurum'];
+        // Kargoya verilmiş / sonlanmış paket Invoiced'a dönemez (Trendyol durum adları)
+        if (!in_array($ham, ['Created', 'Picking'], true)) {
+            return '';
+        }
+
+        $satirlar = [];
+        foreach ($this->db->fetchAll("
+            SELECT PazaryeriSiparisKalemleri_DisId AS lid, PazaryeriSiparisKalemleri_Miktar AS adet
+            FROM dbo.PazaryeriSiparisKalemleri
+            WHERE PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id = ? AND PazaryeriSiparisKalemleri_Durum = 1
+        ", [(int)$s['PazaryeriSiparisleri_id']]) ?: [] as $k) {
+            if ($k['lid']) {
+                $satirlar[] = ['lineId' => (int)$k['lid'], 'quantity' => (int)$k['adet']];
+            }
+        }
+
+        // Pazaryeri sırası: önce Picking, sonra Invoiced
+        if ($ham === 'Created') {
+            $p = $api->paketDurumGuncelle($paketId, 'Picking', $satirlar);
+            if (!$p['basarili']) {
+                return 'Paket durumu güncellenemedi: ' . $p['hata'];
+            }
+        }
+
+        $d = $api->paketDurumGuncelle($paketId, 'Invoiced', $satirlar, ['invoiceNumber' => $s['Faturalar_FaturaNo']]);
+        if (!$d['basarili']) {
+            return 'Paket durumu "Faturalandı" yapılamadı: ' . $d['hata'];
+        }
+
+        $this->db->execute("
+            UPDATE dbo.PazaryeriSiparisleri
+               SET PazaryeriSiparisleri_HamDurum = 'Invoiced',
+                   PazaryeriSiparisleri_GuncelleyenKullanici = ?, PazaryeriSiparisleri_GuncellemeTarihi = ?
+             WHERE PazaryeriSiparisleri_id = ?
+        ", [$this->userId ?: 1, date('Y-m-d H:i:s'), (int)$s['PazaryeriSiparisleri_id']]);
+        return '';
+    }
+
+    /**
+     * Pazaryerine verilecek girişsiz fatura linki.
+     * e-Arşiv: Örnek Holding'nin WEB_KEY adresi. e-Fatura: Örnek Holding'de karşılığı yok →
+     * kendi sayfamız (/fatura.php?k=ETTN). WEB_KEY alınamazsa e-Arşiv de kendi sayfaya düşer.
+     */
+    private function faturaLinki(array $s)
+    {
+        if (!$s['Faturalar_ETTN']) {
+            return '';
+        }
+        if ($s['Faturalar_Tur'] === 'EARSIV' && $s['TbKanalId']) {
+            $tb = OrnekHoldingApi::kanaldan((int)$s['TbKanalId'], $this->userId, $this->db);
+            if ($tb && $tb->hazirMi()) {
+                $durum = $tb->earsivDurumlari([$s['Faturalar_ETTN']]);
+                $web   = (string)($durum[strtolower($s['Faturalar_ETTN'])]['web_key'] ?? '');
+                if (preg_match('~^https?://~i', $web)) {
+                    return $web;
+                }
+            }
+        }
+        return $this->girissizLink($s['Faturalar_ETTN']);
+    }
+
+    /** Girişsiz fatura sayfasının site adresi; boşsa config/database.php server_info.url */
+    public static $siteAdresi = null;
+
+    /**
+     * Kendi girişsiz fatura sayfamızın adresi.
+     * $pdfUzanti: /fatura/<ETTN>.pdf biçimi (web.config "Fatura PDF" kuralı fatura.php'ye yönlendirir)
+     */
+    private function girissizLink($ettn, $pdfUzanti = false)
+    {
+        $ettn = strtolower(trim((string)$ettn));
+        if ($ettn === '') {
+            return '';
+        }
+        $site = trim((string)self::$siteAdresi);
+        if ($site === '') {
+            $yol = __DIR__ . '/../../config/database.php';
+            $cfg = is_file($yol) ? (require $yol) : [];
+            $site = trim((string)($cfg['server_info']['url'] ?? ''));
+        }
+        if ($site === '') {
+            return '';
+        }
+        $site = 'https://' . preg_replace('~^https?://~i', '', rtrim($site, '/'));
+        return $pdfUzanti
+            ? $site . '/fatura/' . rawurlencode($ettn) . '.pdf'
+            : $site . '/fatura.php?k=' . rawurlencode($ettn);
+    }
+
+    /**
+     * Girişsiz fatura sayfası (/fatura.php) için PDF.
+     * Yalnız kesinleşmiş, giden ve bir pazaryeri siparişine bağlı fatura verilir;
+     * ETTN tahmin edilemez UUID olduğundan erişim anahtarı yerine geçer.
+     *
+     * @return array ['success', 'message', 'pdf' (ham içerik), 'dosya_adi']
+     */
+    public function girissizPdf($ettn)
+    {
+        $ettn = strtolower(trim((string)$ettn));
+        if (!preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $ettn)) {
+            return ['success' => false, 'message' => 'Geçersiz bağlantı.'];
+        }
+
+        $f = $this->db->fetchOne("
+            SELECT TOP 1 fa.Faturalar_FaturaNo, fa.Faturalar_ETTN, fa.Faturalar_Tur, fa.Faturalar_Durum,
+                   fa.Faturalar_IptalDurumu, fa.Faturalar_KesimDurumu,
+                   fa.Faturalar_EntegrasyonKanallari_id AS TbKanalId
+            FROM dbo.Faturalar fa
+            INNER JOIN dbo.PazaryeriSiparisleri s ON s.PazaryeriSiparisleri_Faturalar_id = fa.Faturalar_id
+            WHERE fa.Faturalar_ETTN = ? AND fa.Faturalar_Yon = 'GIDEN'
+              AND fa.Faturalar_Durum = 1 AND fa.Faturalar_IptalDurumu = 0
+        ", [$ettn]);
+        if (!$f || !self::kesinlesmisMi($f) || !$f['TbKanalId']) {
+            return ['success' => false, 'message' => 'Fatura bulunamadı.'];
+        }
+
+        $tb = OrnekHoldingApi::kanaldan((int)$f['TbKanalId'], $this->userId, $this->db);
+        if ($tb && $tb->hazirMi()) {
+            $g = $f['Faturalar_Tur'] === 'EARSIV' ? $tb->earsivPdf($f['Faturalar_ETTN']) : $tb->faturaPdf($f['Faturalar_ETTN'], 'OUT');
+            if (!empty($g['success']) && !empty($g['pdf'])) {
+                return ['success' => true, 'message' => '', 'pdf' => $g['pdf'],
+                        'dosya_adi' => ($f['Faturalar_FaturaNo'] ?: $f['Faturalar_ETTN']) . '.pdf'];
+            }
+        }
+        return ['success' => false, 'message' => 'Fatura şu anda görüntülenemiyor, lütfen daha sonra tekrar deneyin.'];
+    }
+
+    private function bildirimYaz($siparisId, $basarili, $hata)
+    {
+        $simdi = date('Y-m-d H:i:s');
+        $this->db->execute("
+            UPDATE dbo.PazaryeriSiparisleri
+               SET PazaryeriSiparisleri_FaturaBildirimTarihi = ?,
+                   PazaryeriSiparisleri_FaturaBildirimHata   = ?,
+                   PazaryeriSiparisleri_GuncelleyenKullanici = ?, PazaryeriSiparisleri_GuncellemeTarihi = ?
+             WHERE PazaryeriSiparisleri_id = ?
+        ", [$basarili ? $simdi : null, $basarili ? null : mb_substr((string)$hata, 0, 500),
+            $this->userId ?: 1, $simdi, (int)$siparisId]);
     }
 
     /** Türkçe büyük harf (i → İ, ı → I) */

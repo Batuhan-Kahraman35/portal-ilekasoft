@@ -492,8 +492,9 @@ class HepsiburadaApi extends PazaryeriApi
     /**
      * Fatura linkini pakete bağla.
      * PUT /packages/merchantid/{mid}/packagenumber/{paketNo}/invoice  gövde {invoiceLink}
-     * Kaynak topluluk SDK'sı (mustafa-m-ugur/hepsiburada-api-php); resmi dokümanla
-     * doğrulanmadı — ilk canlı gönderimde yanıt kontrol edilmeli.
+     * Kaynak topluluk SDK'sı (mustafa-m-ugur/hepsiburada-api-php). Canlıda doğrulandı
+     * (14.11.2026): başarı HTTP 204; pakette fatura varsa HTTP 409
+     * "Invoice is already exist for this package" → önceden bildirilmiş sayılır.
      */
     public function faturaLinkGonder($paketId, array $fatura)
     {
@@ -506,6 +507,11 @@ class HepsiburadaApi extends PazaryeriApi
             ['invoiceLink' => $fatura['link'] ?? ''],
             [], 'Fatura Linki Gönder', 'siparis');
 
+        // 409 "Invoice is already exist for this package": pakete daha önce fatura bildirilmiş
+        // (başka sistemden ya da panelden) — bildirim yerinde, başarı sayılır (Trendyol 409 ile aynı)
+        if (!$sonuc['basarili'] && (int)($sonuc['httpKod'] ?? 0) === 409) {
+            return ['basarili' => true, 'hata' => '', 'onceden' => true];
+        }
         return ['basarili' => $sonuc['basarili'], 'hata' => $sonuc['hata']];
     }
 

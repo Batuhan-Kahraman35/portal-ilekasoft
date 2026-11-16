@@ -21,6 +21,7 @@ require_once __DIR__ . '/QnbService.php';
 require_once __DIR__ . '/YapiKrediService.php';
 require_once __DIR__ . '/SekerBankService.php';
 require_once __DIR__ . '/AnadolubankService.php';
+require_once __DIR__ . '/DenizbankService.php';
 
 class BankaServiceFactory
 {
@@ -131,7 +132,7 @@ class BankaServiceFactory
                 
             case self::DENIZBANK:
             case self::DENIZBANK_ALT:
-                throw new \Exception("Denizbank servisi henüz hazır değil.");
+                return new DenizbankService($apiKimlikId, $kullaniciId, $kaynak);
                 
             case self::TEB:
             case self::TEB_ALT:

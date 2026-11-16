@@ -210,7 +210,7 @@ class OrnekHoldingSenkron
 
     private function earsivSenkron(OrnekHoldingApi $api): array
     {
-        $yeni = 0; $guncellenen = 0; $hatali = 0; $toplam = 0;
+        $yeni = 0; $guncellenen = 0; $hatali = 0; $toplam = 0; $taslak = 0;
 
         foreach ($this->dilimler() as [$bas, $bit]) {
             $faturalar = $this->dilimCek(
@@ -223,6 +223,7 @@ class OrnekHoldingSenkron
                 $toplam++;
 
                 $sonuc = $this->faturaUpsert($api->getKanalId(), 'EARSIV', 'GIDEN', [
+                    'taslak'      => self::taslakMi($f['fatura_no'] ?? '', $f['durum'] ?? null, $f['gib_durum_kod'] ?? null),
                     'ettn'        => $f['ettn'],
                     'fatura_no'   => $f['fatura_no'],
                     'tarih'       => $f['fatura_tarihi'],
@@ -243,11 +244,13 @@ class OrnekHoldingSenkron
 
                 if ($sonuc === 'yeni') $yeni++;
                 elseif ($sonuc === 'guncellendi') $guncellenen++;
+                elseif ($sonuc === 'taslak') $taslak++;
                 else $hatali++;
             }
         }
 
         $this->log("  EARSIV/GIDEN : $toplam kayıt | $yeni yeni | $guncellenen güncellendi"
+                 . ($taslak ? " | $taslak taslak atlandı" : '')
                  . ($hatali ? " | $hatali hatalı" : ''));
 
         if ($this->detayAcik) {
@@ -398,10 +401,51 @@ class OrnekHoldingSenkron
     /** @var array<string,int|null> VKN -> cari_id önbelleği */
     private $cariOnbellek = [];
 
-    /** @return string 'yeni' | 'guncellendi' | 'hata' */
+    /**
+     * e-Arşiv taslağı mı? Taslak fatura değildir: GİB'e raporlanmamıştır, ciro/rapora girmemelidir.
+     * Örnek Holding taslağı listede:
+     *   - yer tutucu numarayla (SERİ + YIL + 000000000) ya da numarasız döner, VEYA
+     *   - STATUS ve STATUS_CODE boş döner (numarası elle verilmiş taslak; gerçek faturada
+     *     ör. RAPORLANDI / 130 dolu gelir)
+     * $durum / $kod null verilirse yalnız numaraya bakılır.
+     */
+    private static function taslakMi(string $faturaNo, ?string $durum = null, ?string $kod = null): bool
+    {
+        $faturaNo = trim($faturaNo);
+        if ($faturaNo === '' || preg_match('/^[A-Z0-9]{3}\d{4}0{9}$/', $faturaNo) === 1) {
+            return true;
+        }
+        return $durum !== null && $kod !== null && trim($durum) === '' && trim($kod) === '';
+    }
+
+    /** Senkronun taslak diye pasife çektiği kayıtların işareti (Faturalar_DurumAciklama) */
+    const TASLAK_ISARETI = 'TASLAK: numara almamış, senkron pasife aldı';
+
+    /** @return string 'yeni' | 'guncellendi' | 'taslak' | 'hata' */
     private function faturaUpsert(int $kanalId, string $tur, string $yon, array $f): string
     {
         try {
+            // Taslak: yeni kayıt açılmaz; daha önce açılmış aktif kayıt pasife alınır.
+            // Kesim servisinin kendi kaydına (KesimDurumu dolu) dokunulmaz.
+            if (!empty($f['taslak'])) {
+                $mevcut = $this->db->fetchOne(
+                    "SELECT TOP 1 Faturalar_id, Faturalar_Durum, Faturalar_KesimDurumu
+                       FROM Faturalar WHERE Faturalar_ETTN = ? AND Faturalar_Tur = ?
+                      ORDER BY Faturalar_Durum DESC, Faturalar_id ASC",
+                    [$f['ettn'], $tur]
+                );
+                if ($mevcut && (int)$mevcut['Faturalar_Durum'] === 1 && $mevcut['Faturalar_KesimDurumu'] === null) {
+                    $this->db->update('Faturalar', [
+                        'Faturalar_Durum'                => 0,
+                        'Faturalar_DurumAciklama'        => self::TASLAK_ISARETI,
+                        'Faturalar_GuncelleyenKullanici' => 1,
+                        'Faturalar_GuncellemeTarihi'     => date('Y-m-d H:i:s'),
+                    ], ['Faturalar_id' => $mevcut['Faturalar_id']]);
+                    $this->log('  Taslak pasife alındı: ' . ($f['fatura_no'] ?: $f['ettn']));
+                }
+                return 'taslak';
+            }
+
             $data = [
                 'Faturalar_EntegrasyonKanallari_id' => $kanalId,
                 'Faturalar_Yon'                     => $yon,
@@ -434,7 +478,7 @@ class OrnekHoldingSenkron
             // Aktif kayıt her zaman önceliklidir: mükerrer olduğu için pasiflenmiş
             // bir satır bulunursa onu diriltmek, aktif eşiyle çakışmaya yol açar.
             $mevcut = $this->db->fetchOne(
-                "SELECT TOP 1 Faturalar_id, Faturalar_Cari_id, Faturalar_Durum
+                "SELECT TOP 1 Faturalar_id, Faturalar_Cari_id, Faturalar_Durum, Faturalar_DurumAciklama
                    FROM Faturalar
                   WHERE Faturalar_ETTN = ? AND Faturalar_Tur = ?
                   ORDER BY Faturalar_Durum DESC, Faturalar_id ASC",
@@ -448,7 +492,9 @@ class OrnekHoldingSenkron
                     $data['Faturalar_Cari_id'] = $cariId;
                 }
                 // Pasif kayıt (mükerrer veya elle kapatılmış) pasif kalır.
-                if ((int)$mevcut['Faturalar_Durum'] === 0) {
+                // İstisna: taslak diye pasife alınmış kayıt numara aldıysa yeniden aktif olur.
+                $taslaktanDondu = (string)$mevcut['Faturalar_DurumAciklama'] === self::TASLAK_ISARETI;
+                if ((int)$mevcut['Faturalar_Durum'] === 0 && !$taslaktanDondu) {
                     unset($data['Faturalar_Durum']);
                 }
                 // Fatura ilk hangi kanaldan kaydedildiyse orada kalır; PDF çağrısı

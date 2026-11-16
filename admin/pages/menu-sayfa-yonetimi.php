@@ -80,6 +80,20 @@ function renameModuleFolder($oldUrl, $newUrl) {
     return false;
 }
 
+// Aynı üst menü altındaki bir sonraki sıra numarası
+function sonrakiMenuSira($db, $parentId) {
+    $row = $parentId === null
+        ? $db->fetchOne("SELECT ISNULL(MAX(menuler_sira_no), 0) + 1 AS sira FROM tanim_menuler WHERE menuler_durum = 1 AND menuler_parent_id IS NULL")
+        : $db->fetchOne("SELECT ISNULL(MAX(menuler_sira_no), 0) + 1 AS sira FROM tanim_menuler WHERE menuler_durum = 1 AND menuler_parent_id = ?", [$parentId]);
+    return (int)($row['sira'] ?? 1);
+}
+
+// Aynı menü altındaki bir sonraki sayfa sıra numarası
+function sonrakiSayfaSira($db, $menuId) {
+    $row = $db->fetchOne("SELECT ISNULL(MAX(sayfalar_sira_no), 0) + 1 AS sira FROM tanim_sayfalar WHERE sayfalar_durum = 1 AND sayfalar_menu_id = ?", [$menuId]);
+    return (int)($row['sira'] ?? 1);
+}
+
 // AJAX İşlemleri
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['ajax_action'])) {
     header('Content-Type: application/json; charset=utf-8');
@@ -108,12 +122,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['ajax_action'])) {
             $menuAdi = trim($_POST['menu_adi'] ?? '');
             $ikon = trim($_POST['ikon'] ?? '') ?: null;
             $parentId = !empty($_POST['parent_id']) ? (int)$_POST['parent_id'] : null;
-            $siraNo = isset($_POST['sira_no']) ? (int)$_POST['sira_no'] : 0;
             $headerGoster = isset($_POST['header_goster']) ? 1 : 0;
 
             if (empty($menuAdi)) {
                 throw new Exception('Menü adı zorunludur');
             }
+
+            // Yeni menü kendi grubunun sonuna eklenir
+            $siraNo = sonrakiMenuSira($db, $parentId);
 
             // Eğer ana menü ise ve URL varsa, klasör oluştur
             if ($parentId === null && $menuUrl) {
@@ -141,7 +157,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['ajax_action'])) {
             $menuAdi = trim($_POST['menu_adi'] ?? '');
             $ikon = trim($_POST['ikon'] ?? '') ?: null;
             $parentId = !empty($_POST['parent_id']) ? (int)$_POST['parent_id'] : null;
-            $siraNo = isset($_POST['sira_no']) ? (int)$_POST['sira_no'] : 0;
             $headerGoster = isset($_POST['header_goster']) ? 1 : 0;
 
             if (empty($menuAdi)) {
@@ -153,6 +168,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['ajax_action'])) {
             if ($parentId == $menuId) {
                 throw new Exception('Bir menü kendi alt menüsü olamaz');
             }
+
+            // Sıra korunur; üst menü değiştiyse yeni grubun sonuna alınır
+            $eski = $db->fetchOne("SELECT menuler_parent_id, menuler_sira_no FROM tanim_menuler WHERE menuler_id = ?", [$menuId]);
+            if (!$eski) {
+                throw new Exception('Menü bulunamadı');
+            }
+            $siraNo = (int)($eski['menuler_parent_id'] ?? 0) === (int)($parentId ?? 0)
+                ? (int)$eski['menuler_sira_no']
+                : sonrakiMenuSira($db, $parentId);
 
             $sql = "
                 UPDATE tanim_menuler 
@@ -184,6 +208,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['ajax_action'])) {
             exit;
         }
 
+        // SÜRÜKLE-BIRAK SIRALAMA
+        if ($action === 'menu_sort' || $action === 'page_sort') {
+            if (!$pagePermissions['can_edit']) {
+                throw new Exception('Düzenleme yetkiniz bulunmamaktadır.');
+            }
+
+            $ids = array_values(array_filter(array_map('intval', (array)($_POST['ids'] ?? []))));
+            if (empty($ids)) {
+                throw new Exception('Sıralanacak kayıt bulunamadı');
+            }
+
+            // Tüm kayıtlar aynı grupta olmalı (aynı üst menü / aynı menü)
+            $yer = implode(',', array_fill(0, count($ids), '?'));
+            $grupSql = $action === 'menu_sort'
+                ? "SELECT COUNT(DISTINCT ISNULL(menuler_parent_id, 0)) AS grup, COUNT(*) AS adet FROM tanim_menuler WHERE menuler_id IN ($yer)"
+                : "SELECT COUNT(DISTINCT ISNULL(sayfalar_menu_id, 0)) AS grup, COUNT(*) AS adet FROM tanim_sayfalar WHERE sayfalar_id IN ($yer)";
+            $grup = $db->fetchOne($grupSql, $ids);
+            if ((int)($grup['grup'] ?? 0) !== 1 || (int)($grup['adet'] ?? 0) !== count($ids)) {
+                throw new Exception('Kayıtlar yalnız kendi grubu içinde sıralanabilir');
+            }
+
+            $sql = $action === 'menu_sort'
+                ? "UPDATE tanim_menuler SET menuler_sira_no = ?, menuler_updated_at = SYSUTCDATETIME() WHERE menuler_id = ?"
+                : "UPDATE tanim_sayfalar SET sayfalar_sira_no = ?, sayfalar_updated_at = SYSUTCDATETIME() WHERE sayfalar_id = ?";
+            foreach ($ids as $i => $id) {
+                $db->execute($sql, [$i + 1, $id]);
+            }
+
+            echo json_encode(['success' => true, 'message' => 'Sıralama kaydedildi']);
+            exit;
+        }
+
         // SAYFA İŞLEMLERİ
         if ($action === 'page_add') {
             // Yetki kontrolü
@@ -196,7 +252,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['ajax_action'])) {
             $aciklama = trim($_POST['aciklama'] ?? '') ?: null;
             $menuId = (int)($_POST['menu_id'] ?? 0);
             $ikon = trim($_POST['ikon'] ?? '') ?: null;
-            $siraNo = isset($_POST['sira_no']) ? (int)$_POST['sira_no'] : 0;
             $dashboard = isset($_POST['dashboard']) ? 1 : 0;
 
             if (empty($sayfaAdi)) {
@@ -208,6 +263,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['ajax_action'])) {
             if ($menuId <= 0) {
                 throw new Exception('Menü seçimi zorunludur');
             }
+
+            // Yeni sayfa menüsünün sonuna eklenir
+            $siraNo = sonrakiSayfaSira($db, $menuId);
 
             $sql = "
                 INSERT INTO tanim_sayfalar 
@@ -234,7 +292,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['ajax_action'])) {
             $aciklama = trim($_POST['aciklama'] ?? '') ?: null;
             $menuId = (int)($_POST['menu_id'] ?? 0);
             $ikon = trim($_POST['ikon'] ?? '') ?: null;
-            $siraNo = isset($_POST['sira_no']) ? (int)$_POST['sira_no'] : 0;
             $dashboard = isset($_POST['dashboard']) ? 1 : 0;
 
             if (empty($sayfaAdi)) {
@@ -249,6 +306,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['ajax_action'])) {
             if ($sayfaId <= 0) {
                 throw new Exception('Geçersiz sayfa ID');
             }
+
+            // Sıra korunur; menü değiştiyse yeni menünün sonuna alınır
+            $eski = $db->fetchOne("SELECT sayfalar_menu_id, sayfalar_sira_no FROM tanim_sayfalar WHERE sayfalar_id = ?", [$sayfaId]);
+            if (!$eski) {
+                throw new Exception('Sayfa bulunamadı');
+            }
+            $siraNo = (int)($eski['sayfalar_menu_id'] ?? 0) === $menuId
+                ? (int)$eski['sayfalar_sira_no']
+                : sonrakiSayfaSira($db, $menuId);
 
             // Eğer URL değişmişse, fiziksel dosyayı da yeniden adlandır
             if (!empty($oldUrl) && $oldUrl !== $sayfaUrl) {
@@ -335,7 +401,7 @@ $sayfalar = $db->fetchAll("
     FROM tanim_sayfalar s
     LEFT JOIN tanim_menuler m ON s.sayfalar_menu_id = m.menuler_id
     WHERE s.sayfalar_durum = 1
-    ORDER BY ISNULL(m.menuler_menu_adi, 'ZZZ'), s.sayfalar_sira_no
+    ORDER BY ISNULL(m.menuler_menu_adi, 'ZZZ'), s.sayfalar_menu_id, s.sayfalar_sira_no
 ");
 
 // Ana menüler (parent_id = NULL)
@@ -367,6 +433,17 @@ $anaMenuler = $db->fetchAll("
         }
         .badge-parent {
             font-size: 0.75rem;
+        }
+        .drag-handle {
+            cursor: grab;
+            color: var(--bs-secondary-color);
+        }
+        .drag-handle:active {
+            cursor: grabbing;
+        }
+        .sortable-ghost {
+            opacity: 0.4;
+            background-color: var(--bs-primary-bg-subtle) !important;
         }
     </style>
 </head>
@@ -480,7 +557,7 @@ $anaMenuler = $db->fetchAll("
                                     <table class="table table-striped table-hover">
                                         <thead>
                                             <tr>
-                                                <th style="width: 50px">#</th>
+                                                <th style="width: 50px" class="text-center"><i class="bi bi-arrows-move" title="Sürükleyerek sıralayın"></i></th>
                                                 <th>Menü Adı</th>
                                                 <th>İkon</th>
                                                 <th>Üst Menü</th>
@@ -489,10 +566,14 @@ $anaMenuler = $db->fetchAll("
                                                 <th style="width: 120px" class="text-center">İşlemler</th>
                                             </tr>
                                         </thead>
-                                        <tbody>
-                                            <?php foreach ($menuler as $index => $menu): ?>
-                                            <tr>
-                                                <td><?= $index + 1 ?></td>
+                                        <tbody id="menuSortList">
+                                            <?php foreach ($menuler as $menu): ?>
+                                            <tr data-id="<?= (int)$menu['menuler_id'] ?>" data-group="<?= (int)($menu['menuler_parent_id'] ?? 0) ?>">
+                                                <td class="text-center">
+                                                    <?php if ($pagePermissions['can_edit']): ?>
+                                                    <i class="bi bi-grip-vertical drag-handle fs-5" title="Sürükleyerek sıralayın"></i>
+                                                    <?php endif; ?>
+                                                </td>
                                                 <td>
                                                     <?php if ($menu['menuler_parent_id']): ?>
                                                         <i class="bi bi-arrow-return-right text-muted"></i>
@@ -515,7 +596,7 @@ $anaMenuler = $db->fetchAll("
                                                     <?php endif; ?>
                                                 </td>
                                                 <td class="text-center">
-                                                    <span class="badge text-bg-info"><?= $menu['menuler_sira_no'] ?? '-' ?></span>
+                                                    <span class="badge text-bg-info sira-badge"><?= $menu['menuler_sira_no'] ?? '-' ?></span>
                                                 </td>
                                                 <td class="text-center">
                                                     <?php if (($menu['menuler_header_goster'] ?? 0) == 1): ?>
@@ -566,7 +647,7 @@ $anaMenuler = $db->fetchAll("
                                     <table class="table table-striped table-hover">
                                         <thead>
                                             <tr>
-                                                <th style="width: 50px">#</th>
+                                                <th style="width: 50px" class="text-center"><i class="bi bi-arrows-move" title="Sürükleyerek sıralayın"></i></th>
                                                 <th>Sayfa Adı</th>
                                                 <th>URL</th>
                                                 <th>Menü</th>
@@ -576,10 +657,14 @@ $anaMenuler = $db->fetchAll("
                                                 <th style="width: 120px" class="text-center">İşlemler</th>
                                             </tr>
                                         </thead>
-                                        <tbody>
-                                            <?php foreach ($sayfalar as $index => $sayfa): ?>
-                                            <tr>
-                                                <td><?= $index + 1 ?></td>
+                                        <tbody id="pageSortList">
+                                            <?php foreach ($sayfalar as $sayfa): ?>
+                                            <tr data-id="<?= (int)$sayfa['sayfalar_id'] ?>" data-group="<?= (int)($sayfa['sayfalar_menu_id'] ?? 0) ?>">
+                                                <td class="text-center">
+                                                    <?php if ($pagePermissions['can_edit']): ?>
+                                                    <i class="bi bi-grip-vertical drag-handle fs-5" title="Sürükleyerek sıralayın"></i>
+                                                    <?php endif; ?>
+                                                </td>
                                                 <td><strong><?= htmlspecialchars($sayfa['sayfalar_sayfa_adi']) ?></strong></td>
                                                 <td><code class="text-sm"><?= htmlspecialchars($sayfa['sayfalar_sayfa_url']) ?></code></td>
                                                 <td>
@@ -603,7 +688,7 @@ $anaMenuler = $db->fetchAll("
                                                     <?php endif; ?>
                                                 </td>
                                                 <td class="text-center">
-                                                    <span class="badge text-bg-info"><?= $sayfa['sayfalar_sira_no'] ?? '-' ?></span>
+                                                    <span class="badge text-bg-info sira-badge"><?= $sayfa['sayfalar_sira_no'] ?? '-' ?></span>
                                                 </td>
                                                 <td class="text-center">
                                                     <?php if ($sayfa['sayfalar_dashboard']): ?>
@@ -673,18 +758,13 @@ $anaMenuler = $db->fetchAll("
                                 <?php endforeach; ?>
                             </select>
                         </div>
-                        <div class="row">
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Sıra No</label>
-                                <input type="number" class="form-control" name="sira_no" value="0" min="0">
-                            </div>
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Header'da Göster</label>
-                                <select class="form-select" name="header_goster" id="add_header_goster">
-                                    <option value="0">Hayır (Sidebar)</option>
-                                    <option value="1">Evet (Header)</option>
-                                </select>
-                            </div>
+                        <div class="mb-3">
+                            <label class="form-label">Header'da Göster</label>
+                            <select class="form-select" name="header_goster" id="add_header_goster">
+                                <option value="0">Hayır (Sidebar)</option>
+                                <option value="1">Evet (Header)</option>
+                            </select>
+                            <small class="text-muted">Yeni menü grubunun sonuna eklenir; sırayı listede sürükleyerek değiştirebilirsiniz</small>
                         </div>
                     </div>
                     <div class="modal-footer">
@@ -724,18 +804,12 @@ $anaMenuler = $db->fetchAll("
                                 <?php endforeach; ?>
                             </select>
                         </div>
-                        <div class="row">
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Sıra No</label>
-                                <input type="number" class="form-control" name="sira_no" id="edit_sira_no" min="0">
-                            </div>
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Header'da Göster</label>
-                                <select class="form-select" name="header_goster" id="edit_header_goster">
-                                    <option value="0">Hayır (Sidebar)</option>
-                                    <option value="1">Evet (Header)</option>
-                                </select>
-                            </div>
+                        <div class="mb-3">
+                            <label class="form-label">Header'da Göster</label>
+                            <select class="form-select" name="header_goster" id="edit_header_goster">
+                                <option value="0">Hayır (Sidebar)</option>
+                                <option value="1">Evet (Header)</option>
+                            </select>
                         </div>
                     </div>
                     <div class="modal-footer">
@@ -789,18 +863,13 @@ $anaMenuler = $db->fetchAll("
                                 <input type="text" class="form-control" name="ikon" placeholder="bi bi-file-text">
                             </div>
                         </div>
-                        <div class="row">
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Sıra No</label>
-                                <input type="number" class="form-control" name="sira_no" value="0" min="0">
+                        <div class="mb-3">
+                            <label class="form-label">Dashboard Göster</label>
+                            <div class="form-check form-switch mt-2">
+                                <input class="form-check-input" type="checkbox" role="switch" name="dashboard" id="dashboard_check" value="1">
+                                <label class="form-check-label" for="dashboard_check">Ana sayfada göster</label>
                             </div>
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Dashboard Göster</label>
-                                <div class="form-check form-switch mt-2">
-                                    <input class="form-check-input" type="checkbox" name="dashboard" id="dashboard_check" value="1">
-                                    <label class="form-check-label" for="dashboard_check">Ana sayfada göster</label>
-                                </div>
-                            </div>
+                            <small class="text-muted">Yeni sayfa menüsünün sonuna eklenir; sırayı listede sürükleyerek değiştirebilirsiniz</small>
                         </div>
                     </div>
                     <div class="modal-footer">
@@ -859,17 +928,11 @@ $anaMenuler = $db->fetchAll("
                                 <input type="text" class="form-control" name="ikon" id="edit_sayfa_ikon">
                             </div>
                         </div>
-                        <div class="row">
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Sıra No</label>
-                                <input type="number" class="form-control" name="sira_no" id="edit_sayfa_sira_no" min="0">
-                            </div>
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Dashboard Göster</label>
-                                <div class="form-check form-switch mt-2">
-                                    <input class="form-check-input" type="checkbox" name="dashboard" id="edit_dashboard_check" value="1">
-                                    <label class="form-check-label" for="edit_dashboard_check">Ana sayfada göster</label>
-                                </div>
+                        <div class="mb-3">
+                            <label class="form-label">Dashboard Göster</label>
+                            <div class="form-check form-switch mt-2">
+                                <input class="form-check-input" type="checkbox" role="switch" name="dashboard" id="edit_dashboard_check" value="1">
+                                <label class="form-check-label" for="edit_dashboard_check">Ana sayfada göster</label>
                             </div>
                         </div>
                     </div>
@@ -885,6 +948,7 @@ $anaMenuler = $db->fetchAll("
     <?php include __DIR__ . '/../includes/scripts.php'; ?>
     <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
     <script src="/admin/assets/js/custom.js"></script>
     
     <script>
@@ -935,10 +999,50 @@ $anaMenuler = $db->fetchAll("
             });
         }
         
+        // Sürükle-bırak sıralama: satırlar yalnız kendi grubu (üst menü / menü) içinde taşınır
+        function initSortable(tbodyId, action) {
+            const tbody = document.getElementById(tbodyId);
+            if (!tbody || !permissions.can_edit) return;
+
+            new Sortable(tbody, {
+                handle: '.drag-handle',
+                animation: 150,
+                ghostClass: 'sortable-ghost',
+                onMove: evt => evt.related.dataset.group === evt.dragged.dataset.group,
+                onEnd: evt => {
+                    if (evt.oldIndex === evt.newIndex) return;
+
+                    const group = evt.item.dataset.group;
+                    const rows = [...tbody.querySelectorAll(`tr[data-group="${group}"]`)];
+                    const formData = new FormData();
+                    formData.append('ajax_action', action);
+                    rows.forEach(row => formData.append('ids[]', row.dataset.id));
+
+                    fetch('', { method: 'POST', body: formData })
+                        .then(r => r.json())
+                        .then(data => {
+                            if (data.success) {
+                                rows.forEach((row, i) => row.querySelector('.sira-badge').textContent = i + 1);
+                                showToast(data.message, 'success');
+                            } else {
+                                showToast(data.message, 'error');
+                                setTimeout(() => location.reload(), 1000);
+                            }
+                        })
+                        .catch(() => {
+                            showToast('Sunucuya ulaşılamıyor', 'error');
+                            setTimeout(() => location.reload(), 1000);
+                        });
+                }
+            });
+        }
+
         // Sayfa hazır
         $(document).ready(() => {
             loadStats();
             initSelect2();
+            initSortable('menuSortList', 'menu_sort');
+            initSortable('pageSortList', 'page_sort');
         });
         
         // MENÜ FONKSİYONLARI
@@ -947,7 +1051,6 @@ $anaMenuler = $db->fetchAll("
             document.getElementById('edit_menu_adi').value = menu.menuler_menu_adi;
             document.getElementById('edit_ikon').value = menu.menuler_ikon || '';
             document.getElementById('edit_parent_id').value = menu.menuler_parent_id || '';
-            document.getElementById('edit_sira_no').value = menu.menuler_sira_no || 0;
             document.getElementById('edit_header_goster').value = menu.menuler_header_goster || 0;
             
             // Eğer select2 kullanılıyorsa değeri güncellemesi için trigger tetikle
@@ -995,7 +1098,6 @@ $anaMenuler = $db->fetchAll("
             document.getElementById('edit_aciklama').value = sayfa.sayfalar_aciklama || '';
             document.getElementById('edit_menu_id_select').value = sayfa.menuler_id;
             document.getElementById('edit_sayfa_ikon').value = sayfa.sayfalar_ikon || '';
-            document.getElementById('edit_sayfa_sira_no').value = sayfa.sayfalar_sira_no || 0;
             document.getElementById('edit_dashboard_check').checked = sayfa.sayfalar_dashboard == 1;
             
             // Orijinal URL'yi sakla

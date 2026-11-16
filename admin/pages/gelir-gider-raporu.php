@@ -1,6 +1,9 @@
 <?php
 /**
- * Admin Panel - Gelir ve Gider Raporu
+ * Admin Panel - Gelir ve Gider Raporu (yalnız e-ticaret)
+ *
+ * Kapsam: gelir = pazaryeri satışları, gider = pazaryeri komisyonu. Banka masrafları ve
+ * e-ticaretle ilişkisi kurulamayan kargo gönderileri rapora girmez.
  *
  * Gelir / gider kaynakları tanim_GelirGiderKaynaklari tablosundan okunur (Durum = 1, Sira).
  * Her kaynak Kodu için aşağıda bir sorgu fonksiyonu vardır (KAYNAK_SORGULARI haritası);
@@ -8,13 +11,11 @@
  *
  * Her sorgu fonksiyonu (baslangic, bitis, firmaIdListesi|null) alır ve şu satırları döner:
  *   ay (YYYY-MM), firma_id, firma_adi, alt_kirilim, tutar, adet,
- *   platform     (tanim_GelirGiderPlatformlari.Kod; NULL → platformsuz, yalnız "Tümü"de görünür),
  *   detay_tur    (kırılım satırı tıklanınca açılacak detay türü: DETAY_TURLERI anahtarı),
- *   detay_anahtar(detay türünün kayıt anahtarı: pazaryeri id, banka id, 'ARAS|GIDEN' ...)
+ *   detay_anahtar(detay türünün kayıt anahtarı: pazaryeri id)
  *
  * Firma kapsamı: null → tüm firmalar (firmasız kayıtlar dahil), dizi → yalnız o firmalar.
  * Kullanıcı firma kısıtlıysa (PageAuth::firmaKisiti) liste daima kendi firmasıdır.
- * Platform kapsamı: seçiliyse yalnız o platform etiketli satırlar toplanır (raporHesapla).
  *
  * Özet rapor: satır sayısı ay × kaynak kadar küçüktür → tek AJAX çağrısı, client-side görünüm.
  * Kırılım detayı: her kırılım satırı → 'detay' action (server-side DataTables, iki aşamalı sorgu).
@@ -42,18 +43,35 @@ if (!$pagePermissions['has_access']) {
 // Firma kısıtı: null → kısıt yok, >0 → yalnız o firma, 0 → hiç kayıt yok
 $kisitFirmaId = PageAuth::firmaKisiti($pagePermissions, $user['kullanici_id']);
 
-// Ayarlar (masraf kuralları, kaynak tanımları) tüm firmaların raporunu etkiler:
+// Ayarlar (kaynak tanımları) tüm firmaların raporunu etkiler:
 // yalnız firma kısıtı olmayan ve düzenleme yetkisi olan kullanıcı değiştirir.
 $ayarYetki = $kisitFirmaId === null && !empty($pagePermissions['can_edit']);
 
 /** Rapor kapsam notu: sayfada InfoBox altında, Excel'de en üst satırda */
-const RAPOR_NOTU = 'Gelir tutarları KDV dahildir ve müşterinin ödediği tutardır (indirimler düşülmüş). Pazaryeri komisyonu (KDV dahil) ve kargo ayrı gider kalemi olarak gösterilir.';
+const RAPOR_NOTU = 'Yalnız e-ticaret (pazaryeri). Tüm tutarlar KDV dahildir. Gelir: pazaryerinin bildirdiği sipariş tutarı (indirimler düşülmüş). Gider: pazaryeri komisyonu (KDV dahil). Net = Gelir − Komisyon; ürün maliyeti, kargo, KDV ve stopaj düşülmez, kâr değildir.';
 
 /**
- * Platform (iş kolu) kodu: tanim_GelirGiderPlatformlari.Kod ile eşleşir.
- * Kaynak sorgularındaki satır etiketi buradan girer (platformSql); kod değişirse tek yer.
+ * Pazaryerine göre tutar tanımları (Pazaryerleri_EntegrasyonKod → not). Kaynak: admin/includes/*Api.php
+ * eşlemeleri; API kodu değişirse burası da güncellenir.
+ *   gelir        : sipariş tutarının pazaryerindeki karşılığı
+ *   komisyon     : komisyonun nereden / ne zaman geldiği
+ *   kdvDahilGelir: true → API komisyonu zaten KDV dahil verir; KomisyonKdvOran ayarı çift KDV yapar
+ *   uyari        : bilinen veri sorunu (kırmızı gösterilir)
  */
-const PLATFORM_ETICARET = 'e_ticaret';
+const PAZARYERI_TUTAR_NOTLARI = [
+    'trendyol'    => ['gelir' => 'Paket tutarı (totalPrice), indirimli.',
+                      'komisyon' => 'Cari ekstreden gelir; yalnız teslim edilen siparişlerde oluşur. API KDV hariç verir.'],
+    'hepsiburada' => ['gelir' => 'Kalem tutarlarının toplamı (totalPrice), indirimli.',
+                      'komisyon' => 'Sipariş servisinden, KDV hariç.'],
+    'n11'         => ['gelir' => 'Mağaza fatura tutarı (sellerInvoiceAmount). n11\'in karşıladığı indirim düşülmez; müşterinin ödediğinden yüksek olabilir.',
+                      'komisyon' => 'Sipariş servisinden yalnız tutar gelir (oran yok), KDV hariç.'],
+    'pttavm'      => ['gelir' => 'Kalemlerin KDV dahil tutarı + müşteriden alınan kargo ücreti.',
+                      'komisyon' => 'API yalnız oran verir (%12, %14); tutar = KDV dahil kalem tutarı × oran olarak hesaplanır. Oranın KDV dahil mi hariç mi uygulandığı doğrulanmadı.'],
+    'koctas'      => ['gelir' => 'Sipariş toplamı (total_price).',
+                      'komisyon' => 'API KDV dahil verir (total_commission); ek KDV uygulanmamalı.', 'kdvDahilGelir' => true],
+    'ciceksepeti' => ['gelir' => 'Sipariş toplamı.',
+                      'komisyon' => 'Komisyon verisi gelmiyor; ciro "Komisyonu Hesaplanmamış" kutusunda görünür.'],
+];
 
 $pageInfo = $db->fetchOne("
     SELECT s.sayfalar_sayfa_adi, s.sayfalar_aciklama, m.menuler_menu_adi AS menu_adi
@@ -110,8 +128,8 @@ function satirFirmaKosulu($firmaId, $kolon)
 }
 
 /**
- * Detay anahtarı olan id listesi → koşul (int'e çevrilir). 0 → kolon NULL olan kayıtlar
- * (ör. bankası tanımsız hesap). Boş liste hiç kayıt döndürmez.
+ * Detay anahtarı olan id listesi → koşul (int'e çevrilir). 0 → kolon NULL olan kayıtlar.
+ * Boş liste hiç kayıt döndürmez.
  */
 function anahtarIdKosulu($idler, $kolon)
 {
@@ -127,13 +145,10 @@ function anahtarIdKosulu($idler, $kolon)
     return $parca ? ' AND (' . implode(' OR ', $parca) . ') ' : ' AND 1 = 0 ';
 }
 
-/** Platform satır etiketi (SQL sabiti). Kod sabitten gelir; yine de desen dışıysa NULL yazılır. */
-function platformSql($kod)
+/** Pay / payda yüzdesi (2 hane). Pay yoksa veya payda 0 ise null (arayüzde "—") */
+function yuzdeOran($pay, $payda)
 {
-    $kod = (string)$kod;
-    return preg_match('/^[a-z0-9_]{1,50}$/', $kod)
-        ? "CAST('$kod' AS VARCHAR(50))"
-        : 'CAST(NULL AS VARCHAR(50))';
+    return ($pay !== null && (float)$payda != 0) ? round((float)$pay / (float)$payda * 100, 2) : null;
 }
 
 /** Renk / ikon desenleri: hem görüntülemede (renkGuvenli/ikonGuvenli) hem kayıtta aynı kural */
@@ -155,48 +170,11 @@ function ikonGuvenli($ikon)
 }
 
 // =====================================================================
-// Banka masraf tanımı (tek yer): rapor, masraf detayı ve kural önizlemesi bunu kullanır.
-// Takma adlar sabittir: h = banka_HesapHareketleri, a = banka_Hesap.
-// =====================================================================
-
-/** Masraf satırı tutarı: bazı bankalar (Akbank) masrafı eksi işaretle verir → ABS */
-const BANKA_MASRAF_TUTAR = 'ABS(ISNULL(TRY_CAST(h.banka_HesapHareketleriAmount AS DECIMAL(18,2)), 0))';
-
-/**
- * Satıra uyan aktif bir kural var mı? (tip: 'dahil' | 'haric')
- * $atlaKuralId > 0 → o kural yok sayılır (önizlemede "bu kural olmasaydı" durumu için).
- */
-function bankaKuralVar($tip, $atlaKuralId = 0)
-{
-    $tip  = $tip === 'haric' ? 'haric' : 'dahil';
-    $atla = (int)$atlaKuralId > 0 ? ' AND r.BankaMasrafKurallari_id <> ' . (int)$atlaKuralId : '';
-    return "EXISTS (SELECT 1 FROM dbo.tanim_BankaMasrafKurallari r
-                    WHERE r.BankaMasrafKurallari_Durum = 1 AND r.BankaMasrafKurallari_Tip = '$tip'
-                      AND (r.BankaMasrafKurallari_Bankalar_id IS NULL OR r.BankaMasrafKurallari_Bankalar_id = a.bankaHesap_banka_id)
-                      AND h.banka_HesapHareketleriDescription LIKE r.BankaMasrafKurallari_Desen{$atla})";
-}
-
-/**
- * Banka masraf satırı koşulu. Yalnız BORÇ satırları:
- *  a) eski banka entegrasyonunun işaretlediği satırlar (banka_HesapHareketleriCost = 1;
- *     açıklama ana işlemden kopyalandığı için hariç kuralları bunlara uygulanmaz), veya
- *  b) bir 'dahil' desenine uyup hiçbir 'haric' desenine uymayanlar.
- * Bayraklı ALACAK satırları ters işlem iadesidir, alınmaz.
- */
-function bankaMasrafKosulu($atlaKuralId = 0)
-{
-    return "(h.banka_HesapHareketleriBorcAlacak = 'B'
-             AND (   h.banka_HesapHareketleriCost = 1
-                  OR (" . bankaKuralVar('dahil', $atlaKuralId) . "
-                      AND NOT " . bankaKuralVar('haric', $atlaKuralId) . ")))";
-}
-
-// =====================================================================
 // Kaynak sorguları: Kod → fonksiyon(baslangic, bitis, firmaIdler|null)
 // Ortak dönüş kolonları: ay, firma_id, firma_adi, alt_kirilim, tutar, adet,
-//                        platform, detay_tur, detay_anahtar
-// FROM + WHERE yardımcıları (pazaryeriKosulu, kargoKosulu, bankaMasrafKosulu) kırılım
-// detayında da aynen kullanılır: detay toplamı kırılım toplamıyla aynı kalır.
+//                        detay_tur, detay_anahtar
+// FROM + WHERE yardımcısı (pazaryeriKosulu) kırılım detayında da aynen kullanılır:
+// detay toplamı kırılım toplamıyla aynı kalır.
 // =====================================================================
 
 /**
@@ -260,20 +238,26 @@ function kaynakPazaryeriSatis($bas, $bit, $firmaIdler)
             p.Pazaryerleri_Ad                                          AS alt_kirilim,
             SUM(ISNULL(s.PazaryeriSiparisleri_ToplamTutar, 0))         AS tutar,
             COUNT(*)                                                   AS adet,
-            " . platformSql(PLATFORM_ETICARET) . "                     AS platform,
+            -- Siparişin komisyonu (KDV dahil): kartta Komisyon Hariç = tutar − komisyon
+            SUM(ISNULL(ko.komisyon, 0) * " . KOMISYON_KDV_CARPAN . ") AS komisyon,
             CAST('satis' AS VARCHAR(30))                               AS detay_tur,
             CAST(p.Pazaryerleri_id AS VARCHAR(50))                     AS detay_anahtar
-        " . pazaryeriKosulu($firmaIdler) . "
+        " . pazaryeriKosulu($firmaIdler, "
+        OUTER APPLY (
+            SELECT SUM(c.PazaryeriSiparisKalemleri_KomisyonTutar) AS komisyon
+            FROM dbo.PazaryeriSiparisKalemleri c
+            WHERE c.PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id = s.PazaryeriSiparisleri_id
+              AND c.PazaryeriSiparisKalemleri_Durum = 1
+        ) ko
+" . KOMISYON_KDV_APPLY) . "
         GROUP BY CONVERT(CHAR(7), s.PazaryeriSiparisleri_SiparisTarihi, 120),
                  k.EntegrasyonKanallari_Firmalar_id, f.firma_adi, f.firma_unvan, p.Pazaryerleri_Ad, p.Pazaryerleri_id
     ", [$bas, $bit]);
 }
 
 /**
- * Komisyon giderleri:
- *  - Pazaryeri kalem komisyonları (alt kırılım = pazaryeri adı; platform = e-ticaret)
- *  - Banka masrafları (alt kırılım = "Banka – <banka adı>"; platformsuz), tanım: bankaMasrafKosulu()
- * detay_anahtar: pazaryeri satırında Pazaryerleri_id, banka satırında banka id (tanımsız banka → 0).
+ * Komisyon giderleri: pazaryeri kalem komisyonları (KDV dahil), alt kırılım = pazaryeri adı.
+ * detay_anahtar: Pazaryerleri_id.
  */
 function kaynakKomisyon($bas, $bit, $firmaIdler)
 {
@@ -285,89 +269,71 @@ function kaynakKomisyon($bas, $bit, $firmaIdler)
             p.Pazaryerleri_Ad                                          AS alt_kirilim,
             SUM(ISNULL(" . KOMISYON_KDV_DAHIL . ", 0))                AS tutar,
             COUNT(DISTINCT s.PazaryeriSiparisleri_id)                  AS adet,
-            " . platformSql(PLATFORM_ETICARET) . "                     AS platform,
+            -- Oran paydası: komisyonu gelmiş kalemlerin tutarı (Komisyon / Tutar = etkin oran, KDV dahil)
+            SUM(CASE WHEN NOT " . KOMISYONSUZ_KOSUL . " THEN ISNULL(c.PazaryeriSiparisKalemleri_ToplamTutar, 0) ELSE 0 END) AS baz,
             CAST('komisyon_pazaryeri' AS VARCHAR(30))                  AS detay_tur,
             CAST(p.Pazaryerleri_id AS VARCHAR(50))                     AS detay_anahtar
         " . pazaryeriKosulu($firmaIdler, KOMISYON_KALEM_JOIN) . "
         GROUP BY CONVERT(CHAR(7), s.PazaryeriSiparisleri_SiparisTarihi, 120),
                  k.EntegrasyonKanallari_Firmalar_id, f.firma_adi, f.firma_unvan, p.Pazaryerleri_Ad, p.Pazaryerleri_id
-
-        UNION ALL
-
-        SELECT
-            CONVERT(CHAR(7), h.banka_HesapHareketleriDateTime, 120)    AS ay,
-            a.bankaHesap_firma_id                                      AS firma_id,
-            ISNULL(NULLIF(f.firma_adi, ''), f.firma_unvan)             AS firma_adi,
-            N'Banka – ' + ISNULL(b.banka_adi, N'Tanımsız')             AS alt_kirilim,
-            SUM(" . BANKA_MASRAF_TUTAR . ")                            AS tutar,
-            COUNT(*)                                                   AS adet,
-            " . platformSql(null) . "                                  AS platform,
-            CAST('banka' AS VARCHAR(30))                               AS detay_tur,
-            CAST(ISNULL(a.bankaHesap_banka_id, 0) AS VARCHAR(50))      AS detay_anahtar
-        FROM dbo.banka_HesapHareketleri h
-        INNER JOIN dbo.banka_Hesap a ON a.bankaHesap_id = h.banka_HesapId
-        LEFT JOIN dbo.bankalar b     ON b.banka_id = a.bankaHesap_banka_id
-        LEFT JOIN dbo.Firmalar f     ON f.firma_id = a.bankaHesap_firma_id
-        WHERE " . bankaMasrafKosulu() . "
-          AND h.banka_HesapHareketleriDateTime >= CAST(? AS DATE)
-          AND h.banka_HesapHareketleriDateTime <  DATEADD(DAY, 1, CAST(? AS DATE))
-          " . firmaKosulu($firmaIdler, 'a.bankaHesap_firma_id') . "
-        GROUP BY CONVERT(CHAR(7), h.banka_HesapHareketleriDateTime, 120),
-                 a.bankaHesap_firma_id, f.firma_adi, f.firma_unvan, b.banka_adi, a.bankaHesap_banka_id
-    ", [$bas, $bit, $bas, $bit]);
-}
-
-/**
- * Kargo gönderileri ortak FROM + WHERE (çıkış tarihine göre).
- * Şimdilik yalnız Aras: ücretini firmanın ödediği gönderiler: giden + ÜG (gönderici öder),
- * gelen + ÜA (alıcı öder). Başka kargo firması eklenirse kuralı buraya OR ile eklenir.
- */
-function kargoKosulu($firmaIdler)
-{
-    return "
-        FROM dbo.kargo_gonderiler g
-        LEFT JOIN dbo.EntegrasyonKanallari k
-               ON k.EntegrasyonKanallari_id = g.kargo_gonderiler_EntegrasyonKanallari_id
-        LEFT JOIN dbo.Firmalar f
-               ON f.firma_id = k.EntegrasyonKanallari_Firmalar_id
-        WHERE g.kargo_gonderiler_Durum = 1
-          AND g.kargo_gonderiler_Kaynak = 'ARAS'
-          AND (   (g.kargo_gonderiler_Yon = 'GIDEN' AND g.kargo_gonderiler_OdemeTipi = N'ÜG')
-               OR (g.kargo_gonderiler_Yon = 'GELEN' AND g.kargo_gonderiler_OdemeTipi = N'ÜA'))
-          AND g.kargo_gonderiler_CikisTarihi >= CAST(? AS DATE)
-          AND g.kargo_gonderiler_CikisTarihi <  DATEADD(DAY, 1, CAST(? AS DATE))
-          " . firmaKosulu($firmaIdler, 'k.EntegrasyonKanallari_Firmalar_id') . "
-    ";
-}
-
-/**
- * Kargo giderleri (platformsuz). detay_anahtar = kargo firması kodu + yön (ör. 'ARAS|GIDEN').
- */
-function kaynakKargo($bas, $bit, $firmaIdler)
-{
-    return Database::getInstance()->fetchAll("
-        SELECT
-            CONVERT(CHAR(7), g.kargo_gonderiler_CikisTarihi, 120)      AS ay,
-            k.EntegrasyonKanallari_Firmalar_id                         AS firma_id,
-            ISNULL(NULLIF(f.firma_adi, ''), f.firma_unvan)             AS firma_adi,
-            CASE g.kargo_gonderiler_Yon WHEN 'GIDEN' THEN N'Aras – Giden' ELSE N'Aras – Gelen' END AS alt_kirilim,
-            SUM(ISNULL(g.kargo_gonderiler_Tutar, 0))                   AS tutar,
-            COUNT(*)                                                   AS adet,
-            " . platformSql(null) . "                                  AS platform,
-            CAST('kargo' AS VARCHAR(30))                               AS detay_tur,
-            CAST(g.kargo_gonderiler_Kaynak + '|' + g.kargo_gonderiler_Yon AS VARCHAR(50)) AS detay_anahtar
-        " . kargoKosulu($firmaIdler) . "
-        GROUP BY CONVERT(CHAR(7), g.kargo_gonderiler_CikisTarihi, 120),
-                 k.EntegrasyonKanallari_Firmalar_id, f.firma_adi, f.firma_unvan,
-                 g.kargo_gonderiler_Kaynak, g.kargo_gonderiler_Yon
     ", [$bas, $bit]);
 }
 
-/** Yeni kaynak eklemek: tanım tablosuna Kod ile kayıt + buraya fonksiyon */
+/**
+ * Komisyonu hesaplanmamış kalem (c = kalem): oranı da tutarı da boş / 0.
+ * Yalnız oran boşsa sayılmaz: bazı pazaryerleri (N11, PttAVM) oran vermeden tutar bildirir.
+ */
+const KOMISYONSUZ_KOSUL = '(ISNULL(c.PazaryeriSiparisKalemleri_KomisyonOran, 0) = 0
+                            AND ISNULL(c.PazaryeriSiparisKalemleri_KomisyonTutar, 0) = 0)';
+
+/**
+ * Komisyonu hesaplanmamış kalemlerin FROM + WHERE'i (InfoBox ve detay aynı tanımı kullanır).
+ * Kırılım seçiliyse yalnız seçili kırılımların pazaryerleri (iki kaynakta da alt kırılım = pazaryeri adı).
+ * Dönüş: [sql, params] — params tarih ?'leri dahil, sıra sql'deki ? sırasıdır.
+ */
+function komisyonsuzTaban($bas, $bit, $firmaIdler, array $kirilimSecim = [])
+{
+    $params = [$bas, $bit];
+    $pzSql  = '';
+    $adlar  = array_values(array_unique(array_map(fn($k) => explode('|', $k, 2)[1], array_values($kirilimSecim))));
+    if ($adlar) {
+        $pzSql  = ' AND p.Pazaryerleri_Ad IN (' . implode(',', array_fill(0, count($adlar), '?')) . ') ';
+        $params = array_merge($params, $adlar);
+    }
+    $sql = pazaryeriKosulu($firmaIdler, "
+        INNER JOIN dbo.PazaryeriSiparisKalemleri c
+                ON c.PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id = s.PazaryeriSiparisleri_id
+               AND c.PazaryeriSiparisKalemleri_Durum = 1") . "
+          AND " . KOMISYONSUZ_KOSUL . $pzSql;
+    return [$sql, $params];
+}
+
+/** InfoBox: komisyonu hesaplanmamış ciro (kalem tutarı toplamı), raporun tarih + firma + kırılım filtresiyle */
+function komisyonsuzOzet($bas, $bit, $firmaIdler, array $kirilimSecim = [])
+{
+    [$taban, $params] = komisyonsuzTaban($bas, $bit, $firmaIdler, $kirilimSecim);
+    $r = Database::getInstance()->fetchOne("
+        SELECT COUNT(DISTINCT s.PazaryeriSiparisleri_id)                         AS siparis,
+               COUNT(*)                                                         AS kalem,
+               ISNULL(SUM(ISNULL(c.PazaryeriSiparisKalemleri_ToplamTutar, 0)), 0) AS tutar
+        $taban", $params);
+
+    return [
+        'siparis' => (int)($r['siparis'] ?? 0),
+        'kalem'   => (int)($r['kalem'] ?? 0),
+        'tutar'   => round((float)($r['tutar'] ?? 0), 2),
+    ];
+}
+
+/**
+ * Yeni kaynak eklemek: tanım tablosuna Kod ile kayıt + buraya fonksiyon.
+ * Kargo gideri şimdilik yok: kargo_gonderiler (firmanın Aras hesabı) pazaryeri siparişleriyle
+ * eşleşmiyor, pazaryeri siparişlerinde kargo ücreti verisi yok. Veri gelince e-ticaret kargosu
+ * olarak buraya eklenir.
+ */
 const KAYNAK_SORGULARI = [
     'pazaryeri_satis'    => 'kaynakPazaryeriSatis',
     'komisyon'           => 'kaynakKomisyon',
-    'kargo'              => 'kaynakKargo',
 ];
 
 /** Aktif kaynaklar: gelirler önce, giderler sonra; her grup Sira'ya göre */
@@ -395,36 +361,8 @@ function aktifKaynaklar()
 }
 
 /**
- * Aktif platformlar (Sira, Ad): [kod => ad]. Tablo henüz kurulmadıysa boş liste
- * (filtrede yalnız "Tümü" kalır, sayfa çökmez). İstek başına bir kez okunur.
- */
-function platformListesi()
-{
-    static $liste = null;
-    if ($liste !== null) {
-        return $liste;
-    }
-    $db    = Database::getInstance();
-    $liste = [];
-    $tablo = $db->fetchOne("SELECT OBJECT_ID('dbo.tanim_GelirGiderPlatformlari', 'U') AS id");
-    if (empty($tablo['id'])) {
-        return $liste;
-    }
-    foreach ($db->fetchAll("
-        SELECT GelirGiderPlatformlari_Kod AS kod, GelirGiderPlatformlari_Ad AS ad
-        FROM dbo.tanim_GelirGiderPlatformlari
-        WHERE GelirGiderPlatformlari_Durum = 1
-        ORDER BY GelirGiderPlatformlari_Sira, GelirGiderPlatformlari_Ad
-    ") as $p) {
-        $liste[(string)$p['kod']] = (string)$p['ad'];
-    }
-    return $liste;
-}
-
-/**
  * Filtre girdisini çözer. Hata varsa ['hata' => mesaj] döner.
  * Firma: kısıtlı kullanıcıda daima kendi firması; aksi halde '' → tüm firmalar (null).
- * Platform: '' → tümü (null); aksi halde tablodaki aktif kodlardan biri olmalı.
  */
 function filtreCoz(array $girdi, $kisitFirmaId)
 {
@@ -441,11 +379,6 @@ function filtreCoz(array $girdi, $kisitFirmaId)
         $firmaIdler = $firmaId > 0 ? [$firmaId] : null;
     }
 
-    $platform = trim((string)($girdi['platform'] ?? ''));
-    if ($platform !== '' && !isset(platformListesi()[$platform])) {
-        return ['hata' => 'Geçersiz platform.'];
-    }
-
     $kirilim = kirilimCoz($girdi['kirilim'] ?? []);
     if (isset($kirilim['hata'])) {
         return $kirilim;
@@ -455,8 +388,6 @@ function filtreCoz(array $girdi, $kisitFirmaId)
         'bas'        => $bas,
         'bit'        => $bit,
         'firmaIdler' => $firmaIdler,
-        'platform'   => $platform !== '' ? $platform : null,
-        'platformAd' => $platform !== '' ? platformListesi()[$platform] : 'Tümü',
         'kirilim'    => $kirilim,
     ];
 }
@@ -516,12 +447,11 @@ function aralikAylari($bas, $bit)
 
 /**
  * Tüm aktif kaynakları çalıştırıp rapor yapısını üretir.
- * $platform seçiliyse yalnız o platform etiketli satırlar toplanır (platformsuz satırlar dışarıda).
  * $kirilimSecim ['kod|alt_kirilim' => ...] doluysa yalnız o kaynak + alt kırılım satırları toplanır.
- * Seçenek listesi (kirilimlar) kırılım filtresinden ÖNCEKİ sonuçtan (tarih + firma + platform)
+ * Seçenek listesi (kirilimlar) kırılım filtresinden ÖNCEKİ sonuçtan (tarih + firma)
  * üretilir; seçimden bu listede olmayanlar yok sayılır, uygulanan seçim kirilimSecili ile döner.
  */
-function raporHesapla($bas, $bit, $firmaIdler, $platform = null, array $kirilimSecim = [])
+function raporHesapla($bas, $bit, $firmaIdler, array $kirilimSecim = [])
 {
     $kaynaklar = aktifKaynaklar();
     $aylar     = aralikAylari($bas, $bit);
@@ -530,14 +460,14 @@ function raporHesapla($bas, $bit, $firmaIdler, $platform = null, array $kirilimS
     $kirilim   = [];   // [kod][] = {alt_kirilim, firma_id, firma_adi, tutar, adet, detay_tur, anahtarlar}
     $kaynakTop = [];   // [kod] = {tutar, adet}
     $atlanan   = [];
-    $satirlar  = [];   // [kod] = platform filtresinden geçen satırlar
+    $satirlar  = [];   // [kod] = sorgu satırları
     $secenek   = [];   // ['kod|alt' => {kaynak_kod, kaynak_ad, tip, alt_kirilim}]
 
     foreach ($aylar as $a) {
         $aylik[$a] = [];
     }
 
-    // 1) Sorgular + platform filtresi; kırılım seçenekleri bu kümeden
+    // 1) Sorgular; kırılım seçenekleri bu kümeden
     foreach ($kaynaklar as $k) {
         $kod = $k['kod'];
         if (!$k['destekli']) {
@@ -547,9 +477,6 @@ function raporHesapla($bas, $bit, $firmaIdler, $platform = null, array $kirilimS
         $fonk = KAYNAK_SORGULARI[$kod];
         $satirlar[$kod] = [];
         foreach ($fonk($bas, $bit, $firmaIdler) as $r) {
-            if ($platform !== null && ($r['platform'] ?? null) !== $platform) {
-                continue;
-            }
             $r['alt_kirilim'] = (string)($r['alt_kirilim'] ?? '-');
             $satirlar[$kod][] = $r;
             $secenek[$kod . '|' . $r['alt_kirilim']] ??= [
@@ -575,7 +502,7 @@ function raporHesapla($bas, $bit, $firmaIdler, $platform = null, array $kirilimS
     // 2) Toplama
     foreach ($satirlar as $kod => $satir) {
         $grup = [];
-        $kaynakTop[$kod] = ['tutar' => 0.0, 'adet' => 0];
+        $kaynakTop[$kod] = ['tutar' => 0.0, 'adet' => 0, 'baz' => null, 'komisyon' => null];
 
         foreach ($satir as $r) {
             if ($uygSet && !isset($uygSet[$kod . '|' . $r['alt_kirilim']])) {
@@ -584,10 +511,20 @@ function raporHesapla($bas, $bit, $firmaIdler, $platform = null, array $kirilimS
             $ay    = (string)$r['ay'];
             $tutar = round((float)$r['tutar'], 2);
             $adet  = (int)$r['adet'];
+            // baz: oran paydası (yalnız komisyon kaynağında); yoksa null kalır, arayüz oran göstermez
+            $baz   = array_key_exists('baz', $r) ? round((float)$r['baz'], 2) : null;
+            // komisyon: satışın komisyonu (yalnız satış kaynağında); yoksa null, arayüz "Komisyon Hariç" göstermez
+            $kom   = array_key_exists('komisyon', $r) ? round((float)$r['komisyon'], 2) : null;
 
             $aylik[$ay][$kod] = ($aylik[$ay][$kod] ?? 0) + $tutar;
             $kaynakTop[$kod]['tutar'] += $tutar;
             $kaynakTop[$kod]['adet']  += $adet;
+            if ($baz !== null) {
+                $kaynakTop[$kod]['baz'] = ($kaynakTop[$kod]['baz'] ?? 0) + $baz;
+            }
+            if ($kom !== null) {
+                $kaynakTop[$kod]['komisyon'] = ($kaynakTop[$kod]['komisyon'] ?? 0) + $kom;
+            }
 
             $firmaAdi = $r['firma_adi'] !== null && $r['firma_adi'] !== '' ? $r['firma_adi'] : '(Firmasız)';
             $anahtar  = $r['alt_kirilim'] . "\x1F" . (int)$r['firma_id'];
@@ -598,14 +535,22 @@ function raporHesapla($bas, $bit, $firmaIdler, $platform = null, array $kirilimS
                     'firma_adi'   => (string)$firmaAdi,
                     'tutar'       => 0.0,
                     'adet'        => 0,
+                    'baz'         => null,
+                    'komisyon'    => null,
                     'detay_tur'   => $r['detay_tur'] ?? null,
                     'anahtarlar'  => [],
                 ];
             }
             $grup[$anahtar]['tutar'] += $tutar;
             $grup[$anahtar]['adet']  += $adet;
+            if ($baz !== null) {
+                $grup[$anahtar]['baz'] = ($grup[$anahtar]['baz'] ?? 0) + $baz;
+            }
+            if ($kom !== null) {
+                $grup[$anahtar]['komisyon'] = ($grup[$anahtar]['komisyon'] ?? 0) + $kom;
+            }
 
-            // Aynı adlı birden fazla kayıt (ör. iki banka kaydı) tek kırılımda birleşebilir → anahtar listesi
+            // Aynı adlı birden fazla kayıt tek kırılımda birleşebilir → anahtar listesi
             if (isset($r['detay_anahtar']) && $r['detay_anahtar'] !== '') {
                 $grup[$anahtar]['anahtarlar'][(string)$r['detay_anahtar']] = (string)$r['detay_anahtar'];
             }
@@ -615,9 +560,20 @@ function raporHesapla($bas, $bit, $firmaIdler, $platform = null, array $kirilimS
         }
         unset($g);
 
-        $liste = array_map(function ($g) { $g['tutar'] = round($g['tutar'], 2); return $g; }, array_values($grup));
+        $liste = array_map(function ($g) {
+            $g['tutar'] = round($g['tutar'], 2);
+            $g['baz']   = $g['baz'] !== null ? round($g['baz'], 2) : null;
+            $g['komisyon'] = $g['komisyon'] !== null ? round($g['komisyon'], 2) : null;
+            return $g;
+        }, array_values($grup));
         usort($liste, fn($x, $y) => $y['tutar'] <=> $x['tutar']);
         $kaynakTop[$kod]['tutar'] = round($kaynakTop[$kod]['tutar'], 2);
+        if ($kaynakTop[$kod]['baz'] !== null) {
+            $kaynakTop[$kod]['baz'] = round($kaynakTop[$kod]['baz'], 2);
+        }
+        if ($kaynakTop[$kod]['komisyon'] !== null) {
+            $kaynakTop[$kod]['komisyon'] = round($kaynakTop[$kod]['komisyon'], 2);
+        }
         $kirilim[$kod] = $liste;
     }
 
@@ -646,7 +602,7 @@ function raporHesapla($bas, $bit, $firmaIdler, $platform = null, array $kirilimS
     }
 
     return [
-        'filtre'    => ['bas' => $bas, 'bit' => $bit, 'platform' => $platform, 'kirilim' => $uygulanan],
+        'filtre'    => ['bas' => $bas, 'bit' => $bit, 'kirilim' => $uygulanan],
         'kirilimlar'    => $kirilimlar,
         'kirilimSecili' => $uygulanan,
         'kaynaklar' => $kaynaklar,
@@ -664,12 +620,9 @@ function raporHesapla($bas, $bit, $firmaIdler, $platform = null, array $kirilimS
 }
 
 /**
- * Firma dropdown'u: yalnız rapora veri sağlayan aktif firmalar.
- * Kaynak firmaları (UNION, EXISTS ile ucuz):
- *   (a) pazaryeri kanalları: entegrasyonu tanim_Pazaryerleri'ne bağlı kanalların firması
- *   (b) kargo kanalları: kargo_gonderiler'de kullanılan kanalların firması
- *   (c) bankalar: en az bir hareketi olan banka hesaplarının firması
- * Yeni kaynak (KAYNAK_SORGULARI) eklendiğinde firması buraya da UNION ile eklenir.
+ * Firma dropdown'u: yalnız rapora veri sağlayan aktif firmalar (EXISTS ile ucuz):
+ * entegrasyonu tanim_Pazaryerleri'ne bağlı kanalların firması.
+ * Yeni kaynak (KAYNAK_SORGULARI) eklendiğinde firması buraya UNION ile eklenir.
  * Kısıtlı kullanıcıda listede olmasa bile kendi firması gösterilir (filtre boş kalmasın).
  */
 function firmaListesi($kisitFirmaId)
@@ -690,30 +643,65 @@ function firmaListesi($kisitFirmaId)
         FROM dbo.Firmalar f
         WHERE f.firma_durum = 1
           AND f.firma_id IN (
-              -- (a) pazaryeri kanalları
+              -- pazaryeri kanalları
               SELECT k.EntegrasyonKanallari_Firmalar_id
               FROM dbo.EntegrasyonKanallari k
               INNER JOIN dbo.Entegrasyonlar e ON e.Entegrasyonlar_id = k.EntegrasyonKanallari_Entegrasyonlar_id
               WHERE EXISTS (SELECT 1 FROM dbo.tanim_Pazaryerleri p WHERE p.Pazaryerleri_EntegrasyonKod = e.Entegrasyonlar_Kod)
-              UNION
-              -- (b) kargo kanalları
-              SELECT k.EntegrasyonKanallari_Firmalar_id
-              FROM dbo.EntegrasyonKanallari k
-              WHERE EXISTS (SELECT 1 FROM dbo.kargo_gonderiler g
-                            WHERE g.kargo_gonderiler_EntegrasyonKanallari_id = k.EntegrasyonKanallari_id
-                              AND g.kargo_gonderiler_Durum = 1)
-              UNION
-              -- (c) hareketi olan banka hesapları
-              SELECT a.bankaHesap_firma_id
-              FROM dbo.banka_Hesap a
-              WHERE EXISTS (SELECT 1 FROM dbo.banka_HesapHareketleri h WHERE h.banka_HesapId = a.bankaHesap_id)
           )
         ORDER BY f.firma_adi
     ");
 }
 
+/**
+ * "Tutar tanımları" paneli: aktif pazaryerleri + komisyona uygulanan KDV (PazaryeriAyarlari 'KomisyonKdvOran',
+ * KOMISYON_KDV_APPLY ile aynı öncelik: pazaryeri → genel; kanal bazlı ayar ayrıca sayılır) + PAZARYERI_TUTAR_NOTLARI.
+ */
+function tutarTanimlari()
+{
+    $satirlar = Database::getInstance()->fetchAll("
+        SELECT p.Pazaryerleri_Ad AS ad, p.Pazaryerleri_EntegrasyonKod AS kod,
+               kd.oran AS kdv_oran,
+               (SELECT COUNT(*) FROM dbo.PazaryeriAyarlari pa
+                 WHERE pa.PazaryeriAyarlari_Anahtar = 'KomisyonKdvOran' AND pa.PazaryeriAyarlari_Durum = 1
+                   AND pa.PazaryeriAyarlari_EntegrasyonKanallari_id IS NOT NULL
+                   AND pa.PazaryeriAyarlari_Pazaryerleri_id = p.Pazaryerleri_id) AS kanal_ayar
+        FROM dbo.tanim_Pazaryerleri p
+        OUTER APPLY (
+            SELECT TOP 1 TRY_CAST(pa.PazaryeriAyarlari_Deger AS DECIMAL(5,2)) AS oran
+            FROM dbo.PazaryeriAyarlari pa
+            WHERE pa.PazaryeriAyarlari_Anahtar = 'KomisyonKdvOran' AND pa.PazaryeriAyarlari_Durum = 1
+              AND pa.PazaryeriAyarlari_EntegrasyonKanallari_id IS NULL
+              AND (pa.PazaryeriAyarlari_Pazaryerleri_id = p.Pazaryerleri_id OR pa.PazaryeriAyarlari_Pazaryerleri_id IS NULL)
+            ORDER BY CASE WHEN pa.PazaryeriAyarlari_Pazaryerleri_id IS NOT NULL THEN 1 ELSE 2 END
+        ) kd
+        WHERE p.Pazaryerleri_Durum = 1
+          AND EXISTS (SELECT 1 FROM dbo.PazaryeriSiparisleri s WHERE s.PazaryeriSiparisleri_Pazaryerleri_id = p.Pazaryerleri_id)
+        ORDER BY p.Pazaryerleri_Sira, p.Pazaryerleri_Ad
+    ");
+
+    return array_map(function ($r) {
+        $not  = PAZARYERI_TUTAR_NOTLARI[(string)$r['kod']] ?? [];
+        $oran = $r['kdv_oran'] !== null ? (float)$r['kdv_oran'] : 0.0;
+        $uyari = $not['uyari'] ?? '';
+        if (!empty($not['kdvDahilGelir']) && $oran > 0) {
+            $uyari = trim($uyari . ' Komisyon API\'den KDV dahil geldiği halde %' . rtrim(rtrim(number_format($oran, 2, ',', ''), '0'), ',')
+                   . ' KDV ayarı var: çift KDV uygulanıyor.');
+        }
+        return [
+            'ad'        => (string)$r['ad'],
+            'gelir'     => $not['gelir'] ?? '—',
+            'komisyon'  => $not['komisyon'] ?? '—',
+            'kdv'       => $oran > 0 ? '+%' . rtrim(rtrim(number_format($oran, 2, ',', ''), '0'), ',') . ' eklenir'
+                                     : (!empty($not['kdvDahilGelir']) ? 'Eklenmez (API KDV dahil)' : 'Eklenmez (ayar yok)'),
+            'kanalAyar' => (int)$r['kanal_ayar'],
+            'uyari'     => $uyari,
+        ];
+    }, $satirlar);
+}
+
 // =====================================================================
-// Ayarlar: banka masraf kuralları + kaynak tanımları
+// Ayarlar: kaynak tanımları
 // =====================================================================
 
 /** LIKE araması için kullanıcı metnindeki joker karakterler etkisizleştirilir */
@@ -724,15 +712,13 @@ function likeKacis($s)
 
 // =====================================================================
 // Kırılım detayı: tür → tanım. Kırılım satırının detay_tur değeri buradaki anahtardır.
-//   platform : türün satır etiketi (seçili platform farklıysa detay boş döner, raporla aynı)
-//   anahtar  : 'id' (int, 0 → NULL) | 'kargo' ('KAYNAK|YON')
-//   ad       : kaynak toplamı detayında sekme / Excel bölüm adı
+//   ad       : kaynak toplamı detayında sekme / Excel bölüm adı. Anahtarlar id'dir (int).
+//   anahtarsiz: true → anahtar listesi zorunlu değil (InfoBox detayı; kapsam rapor filtresinden)
 // =====================================================================
 const DETAY_TURLERI = [
-    'satis'              => ['platform' => PLATFORM_ETICARET, 'anahtar' => 'id',    'ad' => 'Pazaryeri satışları'],
-    'komisyon_pazaryeri' => ['platform' => PLATFORM_ETICARET, 'anahtar' => 'id',    'ad' => 'Pazaryeri komisyonu'],
-    'banka'              => ['platform' => null,              'anahtar' => 'id',    'ad' => 'Banka masrafı'],
-    'kargo'              => ['platform' => null,              'anahtar' => 'kargo', 'ad' => 'Kargo'],
+    'satis'              => ['ad' => 'Pazaryeri satışları'],
+    'komisyon_pazaryeri' => ['ad' => 'Pazaryeri komisyonu'],
+    'komisyonsuz'        => ['ad' => 'Komisyonu hesaplanmamış ciro', 'anahtarsiz' => true],
 ];
 
 /** Firma görünen adı (f = Firmalar takma adı; sıralama ve dış SELECT aynı ifadeyi kullanır) */
@@ -740,7 +726,7 @@ const FIRMA_AD_SQL = "ISNULL(NULLIF(f.firma_adi, ''), f.firma_unvan)";
 
 /**
  * Detay isteği doğrulaması. Hata varsa ['hata' => mesaj] döner.
- * tur whitelist; anahtarlar türüne göre (id → rakam, kargo → KAYNAK|GIDEN/GELEN); satır firması int.
+ * tur whitelist; anahtarlar rakam (pazaryeri id); satır firması int.
  */
 function detayGirdisi(array $g)
 {
@@ -748,16 +734,15 @@ function detayGirdisi(array $g)
     if (!isset(DETAY_TURLERI[$tur])) {
         return ['hata' => 'Geçersiz detay türü.'];
     }
-    $desen = DETAY_TURLERI[$tur]['anahtar'] === 'kargo' ? '/^[A-Z0-9_]{1,10}\|(GIDEN|GELEN)$/' : '/^\d{1,10}$/';
     $anahtarlar = [];
     foreach (array_slice((array)($g['anahtarlar'] ?? []), 0, 50) as $a) {
         $a = trim((string)$a);
-        if (!preg_match($desen, $a)) {
+        if (!preg_match('/^\d{1,10}$/', $a)) {
             return ['hata' => 'Geçersiz detay anahtarı.'];
         }
         $anahtarlar[$a] = $a;
     }
-    if (!$anahtarlar) {
+    if (!$anahtarlar && empty(DETAY_TURLERI[$tur]['anahtarsiz'])) {
         return ['hata' => 'Detay anahtarı eksik.'];
     }
     // Satır firması: yoksa / negatifse koşul yok (raporun firma filtresi yine uygulanır)
@@ -781,15 +766,12 @@ function detayTanim(array $d, array $f)
     $tur = $d['tur'];
     $p   = [$f['bas'], $f['bit']];
 
-    // Seçili platform bu türün etiketi değilse rapordaki gibi hiç satır yok
-    $platformSql = ($f['platform'] !== null && DETAY_TURLERI[$tur]['platform'] !== $f['platform']) ? ' AND 1 = 0 ' : '';
-
     switch ($tur) {
         case 'satis':
             return [
                 'taban'  => pazaryeriKosulu($f['firmaIdler'])
                           . anahtarIdKosulu($d['anahtarlar'], 's.PazaryeriSiparisleri_Pazaryerleri_id')
-                          . satirFirmaKosulu($d['satirFirma'], 'k.EntegrasyonKanallari_Firmalar_id') . $platformSql,
+                          . satirFirmaKosulu($d['satirFirma'], 'k.EntegrasyonKanallari_Firmalar_id'),
                 'params' => $p,
                 'id'     => 's.PazaryeriSiparisleri_id',
                 'ozet'   => 'COUNT(*) AS adet, ISNULL(SUM(ISNULL(s.PazaryeriSiparisleri_ToplamTutar, 0)), 0) AS toplam',
@@ -860,6 +842,7 @@ function detayTanim(array $d, array $f)
                     'kalem'      => (int)$r['kalem'],
                     'urunler'    => (string)($r['urunler'] ?? ''),
                     'komisyon'   => $r['komisyon'] !== null ? round((float)$r['komisyon'], 2) : null,
+                    'komisyon_yuzde' => yuzdeOran($r['komisyon'], $r['tutar']),
                     'tutar'      => round((float)$r['tutar'], 2),
                 ],
             ];
@@ -869,12 +852,13 @@ function detayTanim(array $d, array $f)
             return [
                 'taban'  => pazaryeriKosulu($f['firmaIdler'], KOMISYON_KALEM_JOIN)
                           . anahtarIdKosulu($d['anahtarlar'], 's.PazaryeriSiparisleri_Pazaryerleri_id')
-                          . satirFirmaKosulu($d['satirFirma'], 'k.EntegrasyonKanallari_Firmalar_id') . $platformSql,
+                          . satirFirmaKosulu($d['satirFirma'], 'k.EntegrasyonKanallari_Firmalar_id'),
                 'params' => $p,
                 'id'     => 'c.PazaryeriSiparisKalemleri_id',
                 'ozet'   => 'COUNT(DISTINCT s.PazaryeriSiparisleri_id) AS adet, COUNT(*) AS kalem,
                              SUM(CASE WHEN c.PazaryeriSiparisKalemleri_KomisyonTutar IS NULL THEN 1 ELSE 0 END) AS bos,
-                             ISNULL(SUM(ISNULL(' . KOMISYON_KDV_DAHIL . ', 0)), 0) AS toplam',
+                             ISNULL(SUM(ISNULL(' . KOMISYON_KDV_DAHIL . ', 0)), 0) AS toplam,
+                             ISNULL(SUM(CASE WHEN NOT ' . KOMISYONSUZ_KOSUL . ' THEN ISNULL(c.PazaryeriSiparisKalemleri_ToplamTutar, 0) ELSE 0 END), 0) AS baz',
                 'ara'    => 's.PazaryeriSiparisleri_SiparisNo LIKE ? OR c.PazaryeriSiparisKalemleri_UrunAdi LIKE ? OR c.PazaryeriSiparisKalemleri_Barkod LIKE ?',
                 'siralama' => [
                     0 => 's.PazaryeriSiparisleri_SiparisTarihi',
@@ -923,116 +907,61 @@ function detayTanim(array $d, array $f)
                     'komisyon_kdvsiz'   => $r['komisyon_kdvsiz'] !== null ? round((float)$r['komisyon_kdvsiz'], 2) : null,
                     'komisyon_kdv_oran' => $r['komisyon_kdv_oran'] !== null ? round((float)$r['komisyon_kdv_oran'], 2) : 0,
                     'komisyon_tutar'    => $r['komisyon_tutar'] !== null ? round((float)$r['komisyon_tutar'], 2) : null,
+                    // Etkin oran: KDV dahil komisyon / kalem tutarı (API oranı KDV hariç olduğundan farklı olabilir)
+                    'etkin_oran'        => yuzdeOran($r['komisyon_tutar'], $r['kalem_tutar']),
                 ],
             ];
 
-        // Banka masrafı: dış SELECT'te banka adı + eşleşen dahil kuralı (OUTER APPLY, yalnız bu sayfaya)
-        case 'banka':
+        // InfoBox detayı: komisyonu hesaplanmamış kalemler (komisyonsuzOzet ile aynı taban)
+        case 'komisyonsuz':
+            [$taban, $tp] = komisyonsuzTaban($f['bas'], $f['bit'], $f['firmaIdler'], $f['kirilim']);
             return [
-                'taban'  => "
-                    FROM dbo.banka_HesapHareketleri h
-                    INNER JOIN dbo.banka_Hesap a ON a.bankaHesap_id = h.banka_HesapId
-                    WHERE " . bankaMasrafKosulu() . "
-                      AND h.banka_HesapHareketleriDateTime >= CAST(? AS DATE)
-                      AND h.banka_HesapHareketleriDateTime <  DATEADD(DAY, 1, CAST(? AS DATE))
-                      " . anahtarIdKosulu($d['anahtarlar'], 'a.bankaHesap_banka_id') . "
-                      " . firmaKosulu($f['firmaIdler'], 'a.bankaHesap_firma_id') . "
-                      " . satirFirmaKosulu($d['satirFirma'], 'a.bankaHesap_firma_id') . $platformSql,
-                'params' => $p,
-                'id'     => 'h.banka_HesapHareketleriID',
-                'ozet'   => 'COUNT(*) AS adet, ISNULL(SUM(' . BANKA_MASRAF_TUTAR . '), 0) AS toplam',
-                'ara'    => 'h.banka_HesapHareketleriDescription LIKE ?',
+                'taban'  => $taban
+                          . ($d['anahtarlar'] ? anahtarIdKosulu($d['anahtarlar'], 's.PazaryeriSiparisleri_Pazaryerleri_id') : '')
+                          . satirFirmaKosulu($d['satirFirma'], 'k.EntegrasyonKanallari_Firmalar_id'),
+                'params' => $tp,
+                'id'     => 'c.PazaryeriSiparisKalemleri_id',
+                'ozet'   => 'COUNT(DISTINCT s.PazaryeriSiparisleri_id) AS adet, COUNT(*) AS kalem,
+                             ISNULL(SUM(ISNULL(c.PazaryeriSiparisKalemleri_ToplamTutar, 0)), 0) AS toplam',
+                'ara'    => 's.PazaryeriSiparisleri_SiparisNo LIKE ? OR c.PazaryeriSiparisKalemleri_UrunAdi LIKE ? OR c.PazaryeriSiparisKalemleri_Barkod LIKE ?',
                 'siralama' => [
-                    0 => 'h.banka_HesapHareketleriDateTime',
-                    1 => 'a.bankaHesap_iban',
-                    2 => 'h.banka_HesapHareketleriDescription',
-                    3 => BANKA_MASRAF_TUTAR,
+                    0 => 's.PazaryeriSiparisleri_SiparisTarihi',
+                    1 => 's.PazaryeriSiparisleri_SiparisNo',
+                    2 => 'p.Pazaryerleri_Ad',
+                    3 => FIRMA_AD_SQL,
+                    4 => 'c.PazaryeriSiparisKalemleri_UrunAdi',
+                    5 => 'c.PazaryeriSiparisKalemleri_Barkod',
+                    6 => 'c.PazaryeriSiparisKalemleri_Miktar',
+                    7 => 's.PazaryeriSiparisleri_DurumKod',
+                    8 => 'c.PazaryeriSiparisKalemleri_ToplamTutar',
                 ],
                 'dis' => "
-                    SELECT h.banka_HesapHareketleriID                                  AS id,
-                           CONVERT(VARCHAR(16), h.banka_HesapHareketleriDateTime, 120) AS tarih,
-                           a.bankaHesap_banka_id                                       AS banka_id,
-                           ISNULL(b.banka_adi, N'Tanımsız')                            AS banka_adi,
-                           a.bankaHesap_iban                                           AS iban,
-                           h.banka_HesapHareketleriDescription                         AS aciklama,
-                           " . BANKA_MASRAF_TUTAR . "                                  AS tutar,
-                           CAST(h.banka_HesapHareketleriCost AS INT)                   AS cost,
-                           kr.desen                                                    AS kural_desen
+                    SELECT c.PazaryeriSiparisKalemleri_id                             AS id,
+                           CONVERT(VARCHAR(16), s.PazaryeriSiparisleri_SiparisTarihi, 120) AS tarih,
+                           s.PazaryeriSiparisleri_SiparisNo                           AS siparis_no,
+                           p.Pazaryerleri_Ad                                          AS pazaryeri,
+                           " . FIRMA_AD_SQL . "                                       AS firma,
+                           c.PazaryeriSiparisKalemleri_UrunAdi                        AS urun,
+                           c.PazaryeriSiparisKalemleri_Barkod                         AS barkod,
+                           c.PazaryeriSiparisKalemleri_Miktar                         AS miktar,
+                           s.PazaryeriSiparisleri_DurumKod                            AS durum,
+                           ISNULL(c.PazaryeriSiparisKalemleri_ToplamTutar, 0)         AS kalem_tutar
                     FROM sayfa x
-                    INNER JOIN dbo.banka_HesapHareketleri h ON h.banka_HesapHareketleriID = x.id
-                    INNER JOIN dbo.banka_Hesap a ON a.bankaHesap_id = h.banka_HesapId
-                    LEFT JOIN dbo.bankalar b     ON b.banka_id = a.bankaHesap_banka_id
-                    OUTER APPLY (
-                        SELECT TOP 1 r.BankaMasrafKurallari_Desen AS desen
-                        FROM dbo.tanim_BankaMasrafKurallari r
-                        WHERE r.BankaMasrafKurallari_Durum = 1 AND r.BankaMasrafKurallari_Tip = 'dahil'
-                          AND (r.BankaMasrafKurallari_Bankalar_id IS NULL OR r.BankaMasrafKurallari_Bankalar_id = a.bankaHesap_banka_id)
-                          AND h.banka_HesapHareketleriDescription LIKE r.BankaMasrafKurallari_Desen
-                        ORDER BY CASE WHEN r.BankaMasrafKurallari_Bankalar_id IS NULL THEN 1 ELSE 0 END, r.BankaMasrafKurallari_id
-                    ) kr",
+                    INNER JOIN dbo.PazaryeriSiparisKalemleri c ON c.PazaryeriSiparisKalemleri_id = x.id
+                    INNER JOIN dbo.PazaryeriSiparisleri s      ON s.PazaryeriSiparisleri_id = c.PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id
+                    INNER JOIN dbo.EntegrasyonKanallari k      ON k.EntegrasyonKanallari_id = s.PazaryeriSiparisleri_EntegrasyonKanallari_id
+                    INNER JOIN dbo.tanim_Pazaryerleri p        ON p.Pazaryerleri_id = s.PazaryeriSiparisleri_Pazaryerleri_id
+                    LEFT JOIN dbo.Firmalar f                   ON f.firma_id = k.EntegrasyonKanallari_Firmalar_id",
                 'bicim' => fn($r) => [
                     'tarih'       => (string)$r['tarih'],
-                    'banka_id'    => (int)$r['banka_id'],
-                    'banka'       => (string)$r['banka_adi'],
-                    'iban'        => (string)($r['iban'] ?? ''),
-                    'aciklama'    => (string)($r['aciklama'] ?? ''),
-                    'tutar'       => round((float)$r['tutar'], 2),
-                    'cost'        => (int)$r['cost'],
-                    'kural_desen' => $r['kural_desen'],
-                ],
-            ];
-
-        // Kargo: anahtar 'KAYNAK|YON' çiftleri parametreyle (tabandaki tarih ?'lerinden sonra)
-        case 'kargo':
-            $parca = [];
-            foreach ($d['anahtarlar'] as $a) {
-                [$kaynak, $yon] = explode('|', $a, 2);
-                $parca[] = '(g.kargo_gonderiler_Kaynak = ? AND g.kargo_gonderiler_Yon = ?)';
-                $p[] = $kaynak;
-                $p[] = $yon;
-            }
-            return [
-                'taban'  => kargoKosulu($f['firmaIdler'])
-                          . ' AND (' . implode(' OR ', $parca) . ') '
-                          . satirFirmaKosulu($d['satirFirma'], 'k.EntegrasyonKanallari_Firmalar_id') . $platformSql,
-                'params' => $p,
-                'id'     => 'g.kargo_gonderiler_id',
-                'ozet'   => 'COUNT(*) AS adet, ISNULL(SUM(ISNULL(g.kargo_gonderiler_Tutar, 0)), 0) AS toplam',
-                'ara'    => 'g.kargo_gonderiler_TakipNo LIKE ? OR g.kargo_gonderiler_Gonderici LIKE ? OR g.kargo_gonderiler_Alici LIKE ?',
-                'siralama' => [
-                    0 => 'g.kargo_gonderiler_CikisTarihi',
-                    1 => 'g.kargo_gonderiler_Yon',
-                    2 => 'g.kargo_gonderiler_TakipNo',
-                    3 => 'g.kargo_gonderiler_Gonderici',
-                    4 => 'g.kargo_gonderiler_Alici',
-                    5 => 'g.kargo_gonderiler_AliciIl',
-                    6 => 'g.kargo_gonderiler_OdemeTipi',
-                    7 => 'g.kargo_gonderiler_DurumMetni',
-                    8 => 'g.kargo_gonderiler_Tutar',
-                ],
-                'dis' => "
-                    SELECT g.kargo_gonderiler_id                                       AS id,
-                           CONVERT(VARCHAR(16), g.kargo_gonderiler_CikisTarihi, 120)   AS tarih,
-                           g.kargo_gonderiler_Yon                                      AS yon,
-                           g.kargo_gonderiler_TakipNo                                  AS takip_no,
-                           g.kargo_gonderiler_Gonderici                                AS gonderici,
-                           g.kargo_gonderiler_Alici                                    AS alici,
-                           g.kargo_gonderiler_AliciIl                                  AS alici_il,
-                           g.kargo_gonderiler_OdemeTipi                                AS odeme_tipi,
-                           g.kargo_gonderiler_DurumMetni                               AS durum,
-                           ISNULL(g.kargo_gonderiler_Tutar, 0)                         AS tutar
-                    FROM sayfa x
-                    INNER JOIN dbo.kargo_gonderiler g ON g.kargo_gonderiler_id = x.id",
-                'bicim' => fn($r) => [
-                    'tarih'      => (string)$r['tarih'],
-                    'yon'        => (string)($r['yon'] ?? ''),
-                    'takip_no'   => (string)($r['takip_no'] ?? ''),
-                    'gonderici'  => (string)($r['gonderici'] ?? ''),
-                    'alici'      => (string)($r['alici'] ?? ''),
-                    'alici_il'   => (string)($r['alici_il'] ?? ''),
-                    'odeme_tipi' => (string)($r['odeme_tipi'] ?? ''),
-                    'durum'      => (string)($r['durum'] ?? ''),
-                    'tutar'      => round((float)$r['tutar'], 2),
+                    'siparis_no'  => (string)($r['siparis_no'] ?? ''),
+                    'pazaryeri'   => (string)($r['pazaryeri'] ?? ''),
+                    'firma'       => (string)($r['firma'] ?? ''),
+                    'urun'        => (string)($r['urun'] ?? ''),
+                    'barkod'      => (string)($r['barkod'] ?? ''),
+                    'miktar'      => (int)$r['miktar'],
+                    'durum'       => (string)($r['durum'] ?? ''),
+                    'kalem_tutar' => round((float)$r['kalem_tutar'], 2),
                 ],
             ];
     }
@@ -1049,6 +978,9 @@ function detayOzet($r)
     if (isset($r['kalem'])) {
         $o['kalem'] = (int)$r['kalem'];
         $o['bos']   = (int)($r['bos'] ?? 0);
+    }
+    if (isset($r['baz'])) {
+        $o['baz'] = round((float)$r['baz'], 2);
     }
     return $o;
 }
@@ -1116,14 +1048,14 @@ const DETAY_EXCEL_EN_FAZLA = 50000;
 
 /**
  * Detay Excel kolonları: tür → [başlık, alan, hücre türü]. Sıra arayüzdeki DETAY_KOLONLARI ile aynı.
- * Alanlar bicim çıktısıdır; 'kaynak' ve 'yon_ad' detayExcelSatir'da türetilir. NULL değer boş hücre yazılır.
+ * Alanlar bicim çıktısıdır. NULL değer boş hücre yazılır.
  */
 const DETAY_EXCEL_KOLONLARI = [
     'satis' => [
         ['Sipariş Tarihi', 'tarih', 'metin'], ['Sipariş No', 'siparis_no', 'metin'], ['Pazaryeri', 'pazaryeri', 'metin'],
         ['Kanal', 'kanal', 'metin'], ['Firma', 'firma', 'metin'], ['Müşteri', 'musteri', 'metin'],
-        ['Ürün', 'urunler', 'metin'], ['Durum', 'durum', 'metin'], ['Kalem', 'kalem', 'sayi'], ['Komisyon', 'komisyon', 'para'],
-        ['Tutar', 'tutar', 'para'],
+        ['Ürün', 'urunler', 'metin'], ['Durum', 'durum', 'metin'], ['Kalem', 'kalem', 'sayi'], ['Komisyon (KDV Dahil)', 'komisyon', 'para'],
+        ['Tutar (KDV Dahil)', 'tutar', 'para'], ['Komisyon / Tutar (%)', 'komisyon_yuzde', 'sayi'],
     ],
     'komisyon_pazaryeri' => [
         ['Sipariş Tarihi', 'tarih', 'metin'], ['Sipariş No', 'siparis_no', 'metin'], ['Pazaryeri', 'pazaryeri', 'metin'],
@@ -1131,149 +1063,26 @@ const DETAY_EXCEL_KOLONLARI = [
         ['Miktar', 'miktar', 'sayi'], ['Kalem Tutarı', 'kalem_tutar', 'para'],
         ['Komisyon Oranı (%)', 'komisyon_oran', 'sayi'], ['Komisyon (KDV Hariç)', 'komisyon_kdvsiz', 'para'],
         ['Komisyon KDV (%)', 'komisyon_kdv_oran', 'sayi'], ['Komisyon (KDV Dahil)', 'komisyon_tutar', 'para'],
+        ['Komisyon / Tutar (%)', 'etkin_oran', 'sayi'],
     ],
-    'banka' => [
-        ['Tarih', 'tarih', 'metin'], ['Banka', 'banka', 'metin'], ['IBAN', 'iban', 'metin'],
-        ['Açıklama', 'aciklama', 'metin'], ['Tutar', 'tutar', 'para'], ['Kaynak', 'kaynak', 'metin'],
-    ],
-    'kargo' => [
-        ['Çıkış Tarihi', 'tarih', 'metin'], ['Yön', 'yon_ad', 'metin'], ['Takip No', 'takip_no', 'metin'],
-        ['Gönderici', 'gonderici', 'metin'], ['Alıcı', 'alici', 'metin'], ['Alıcı İl', 'alici_il', 'metin'],
-        ['Ödeme Tipi', 'odeme_tipi', 'metin'], ['Durum', 'durum', 'metin'], ['Tutar', 'tutar', 'para'],
+    'komisyonsuz' => [
+        ['Sipariş Tarihi', 'tarih', 'metin'], ['Sipariş No', 'siparis_no', 'metin'], ['Pazaryeri', 'pazaryeri', 'metin'],
+        ['Firma', 'firma', 'metin'], ['Ürün Adı', 'urun', 'metin'], ['Barkod', 'barkod', 'metin'],
+        ['Miktar', 'miktar', 'sayi'], ['Durum', 'durum', 'metin'], ['Kalem Tutarı', 'kalem_tutar', 'para'],
     ],
 ];
 
-/** Detay satırı → Excel hücreleri (arayüzde render ile gösterilen türetilmiş alanlar dahil) */
+/** Detay satırı → Excel hücreleri */
 function detayExcelSatir($tur, array $s)
 {
-    if ($tur === 'banka') {
-        $s['kaynak'] = $s['cost'] === 1 ? 'Banka işareti' : $s['kural_desen'];
-    } elseif ($tur === 'kargo') {
-        $s['yon_ad'] = $s['yon'] === 'GIDEN' ? 'Giden' : 'Gelen';
-    }
     return array_map(fn($k) => ($s[$k[1]] ?? null) === null ? '' : ['deger' => $s[$k[1]], 'tur' => $k[2]], DETAY_EXCEL_KOLONLARI[$tur]);
 }
 
-/** Kural formu doğrulaması. Hata varsa ['hata' => mesaj] döner. */
-function kuralGirdisi(array $g)
-{
-    $desen   = trim((string)($g['desen'] ?? ''));
-    $tip     = (string)($g['tip'] ?? '');
-    $bankaId = (int)($g['banka_id'] ?? 0);
-
-    if ($desen === '') {
-        return ['hata' => 'Desen zorunludur.'];
-    }
-    if (mb_strlen($desen, 'UTF-8') > 200) {
-        return ['hata' => 'Desen en fazla 200 karakter olabilir.'];
-    }
-    if (strpos($desen, '%') === false && mb_strlen($desen, 'UTF-8') < 3) {
-        return ['hata' => 'Desen en az bir % içermeli veya en az 3 karakter olmalı.'];
-    }
-    if (trim($desen, "%_ \t") === '') {
-        return ['hata' => 'Yalnız joker karakterden oluşan desen tüm hareketlere uyar; bir anahtar kelime yazın.'];
-    }
-    if (!in_array($tip, ['dahil', 'haric'], true)) {
-        return ['hata' => 'Geçersiz kural tipi.'];
-    }
-    if ($bankaId > 0 && !Database::getInstance()->fetchOne("SELECT banka_id FROM dbo.bankalar WHERE banka_id = ?", [$bankaId])) {
-        return ['hata' => 'Banka bulunamadı.'];
-    }
-
-    return [
-        'id'       => max(0, (int)($g['id'] ?? 0)),
-        'desen'    => $desen,
-        'tip'      => $tip,
-        'banka_id' => $bankaId > 0 ? $bankaId : null,
-        'aciklama' => mb_substr(trim((string)($g['aciklama'] ?? '')), 0, 300, 'UTF-8'),
-        'durum'    => !empty($g['durum']) ? 1 : 0,
-    ];
-}
-
-/**
- * Kural önizlemesi: kural (yeni ya da düzenlenen) etkin olsaydı rapordaki masraf satırları nasıl değişirdi?
- *  dahil → desene uyup şu an masraf sayılmayan ve hiçbir hariç kurala uymayan BORÇ satırları (eklenecekler)
- *  haric → şu an masraf sayılan, desene uyan ve bankaca işaretlenmemiş (Cost = 0) satırlar (çıkarılacaklar)
- * "Şu an" durumu düzenlenen kural yok sayılarak hesaplanır; böylece yalnız bu kuralın etkisi görünür.
- */
-function kuralOnizle(array $k, $bas, $bit, $firmaIdler)
-{
-    $db     = Database::getInstance();
-    $params = [$k['desen']];
-    $bankaSql = '';
-    if ($k['banka_id']) {
-        $bankaSql = ' AND a.bankaHesap_banka_id = ? ';
-        $params[] = $k['banka_id'];
-    }
-    $params[] = $bas;
-    $params[] = $bit;
-
-    $etki = $k['tip'] === 'dahil'
-        ? " AND NOT " . bankaMasrafKosulu($k['id']) . " AND NOT " . bankaKuralVar('haric', $k['id'])
-        : " AND h.banka_HesapHareketleriCost = 0 AND " . bankaMasrafKosulu($k['id']);
-
-    $kaynak = "
-        FROM dbo.banka_HesapHareketleri h
-        INNER JOIN dbo.banka_Hesap a ON a.bankaHesap_id = h.banka_HesapId
-        WHERE h.banka_HesapHareketleriBorcAlacak = 'B'
-          AND h.banka_HesapHareketleriDescription LIKE ?
-          $bankaSql
-          $etki
-          AND h.banka_HesapHareketleriDateTime >= CAST(? AS DATE)
-          AND h.banka_HesapHareketleriDateTime <  DATEADD(DAY, 1, CAST(? AS DATE))
-          " . firmaKosulu($firmaIdler, 'a.bankaHesap_firma_id');
-
-    $ozet = $db->fetchOne("SELECT COUNT(*) AS adet, ISNULL(SUM(" . BANKA_MASRAF_TUTAR . "), 0) AS toplam $kaynak", $params);
-
-    $satirlar = $db->fetchAll("
-        SELECT TOP 20
-            CONVERT(VARCHAR(16), h.banka_HesapHareketleriDateTime, 120) AS tarih,
-            ISNULL(b.banka_adi, N'Tanımsız')                            AS banka_adi,
-            a.bankaHesap_iban                                           AS iban,
-            h.banka_HesapHareketleriDescription                         AS aciklama,
-            " . BANKA_MASRAF_TUTAR . "                                  AS tutar
-        FROM (SELECT h.banka_HesapHareketleriID AS id $kaynak) x
-        INNER JOIN dbo.banka_HesapHareketleri h ON h.banka_HesapHareketleriID = x.id
-        INNER JOIN dbo.banka_Hesap a ON a.bankaHesap_id = h.banka_HesapId
-        LEFT JOIN dbo.bankalar b     ON b.banka_id = a.bankaHesap_banka_id
-        ORDER BY " . BANKA_MASRAF_TUTAR . " DESC, h.banka_HesapHareketleriID DESC
-    ", $params);
-
-    return [
-        'tip'      => $k['tip'],
-        'adet'     => (int)($ozet['adet'] ?? 0),
-        'toplam'   => round((float)($ozet['toplam'] ?? 0), 2),
-        'satirlar' => array_map(fn($r) => [
-            'tarih'    => (string)$r['tarih'],
-            'banka'    => (string)$r['banka_adi'],
-            'iban'     => (string)($r['iban'] ?? ''),
-            'aciklama' => (string)($r['aciklama'] ?? ''),
-            'tutar'    => round((float)$r['tutar'], 2),
-        ], $satirlar),
-    ];
-}
-
-/** Ayar modalı verisi: kurallar, aktif bankalar, tüm kaynak tanımları */
+/** Ayar modalı verisi: tüm kaynak tanımları */
 function ayarVerisi()
 {
     $db = Database::getInstance();
     return [
-        'kurallar' => $db->fetchAll("
-            SELECT r.BankaMasrafKurallari_id AS id, r.BankaMasrafKurallari_Desen AS desen,
-                   r.BankaMasrafKurallari_Tip AS tip, r.BankaMasrafKurallari_Bankalar_id AS banka_id,
-                   b.banka_adi, r.BankaMasrafKurallari_Aciklama AS aciklama,
-                   CAST(r.BankaMasrafKurallari_Durum AS INT) AS durum
-            FROM dbo.tanim_BankaMasrafKurallari r
-            LEFT JOIN dbo.bankalar b ON b.banka_id = r.BankaMasrafKurallari_Bankalar_id
-            ORDER BY CASE r.BankaMasrafKurallari_Tip WHEN 'dahil' THEN 0 ELSE 1 END,
-                     r.BankaMasrafKurallari_Desen
-        "),
-        'bankalar' => $db->fetchAll("
-            SELECT banka_id AS id, banka_adi AS ad
-            FROM dbo.bankalar
-            WHERE banka_durum = 1
-            ORDER BY banka_sira_no, banka_adi
-        "),
         'kaynaklar' => $db->fetchAll("
             SELECT GelirGiderKaynaklari_id AS id, GelirGiderKaynaklari_Kod AS kod, GelirGiderKaynaklari_Ad AS ad,
                    GelirGiderKaynaklari_Tip AS tip, GelirGiderKaynaklari_Aciklama AS aciklama,
@@ -1294,7 +1103,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $jsonBayrak = JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE;
 
     // Ayar işlemleri: yalnız ayar yetkisi olan kullanıcı (buton gizli olsa da sunucuda da denetlenir)
-    $ayarAksiyonlari = ['ayar_liste', 'kural_onizle', 'kural_kaydet', 'kural_durum', 'kural_sil', 'kaynak_kaydet', 'kaynak_durum'];
+    $ayarAksiyonlari = ['ayar_liste', 'kaynak_kaydet', 'kaynak_durum'];
     if (in_array($action, $ayarAksiyonlari, true) && !$ayarYetki) {
         header('Content-Type: application/json; charset=utf-8');
         echo json_encode(['success' => false, 'message' => 'Ayarları değiştirme yetkiniz yok.'], $jsonBayrak);
@@ -1306,92 +1115,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         switch ($action) {
 
             // ---------------------------------------------------------
-            // Ayar modalı: kurallar + bankalar + kaynaklar
+            // Ayar modalı: kaynaklar
             case 'ayar_liste':
                 header('Content-Type: application/json; charset=utf-8');
                 echo json_encode(['success' => true, 'data' => ayarVerisi()], $jsonBayrak);
-                exit;
-
-            // ---------------------------------------------------------
-            // Kural önizleme: raporun filtresi (tarih + firma) ile
-            case 'kural_onizle':
-                header('Content-Type: application/json; charset=utf-8');
-                $f = filtreCoz($_POST, $kisitFirmaId);
-                $k = kuralGirdisi($_POST);
-                $hata = $f['hata'] ?? $k['hata'] ?? null;
-                if ($hata) {
-                    echo json_encode(['success' => false, 'message' => $hata], $jsonBayrak);
-                    exit;
-                }
-                echo json_encode(['success' => true, 'data' => kuralOnizle($k, $f['bas'], $f['bit'], $f['firmaIdler'])], $jsonBayrak);
-                exit;
-
-            // ---------------------------------------------------------
-            case 'kural_kaydet':
-                header('Content-Type: application/json; charset=utf-8');
-                $k = kuralGirdisi($_POST);
-                if (isset($k['hata'])) {
-                    echo json_encode(['success' => false, 'message' => $k['hata']], $jsonBayrak);
-                    exit;
-                }
-                if ($k['id'] > 0 && !$db->fetchOne("SELECT BankaMasrafKurallari_id FROM dbo.tanim_BankaMasrafKurallari WHERE BankaMasrafKurallari_id = ?", [$k['id']])) {
-                    echo json_encode(['success' => false, 'message' => 'Kural bulunamadı.'], $jsonBayrak);
-                    exit;
-                }
-                $ayni = $db->fetchOne("
-                    SELECT TOP 1 BankaMasrafKurallari_id FROM dbo.tanim_BankaMasrafKurallari
-                    WHERE BankaMasrafKurallari_Desen = ? AND BankaMasrafKurallari_Tip = ?
-                      AND ISNULL(BankaMasrafKurallari_Bankalar_id, 0) = ? AND BankaMasrafKurallari_id <> ?
-                ", [$k['desen'], $k['tip'], (int)$k['banka_id'], $k['id']]);
-                if ($ayni) {
-                    echo json_encode(['success' => false, 'message' => 'Aynı desen, tip ve banka için kural zaten var.'], $jsonBayrak);
-                    exit;
-                }
-
-                if ($k['id'] > 0) {
-                    $ok = $db->execute("
-                        UPDATE dbo.tanim_BankaMasrafKurallari
-                        SET BankaMasrafKurallari_Desen = ?, BankaMasrafKurallari_Tip = ?, BankaMasrafKurallari_Bankalar_id = ?,
-                            BankaMasrafKurallari_Aciklama = ?, BankaMasrafKurallari_Durum = ?,
-                            BankaMasrafKurallari_GuncelleyenKullanici = ?, BankaMasrafKurallari_GuncellemeTarihi = ?
-                        WHERE BankaMasrafKurallari_id = ?
-                    ", [$k['desen'], $k['tip'], $k['banka_id'], $k['aciklama'] ?: null, $k['durum'],
-                        (int)$user['kullanici_id'], $simdi, $k['id']]);
-                    $mesaj = 'Kural güncellendi.';
-                } else {
-                    $ok = $db->execute("
-                        INSERT INTO dbo.tanim_BankaMasrafKurallari
-                            (BankaMasrafKurallari_Desen, BankaMasrafKurallari_Tip, BankaMasrafKurallari_Bankalar_id,
-                             BankaMasrafKurallari_Aciklama, BankaMasrafKurallari_Durum,
-                             BankaMasrafKurallari_OlusturanKullanici, BankaMasrafKurallari_OlusturmaTarihi)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ", [$k['desen'], $k['tip'], $k['banka_id'], $k['aciklama'] ?: null, $k['durum'],
-                        (int)$user['kullanici_id'], $simdi]);
-                    $mesaj = 'Kural eklendi.';
-                }
-                echo json_encode($ok ? ['success' => true, 'message' => $mesaj]
-                                     : ['success' => false, 'message' => 'Kural kaydedilemedi.'], $jsonBayrak);
-                exit;
-
-            // ---------------------------------------------------------
-            case 'kural_durum':
-                header('Content-Type: application/json; charset=utf-8');
-                $ok = $db->execute("
-                    UPDATE dbo.tanim_BankaMasrafKurallari
-                    SET BankaMasrafKurallari_Durum = ?, BankaMasrafKurallari_GuncelleyenKullanici = ?, BankaMasrafKurallari_GuncellemeTarihi = ?
-                    WHERE BankaMasrafKurallari_id = ?
-                ", [!empty($_POST['durum']) ? 1 : 0, (int)$user['kullanici_id'], $simdi, (int)($_POST['id'] ?? 0)]);
-                echo json_encode($ok ? ['success' => true, 'message' => 'Kural durumu güncellendi.']
-                                     : ['success' => false, 'message' => 'Durum güncellenemedi.'], $jsonBayrak);
-                exit;
-
-            // ---------------------------------------------------------
-            // Kalıcı silme (pasife almak için Durum anahtarı kullanılır)
-            case 'kural_sil':
-                header('Content-Type: application/json; charset=utf-8');
-                $ok = $db->execute("DELETE FROM dbo.tanim_BankaMasrafKurallari WHERE BankaMasrafKurallari_id = ?", [(int)($_POST['id'] ?? 0)]);
-                echo json_encode($ok ? ['success' => true, 'message' => 'Kural silindi.']
-                                     : ['success' => false, 'message' => 'Kural silinemedi.'], $jsonBayrak);
                 exit;
 
             // ---------------------------------------------------------
@@ -1446,8 +1173,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             // ---------------------------------------------------------
             // Kırılım detayı (server-side DataTables). Sayfanın görüntüleme yetkisi yeterli;
-            // firma kısıtı filtreCoz ile uygulanır. tur: satis | komisyon_pazaryeri | banka | kargo
-            // (eski 'masraf_detay' = tur 'banka'). Sorgu: detayCalistir (iki aşamalı).
+            // firma kısıtı filtreCoz ile uygulanır. tur: satis | komisyon_pazaryeri.
+            // Sorgu: detayCalistir (iki aşamalı).
             case 'detay':
                 header('Content-Type: application/json; charset=utf-8');
                 $draw = (int)($_POST['draw'] ?? 0);
@@ -1470,7 +1197,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     echo json_encode(['success' => false, 'message' => $f['hata']], $jsonBayrak);
                     exit;
                 }
-                echo json_encode(['success' => true, 'data' => raporHesapla($f['bas'], $f['bit'], $f['firmaIdler'], $f['platform'], $f['kirilim'])], $jsonBayrak);
+                echo json_encode(['success' => true, 'data' => raporHesapla($f['bas'], $f['bit'], $f['firmaIdler'], $f['kirilim'])], $jsonBayrak);
+                exit;
+
+            // ---------------------------------------------------------
+            // InfoBox: komisyonu hesaplanmamış ciro (rapordan sonra ayrı çağrı)
+            case 'komisyonsuz':
+                header('Content-Type: application/json; charset=utf-8');
+                $f = filtreCoz($_POST, $kisitFirmaId);
+                if (isset($f['hata'])) {
+                    echo json_encode(['success' => false, 'message' => $f['hata']], $jsonBayrak);
+                    exit;
+                }
+                echo json_encode(['success' => true, 'data' => komisyonsuzOzet($f['bas'], $f['bit'], $f['firmaIdler'], $f['kirilim'])], $jsonBayrak);
                 exit;
 
             // ---------------------------------------------------------
@@ -1490,7 +1229,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 require_once __DIR__ . '/../includes/XlsxYazici.php';
-                $r = raporHesapla($f['bas'], $f['bit'], $f['firmaIdler'], $f['platform'], $f['kirilim']);
+                $r = raporHesapla($f['bas'], $f['bit'], $f['firmaIdler'], $f['kirilim']);
                 $destekli = array_values(array_filter($r['kaynaklar'], fn($k) => $k['destekli']));
 
                 // Kırılım seçiliyse yalnız seçili kırılımı olan kaynak kolonları (sayfadaki görünümle aynı)
@@ -1523,8 +1262,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // basliklar() satırı en üste alır; not ve filtre bilgisi en üstte kalsın diye başlık satırı satir() ile yazılır
                 $xlsx = new XlsxYazici($bolum === 'kirilim' ? $kirilimKaynaklari[0]['ad'] : 'Gelir ve Gider');
                 $xlsx->satir([RAPOR_NOTU]);
-                $xlsx->satir(['Dönem: ' . $f['bas'] . ' – ' . $f['bit'] . ' · Platform: ' . $f['platformAd']
-                    . ($f['platform'] !== null ? ' (platformsuz kalemler – banka masrafları, kargo – dahil değil)' : '')
+                $xlsx->satir(['Dönem: ' . $f['bas'] . ' – ' . $f['bit']
                     . ' · Kırılım: ' . ($secili ? $kirilimMetin : 'Tümü')]);
 
                 $kaynakTop = (array)$r['kaynakTop'];
@@ -1572,7 +1310,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         ['deger' => 'Firma', 'tur' => 'baslik'],
                         ['deger' => 'Adet', 'tur' => 'baslik'],
                         ['deger' => 'Tutar', 'tur' => 'baslik'],
+                        ['deger' => 'Komisyon Hariç', 'tur' => 'baslik'],
+                        ['deger' => 'Komisyon / Tutar (%)', 'tur' => 'baslik'],
                     ]);
+                    // Oran yalnız paydası (baz) olan kaynakta (komisyon); boşsa hücre boş
+                    $oranHucre = fn($x) => ($o = yuzdeOran($x['tutar'] ?? null, $x['baz'] ?? 0)) !== null && ($x['baz'] ?? null) !== null
+                        ? ['deger' => $o, 'tur' => 'sayi'] : '';
+                    // Komisyon hariç yalnız komisyonu taşıyan kaynakta (satış); boşsa hücre boş
+                    $komHaricHucre = fn($x) => ($x['komisyon'] ?? null) !== null
+                        ? ['deger' => round($x['tutar'] - $x['komisyon'], 2), 'tur' => 'para'] : '';
                     foreach ($kirilimKaynaklari as $k) {
                         foreach ($kirilim[$k['kod']] ?? [] as $s) {
                             $xlsx->satir([
@@ -1582,6 +1328,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 $s['firma_adi'],
                                 ['deger' => $s['adet'], 'tur' => 'sayi'],
                                 ['deger' => round($s['tutar'], 2), 'tur' => 'para'],
+                                $komHaricHucre($s),
+                                $oranHucre($s),
                             ]);
                         }
                     }
@@ -1592,6 +1340,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             ['deger' => 'TOPLAM', 'tur' => 'baslik'], '', '', '',
                             ['deger' => $t['adet'], 'tur' => 'sayi'],
                             ['deger' => round($t['tutar'], 2), 'tur' => 'para'],
+                            $komHaricHucre($t),
+                            $oranHucre($t),
                         ]);
                     }
                 }
@@ -1679,8 +1429,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-$firmalar    = firmaListesi($kisitFirmaId);
-$platformlar = platformListesi();
+$firmalar       = firmaListesi($kisitFirmaId);
+$tutarTanimlari = tutarTanimlari();
+$tanimUyariVar  = (bool)array_filter($tutarTanimlari, fn($t) => $t['uyari'] !== '');
 ?>
 <!DOCTYPE html>
 <html lang="tr">
@@ -1712,14 +1463,21 @@ $platformlar = platformListesi();
         /* Kaynak toplamı (kart altı / aylık Genel Toplam) → kaynağın tüm kırılımlarının detayı */
         .kaynak-toplam { cursor: pointer; }
         .kaynak-toplam .toplam-tutar { border-bottom: 1px dashed currentColor; }
-        #tblKurallar td, #tblKaynaklar td { vertical-align: middle; }
+        #tblKaynaklar td { vertical-align: middle; }
         #tblKaynaklar input[type=color] { width: 3rem; padding: .15rem; }
         #tblDetay td { vertical-align: middle; }
         #tblDetay td.aciklama-hucre { white-space: normal; min-width: 260px; }
         /* Komisyonu henüz gelmemiş kalem (teslim sonrası dolar) */
         #tblDetay tr.satir-soluk td { opacity: .5; }
-        /* Kural modalı ayar / detay modalının üstünde açılır */
-        #kuralModal { z-index: 1065; }
+        /* InfoBox → detay modalı */
+        .ib-detay { cursor: pointer; transition: box-shadow .15s; }
+        .ib-detay:hover { box-shadow: 0 0 0 .2rem rgba(13,110,253,.25); }
+        /* Geniş modallar ekrana sığsın: genişlik görüntü alanına göre, taşan tablo modal içinde kayar */
+        .modal-genis { max-width: min(1600px, calc(100vw - 2rem)); margin-left: auto; margin-right: auto; }
+        .modal-genis .modal-body { overflow-x: hidden; }
+        .modal-genis .dataTables_wrapper, .modal-genis .table-responsive { max-width: 100%; }
+        #detayModal .dataTables_wrapper .row { margin-left: 0; margin-right: 0; }
+        #detayModal .dataTables_wrapper .row > * { padding-left: 0; padding-right: 0; }
     </style>
 </head>
 <body class="layout-fixed sidebar-expand-lg sidebar-open bg-body-tertiary">
@@ -1735,7 +1493,7 @@ $platformlar = platformListesi();
                             <div class="d-flex align-items-center gap-2">
                                 <h3 class="mb-0"><?= htmlspecialchars($pageTitle) ?></h3>
                                 <?php if ($ayarYetki): ?>
-                                <button type="button" class="btn btn-sm btn-outline-secondary" id="btnAyarlar" title="Banka masraf kuralları ve kaynak tanımları">
+                                <button type="button" class="btn btn-sm btn-outline-secondary" id="btnAyarlar" title="Gelir / gider kaynak tanımları">
                                     <i class="bi bi-gear"></i> Ayarlar
                                 </button>
                                 <?php endif; ?>
@@ -1761,44 +1519,107 @@ $platformlar = platformListesi();
 
                     <!-- InfoBox -->
                     <div class="row mb-3">
-                        <div class="col-12 col-sm-6 col-lg-3">
-                            <div class="info-box">
+                        <div class="col-12 col-sm-6 col-xl">
+                            <div class="info-box ib-detay" data-ib="gelir" title="Gelir detayını göster">
                                 <span class="info-box-icon text-bg-success shadow-sm"><i class="bi bi-arrow-down-circle"></i></span>
                                 <div class="info-box-content">
-                                    <span class="info-box-text">Toplam Gelir</span>
+                                    <span class="info-box-text">Toplam Gelir <small class="text-muted">· KDV dahil</small></span>
                                     <span class="info-box-number tutar" id="ibGelir">-</span>
                                 </div>
                             </div>
                         </div>
-                        <div class="col-12 col-sm-6 col-lg-3">
-                            <div class="info-box">
+                        <div class="col-12 col-sm-6 col-xl">
+                            <div class="info-box ib-detay" data-ib="gider" title="Gider detayını göster">
                                 <span class="info-box-icon text-bg-danger shadow-sm"><i class="bi bi-arrow-up-circle"></i></span>
                                 <div class="info-box-content">
-                                    <span class="info-box-text">Toplam Gider</span>
+                                    <span class="info-box-text">Toplam Gider <small class="text-muted">· Komisyon, KDV dahil</small></span>
                                     <span class="info-box-number tutar" id="ibGider">-</span>
+                                    <small class="text-muted" id="ibGiderAlt" title="Komisyon (KDV dahil) / komisyonu gelmiş kalemlerin tutarı: pazaryerlerinin fiilen kestiği ortalama oran"></small>
                                 </div>
                             </div>
                         </div>
-                        <div class="col-12 col-sm-6 col-lg-3">
-                            <div class="info-box">
+                        <div class="col-12 col-sm-6 col-xl">
+                            <div class="info-box ib-detay" data-ib="net" title="Gelir ve gider detayını göster">
                                 <span class="info-box-icon text-bg-primary shadow-sm"><i class="bi bi-wallet2"></i></span>
                                 <div class="info-box-content">
-                                    <span class="info-box-text">Net (Gelir − Gider)</span>
+                                    <span class="info-box-text" title="Ürün maliyeti, kargo, KDV ve stopaj düşülmez; kâr değildir">Net (Gelir − Komisyon) <small class="text-muted">· KDV dahil, maliyet hariç</small></span>
                                     <span class="info-box-number tutar" id="ibNet">-</span>
                                 </div>
                             </div>
                         </div>
-                        <div class="col-12 col-sm-6 col-lg-3">
-                            <div class="info-box">
+                        <div class="col-12 col-sm-6 col-xl">
+                            <div class="info-box ib-detay" data-ib="net" title="Gelir ve gider detayını göster">
                                 <span class="info-box-icon text-bg-warning shadow-sm"><i class="bi bi-percent"></i></span>
                                 <div class="info-box-content">
-                                    <span class="info-box-text">Kâr Marjı</span>
+                                    <span class="info-box-text" title="Net / Gelir. Ürün maliyeti düşülmediği için kâr marjı değildir">Komisyon Sonrası Marj</span>
                                     <span class="info-box-number" id="ibMarj">-</span>
                                 </div>
                             </div>
                         </div>
+                        <div class="col-12 col-sm-6 col-xl">
+                            <div class="info-box ib-detay" data-ib="komisyonsuz" title="Detay için tıklayın. Komisyon oranı ve tutarı boş / 0 olan kalemlerin tutarı (pazaryeri komisyonu henüz bildirmedi). Bu ciroya ait komisyon gidere girmedi.">
+                                <span class="info-box-icon text-bg-secondary shadow-sm"><i class="bi bi-hourglass-split"></i></span>
+                                <div class="info-box-content">
+                                    <span class="info-box-text">Komisyonu Hesaplanmamış Ciro <small class="text-muted">· KDV dahil</small></span>
+                                    <span class="info-box-number tutar" id="ibKomisyonsuz">-</span>
+                                    <small class="text-muted" id="ibKomisyonsuzAlt"></small>
+                                </div>
+                            </div>
+                        </div>
                     </div>
-                    <p class="text-muted small mt-n2 mb-3"><i class="bi bi-info-circle me-1"></i><?= htmlspecialchars(RAPOR_NOTU) ?></p>
+                    <!-- Tutar tanımları: KDV / komisyon durumu pazaryerine göre -->
+                    <div class="alert <?= $tanimUyariVar ? 'alert-warning' : 'alert-light border' ?> small py-2 mt-n2 mb-3">
+                        <div class="d-flex align-items-start gap-2">
+                            <i class="bi <?= $tanimUyariVar ? 'bi-exclamation-triangle' : 'bi-info-circle' ?> mt-1"></i>
+                            <div class="flex-grow-1">
+                                <?= htmlspecialchars(RAPOR_NOTU) ?>
+                                <?php if ($tanimUyariVar): ?>
+                                <b class="text-danger">Bazı pazaryerlerinde tutar sorunu var, ayrıntı için tanımlara bakın.</b>
+                                <?php endif; ?>
+                                <a class="ms-1 text-nowrap" data-bs-toggle="collapse" href="#tutarTanimlari" role="button" aria-expanded="false">
+                                    <i class="bi bi-chevron-down"></i> Pazaryerine göre tutar tanımları
+                                </a>
+                            </div>
+                        </div>
+                        <div class="collapse" id="tutarTanimlari">
+                            <div class="table-responsive mt-2">
+                                <table class="table table-sm table-bordered bg-white mb-1 align-middle">
+                                    <thead class="table-light">
+                                        <tr>
+                                            <th>Pazaryeri</th>
+                                            <th>Gelir (sipariş tutarı, KDV dahil)</th>
+                                            <th>Komisyon kaynağı</th>
+                                            <th class="text-nowrap">Komisyona KDV</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <?php foreach ($tutarTanimlari as $tt): ?>
+                                        <tr<?= $tt['uyari'] !== '' ? ' class="table-danger"' : '' ?>>
+                                            <td class="fw-semibold text-nowrap"><?= htmlspecialchars($tt['ad']) ?></td>
+                                            <td><?= htmlspecialchars($tt['gelir']) ?></td>
+                                            <td>
+                                                <?= htmlspecialchars($tt['komisyon']) ?>
+                                                <?php if ($tt['uyari'] !== ''): ?>
+                                                <div class="text-danger fw-semibold"><i class="bi bi-exclamation-octagon me-1"></i><?= htmlspecialchars($tt['uyari']) ?></div>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td class="text-nowrap">
+                                                <?= htmlspecialchars($tt['kdv']) ?>
+                                                <?php if ($tt['kanalAyar']): ?>
+                                                <div class="text-muted">+ <?= (int)$tt['kanalAyar'] ?> kanal ayarı</div>
+                                                <?php endif; ?>
+                                            </td>
+                                        </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div class="text-muted">
+                                Komisyon KDV oranı Pazaryeri Ayarları'ndaki <code>KomisyonKdvOran</code> ayarından okunur (kanal → pazaryeri → genel).
+                                Komisyonu henüz gelmemiş siparişlerin cirosu gelire girer ama gideri yoktur; bu tutar "Komisyonu Hesaplanmamış Ciro" kutusunda gösterilir.
+                            </div>
+                        </div>
+                    </div>
 
                     <!-- Filtre -->
                     <div class="card card-secondary card-outline mb-3">
@@ -1820,17 +1641,8 @@ $platformlar = platformListesi();
                                             <?php endforeach; ?>
                                         </select>
                                     </div>
-                                    <div class="col-md-2">
-                                        <label class="form-label small mb-1" title="Platform seçiliyken platformsuz kalemler (banka masrafları, kargo) rapora girmez">Platform</label>
-                                        <select class="form-select form-select-sm" id="fPlatform">
-                                            <option value="">Tümü</option>
-                                            <?php foreach ($platformlar as $pKod => $pAd): ?>
-                                            <option value="<?= htmlspecialchars($pKod) ?>"><?= htmlspecialchars($pAd) ?></option>
-                                            <?php endforeach; ?>
-                                        </select>
-                                    </div>
-                                    <div class="col-md-3">
-                                        <label class="form-label small mb-1" title="Seçenekler tarih, firma ve platform filtresine göre rapordan gelir; seçiliyse yalnız seçilen kırılımlar toplanır">Kırılım</label>
+                                    <div class="col-md-5">
+                                        <label class="form-label small mb-1" title="Seçenekler tarih ve firma filtresine göre rapordan gelir; seçiliyse yalnız seçilen kırılımlar toplanır">Kırılım</label>
                                         <select class="form-select form-select-sm" id="fKirilim" multiple></select>
                                     </div>
                                     <div class="col-md-2">
@@ -1893,14 +1705,14 @@ $platformlar = platformListesi();
 
     <!-- Kırılım detayı: kolonlar detay türüne göre JS'te kurulur (DETAY_KOLONLARI) -->
     <div class="modal fade" id="detayModal" tabindex="-1" aria-hidden="true">
-        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+        <div class="modal-dialog modal-xl modal-genis modal-fullscreen-md-down modal-dialog-scrollable">
             <div class="modal-content">
                 <div class="modal-header">
                     <h5 class="modal-title"><i class="bi bi-list-ul me-1" id="detayIkon"></i> <span id="detayBaslik"></span></h5>
                     <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Kapat"></button>
                 </div>
                 <div class="modal-body">
-                    <!-- Kaynak toplamı birden fazla detay türü içeriyorsa (ör. komisyon + banka masrafı) -->
+                    <!-- Kaynak toplamı birden fazla detay türü içeriyorsa -->
                     <ul class="nav nav-pills mb-2 d-none" id="detaySekmeler"></ul>
                     <div class="row g-2 align-items-end mb-2">
                         <div class="col-md-5">
@@ -1922,132 +1734,40 @@ $platformlar = platformListesi();
     <?php if ($ayarYetki): ?>
     <!-- Ayarlar -->
     <div class="modal fade" id="ayarModal" tabindex="-1" aria-hidden="true">
-        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+        <div class="modal-dialog modal-xl modal-genis modal-fullscreen-md-down modal-dialog-scrollable">
             <div class="modal-content">
                 <div class="modal-header">
                     <h5 class="modal-title"><i class="bi bi-gear me-1"></i> Gelir / Gider Ayarları</h5>
                     <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Kapat"></button>
                 </div>
                 <div class="modal-body">
-                    <ul class="nav nav-tabs mb-3" role="tablist">
-                        <li class="nav-item" role="presentation">
-                            <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#sekmeKurallar" type="button" role="tab">
-                                <i class="bi bi-bank me-1"></i> Banka Masraf Kuralları
-                            </button>
-                        </li>
-                        <li class="nav-item" role="presentation">
-                            <button class="nav-link" data-bs-toggle="tab" data-bs-target="#sekmeKaynaklar" type="button" role="tab">
-                                <i class="bi bi-diagram-3 me-1"></i> Gelir / Gider Kaynakları
-                            </button>
-                        </li>
-                    </ul>
-                    <div class="tab-content">
-                        <div class="tab-pane fade show active" id="sekmeKurallar" role="tabpanel">
-                            <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
-                                <small class="text-muted">
-                                    Banka BORÇ hareketi masraf sayılır: bankaca işaretliyse veya bir <b>dahil</b> desenine uyup hiçbir <b>hariç</b> desenine uymuyorsa.
-                                    Desen SQL LIKE biçimindedir (<code>%</code> herhangi metin, <code>_</code> tek karakter).
-                                </small>
-                                <button type="button" class="btn btn-sm btn-primary" id="btnYeniKural"><i class="bi bi-plus-lg"></i> Yeni Kural</button>
-                            </div>
-                            <div class="table-responsive">
-                                <table class="table table-sm table-hover mb-0" id="tblKurallar">
-                                    <thead>
-                                        <tr>
-                                            <th>Desen</th>
-                                            <th>Tip</th>
-                                            <th>Banka</th>
-                                            <th>Açıklama</th>
-                                            <th class="text-center">Durum</th>
-                                            <th class="text-end">İşlem</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody><tr><td colspan="6" class="text-muted">Yükleniyor...</td></tr></tbody>
-                                </table>
-                            </div>
-                        </div>
-                        <div class="tab-pane fade" id="sekmeKaynaklar" role="tabpanel">
-                            <div class="alert alert-info py-2 small mb-2">
-                                <i class="bi bi-info-circle me-1"></i> Kod ve tip sayfadaki sorgu fonksiyonuna bağlıdır, değiştirilemez.
-                                Yeni kaynak türü geliştirme gerektirir.
-                            </div>
-                            <div class="table-responsive">
-                                <table class="table table-sm table-hover mb-0" id="tblKaynaklar">
-                                    <thead>
-                                        <tr>
-                                            <th>Kod</th>
-                                            <th>Tip</th>
-                                            <th>Ad</th>
-                                            <th>Renk</th>
-                                            <th>İkon</th>
-                                            <th style="width:90px">Sıra</th>
-                                            <th>Açıklama</th>
-                                            <th class="text-center">Durum</th>
-                                            <th class="text-end">İşlem</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody></tbody>
-                                </table>
-                            </div>
-                        </div>
+                    <div class="alert alert-info py-2 small mb-2">
+                        <i class="bi bi-info-circle me-1"></i> Kod ve tip sayfadaki sorgu fonksiyonuna bağlıdır, değiştirilemez.
+                        Yeni kaynak türü geliştirme gerektirir.
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table table-sm table-hover mb-0" id="tblKaynaklar">
+                            <thead>
+                                <tr>
+                                    <th>Kod</th>
+                                    <th>Tip</th>
+                                    <th>Ad</th>
+                                    <th>Renk</th>
+                                    <th>İkon</th>
+                                    <th style="width:90px">Sıra</th>
+                                    <th>Açıklama</th>
+                                    <th class="text-center">Durum</th>
+                                    <th class="text-end">İşlem</th>
+                                </tr>
+                            </thead>
+                            <tbody></tbody>
+                        </table>
                     </div>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- Kural ekle / düzenle (ayar veya detay modalının üstünde açılır) -->
-    <div class="modal fade" id="kuralModal" tabindex="-1" aria-hidden="true">
-        <div class="modal-dialog modal-lg modal-dialog-scrollable">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h5 class="modal-title" id="kuralBaslik">Kural</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Kapat"></button>
-                </div>
-                <div class="modal-body">
-                    <input type="hidden" id="kId" value="0">
-                    <div class="row g-2">
-                        <div class="col-md-6">
-                            <label class="form-label small mb-1" for="kDesen">Desen <span class="text-danger">*</span></label>
-                            <input type="text" class="form-control form-control-sm" id="kDesen" maxlength="200" placeholder="%KOMİSYON%">
-                            <div class="form-text">En az bir <code>%</code> veya en az 3 karakter. Büyük/küçük harf duyarsız; I ve İ farklıdır.</div>
-                        </div>
-                        <div class="col-md-3">
-                            <label class="form-label small mb-1" for="kTip">Tip</label>
-                            <select class="form-select form-select-sm" id="kTip">
-                                <option value="dahil">Dahil (masraf say)</option>
-                                <option value="haric">Hariç (masraf sayma)</option>
-                            </select>
-                        </div>
-                        <div class="col-md-3">
-                            <label class="form-label small mb-1" for="kBanka">Banka</label>
-                            <select class="form-select form-select-sm" id="kBanka"></select>
-                        </div>
-                        <div class="col-md-9">
-                            <label class="form-label small mb-1" for="kAciklama">Açıklama</label>
-                            <input type="text" class="form-control form-control-sm" id="kAciklama" maxlength="300">
-                        </div>
-                        <div class="col-md-3 d-flex align-items-end">
-                            <div class="form-check form-switch mb-1">
-                                <input class="form-check-input" type="checkbox" role="switch" id="kDurum" name="kDurum" value="1" checked>
-                                <label class="form-check-label" for="kDurum">Aktif</label>
-                            </div>
-                        </div>
-                    </div>
-                    <hr>
-                    <div class="d-flex align-items-center gap-2 mb-2">
-                        <button type="button" class="btn btn-sm btn-outline-info" id="btnOnizle"><i class="bi bi-eye"></i> Önizle</button>
-                        <small class="text-muted" id="onizleKapsam"></small>
-                    </div>
-                    <div id="onizleSonuc"></div>
-                </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Vazgeç</button>
-                    <button type="button" class="btn btn-sm btn-primary" id="btnKuralKaydet"><i class="bi bi-check-lg"></i> Kaydet</button>
-                </div>
-            </div>
-        </div>
-    </div>
     <?php endif; ?>
 
     <?php include __DIR__ . '/../includes/scripts.php'; ?>
@@ -2063,6 +1783,10 @@ $platformlar = platformListesi();
         const kacis = (s) => $('<div>').text(s ?? '').html();
         const paraBicim = new Intl.NumberFormat('tr-TR', { style: 'currency', currency: 'TRY', minimumFractionDigits: 2, maximumFractionDigits: 2 });
         const para = (t) => paraBicim.format(Number(t) || 0);
+        /** Komisyon / Tutar oranı metni; pay veya payda yok ya da payda 0 ise '—' */
+        const oranYazi = (pay, payda) => (payda === null || payda === undefined || Number(payda) === 0 || pay === null || pay === undefined) ? '—'
+            : '%' + (Number(pay) / Number(payda) * 100).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const ORAN_IPUCU = 'Komisyon (KDV dahil) / komisyonu gelmiş kalemlerin tutarı. Pazaryerinin fiilen kestiği etkin oran; sözleşme oranıyla karşılaştırın.';
         const ayAdi = (ay) => {
             const [y, m] = ay.split('-').map(Number);
             return new Date(y, m - 1, 1).toLocaleDateString('tr-TR', { month: 'long', year: 'numeric' });
@@ -2073,7 +1797,7 @@ $platformlar = platformListesi();
         };
 
         // custom.js tüm .form-select kutularına "Seçiniz..." yer tutuculu Select2 kurar; kendi etiketiyle yeniden kurulur
-        [['#fFirma', 'Tüm firmalar'], ['#fPlatform', 'Tümü']].forEach(([sec, etiket]) => {
+        [['#fFirma', 'Tüm firmalar']].forEach(([sec, etiket]) => {
             const $s = $(sec);
             if ($s.hasClass('select2-hidden-accessible')) { $s.select2('destroy'); }
             initSelect2(sec, { placeholder: etiket, minimumResultsForSearch: 0 });
@@ -2118,7 +1842,6 @@ $platformlar = platformListesi();
         function filtreVerisi() {
             return {
                 firma_id:  $('#fFirma').val() || '',
-                platform:  $('#fPlatform').val() || '',
                 kirilim:   $('#fKirilim').val() || [],
                 bas_tarih: $('#fBas').val(),
                 bit_tarih: $('#fBit').val()
@@ -2211,10 +1934,12 @@ $platformlar = platformListesi();
         // Kırılım satırları → detay modalı (index ile bu listeden okunur; filtre rapor anındaki haliyle saklanır)
         let detayKayitlari = [];
         let kaynakToplamlari = {};   // kod → kaynak toplamı detayı (türe göre parçalar)
+        let ibFiltre = null;         // InfoBox detayı: ekrandaki raporun filtresi (firma_ad dahil)
+        let ibKomisyonsuz = null;    // InfoBox detayı: komisyonsuz özet {siparis, kalem, tutar}
 
         /**
          * Kaynağın tüm kırılım satırları → detay türüne göre parçalar (anahtarlar birleşir, satır firması yok:
-         * raporun firma / platform filtresi ve kırılım seçimi zaten satırlara yansımış). adet / tutar
+         * raporun firma filtresi ve kırılım seçimi zaten satırlara yansımış). adet / tutar
          * detay özetinin kartla karşılaştırması için satırlardan toplanır.
          */
         function kaynakParcalari(satirlar) {
@@ -2229,10 +1954,18 @@ $platformlar = platformListesi();
             return Object.values(parcalar);
         }
 
-        function kirilimSatir(k, s, filtre) {
+        /** Komisyon hariç tutar hücresi (yalnız satış kaynağında) */
+        function komHaricHucre(x, ekSinif) {
+            const net = Number(x.tutar || 0) - Number(x.komisyon || 0);
+            return '<td class="text-end tutar' + (ekSinif || '') + '" title="Komisyon (KDV dahil): ' + para(x.komisyon || 0) + '">' + para(net) + '</td>';
+        }
+
+        function kirilimSatir(k, s, filtre, oranli, komli) {
             const hucreler = '<td><span>' + kacis(s.alt_kirilim) + '</span></td><td>' + kacis(s.firma_adi) + '</td>'
                 + '<td class="text-end">' + Number(s.adet).toLocaleString('tr-TR') + '</td>'
-                + '<td class="text-end tutar">' + para(s.tutar) + '</td>';
+                + '<td class="text-end tutar">' + para(s.tutar) + '</td>'
+                + (komli ? komHaricHucre(s) : '')
+                + (oranli ? '<td class="text-end">' + oranYazi(s.tutar, s.baz) + '</td>' : '');
             if (!DETAY_KOLONLARI[s.detay_tur] || !Array.isArray(s.anahtarlar) || !s.anahtarlar.length) {
                 return '<tr>' + hucreler + '</tr>';
             }
@@ -2246,18 +1979,23 @@ $platformlar = platformListesi();
             const top = d.kaynakTop || {};
             detayKayitlari = [];
             kaynakToplamlari = {};
+            ibFiltre = filtre;
 
             $('#kirilimKartlari').html(kaynaklar.map(k => {
                 const satirlar = (d.kirilim || {})[k.kod] || [];
                 const t = top[k.kod] || { tutar: 0, adet: 0 };
                 const parcalar = kaynakParcalari(satirlar);
                 if (parcalar.length) {
-                    kaynakToplamlari[k.kod] = { kaynak: k.ad, alt: 'Toplam', firma: filtre.firma_ad, parcalar: parcalar, filtre: filtre };
+                    kaynakToplamlari[k.kod] = { kaynak: k.ad, tip: k.tip, alt: 'Toplam', firma: filtre.firma_ad, parcalar: parcalar, filtre: filtre };
                 }
                 const toplamSinif = parcalar.length ? ' kaynak-toplam" data-kod="' + kacis(k.kod) + '" title="Tüm kırılımların detayını göster' : '';
+                // Oran kolonu yalnız paydası (baz) olan kaynakta (komisyon)
+                const oranli = t.baz !== null && t.baz !== undefined;
+                // Komisyon hariç kolonu yalnız komisyonu taşıyan kaynakta (satış)
+                const komli = t.komisyon !== null && t.komisyon !== undefined;
                 const govde = satirlar.length
-                    ? satirlar.map(s => kirilimSatir(k, s, filtre)).join('')
-                    : '<tr><td colspan="4" class="text-center text-muted">Kayıt yok</td></tr>';
+                    ? satirlar.map(s => kirilimSatir(k, s, filtre, oranli, komli)).join('')
+                    : '<tr><td colspan="' + (4 + (oranli ? 1 : 0) + (komli ? 1 : 0)) + '" class="text-center text-muted">Kayıt yok</td></tr>';
 
                 return '<div class="col-12 col-xl-6 mb-3"><div class="card h-100" style="border-top:3px solid ' + kacis(k.renk) + '">'
                     + '<div class="card-header d-flex align-items-center gap-2">'
@@ -2269,10 +2007,16 @@ $platformlar = platformListesi();
                     + '<i class="bi bi-file-earmark-excel"></i></button>'
                     + '</div><div class="card-body p-0"><div class="table-responsive">'
                     + '<table class="table table-sm table-striped mb-0 kirilim-tablo"><thead><tr>'
-                    + '<th>Kırılım</th><th>Firma</th><th class="text-end">Adet</th><th class="text-end">Tutar</th></tr></thead>'
+                    + '<th>Kırılım</th><th>Firma</th><th class="text-end">Adet</th><th class="text-end">Tutar</th>'
+                    + (komli ? '<th class="text-end text-nowrap" title="Tutar − pazaryeri komisyonu (KDV dahil). Komisyonu henüz gelmemiş siparişlerde komisyon 0 sayılır.">Komisyon Hariç <i class="bi bi-question-circle"></i></th>' : '')
+                    + (oranli ? '<th class="text-end text-nowrap" title="' + ORAN_IPUCU + '">Kom. / Tutar <i class="bi bi-question-circle"></i></th>' : '')
+                    + '</tr></thead>'
                     + '<tbody>' + govde + '</tbody>'
                     + '<tfoot><tr class="fw-bold' + toplamSinif + '"><td colspan="2">Toplam</td><td class="text-end">' + Number(t.adet).toLocaleString('tr-TR') + '</td>'
-                    + '<td class="text-end tutar"><span class="toplam-tutar">' + para(t.tutar) + '</span></td></tr></tfoot>'
+                    + '<td class="text-end tutar"><span class="toplam-tutar">' + para(t.tutar) + '</span></td>'
+                    + (komli ? komHaricHucre(t) : '')
+                    + (oranli ? '<td class="text-end">' + oranYazi(t.tutar, t.baz) + '</td>' : '')
+                    + '</tr></tfoot>'
                     + '</table></div></div></div></div>';
             }).join(''));
 
@@ -2301,6 +2045,21 @@ $platformlar = platformListesi();
         let raporIstekNo = 0;   // art arda değişimde yalnız son isteğin yanıtı çizilir
         let sonFiltre = null;   // ekrandaki raporun filtresi (tablo bazlı Excel)
 
+        /** InfoBox: komisyonu hesaplanmamış ciro; rapor çizildikten sonra ayrı çağrı (uygulanan kırılımla) */
+        function komisyonsuzYukle(f, gelir, no) {
+            $('#ibKomisyonsuz').text('...');
+            $('#ibKomisyonsuzAlt').text('');
+            $.post('', Object.assign({ action: 'komisyonsuz' }, f), function (res) {
+                if (no !== raporIstekNo) return;
+                if (!res.success) { $('#ibKomisyonsuz').text('-'); showToast(res.message || 'Özet alınamadı', 'error'); return; }
+                const o = res.data;
+                ibKomisyonsuz = o;
+                const oran = gelir > 0 ? ' · %' + (o.tutar / gelir * 100).toLocaleString('tr-TR', { maximumFractionDigits: 1 }) + ' ciro' : '';
+                $('#ibKomisyonsuz').text(para(o.tutar)).toggleClass('text-warning', o.tutar > 0);
+                $('#ibKomisyonsuzAlt').text(sayi(o.siparis) + ' sipariş · ' + sayi(o.kalem) + ' kalem' + oran);
+            }, 'json').fail(() => { if (no === raporIstekNo) $('#ibKomisyonsuz').text('-'); });
+        }
+
         function raporYukle() {
             const f = filtreVerisi();
             if (!filtreGecerli(f)) return;
@@ -2315,13 +2074,18 @@ $platformlar = platformListesi();
                 f.kirilim = d.kirilimSecili || [];
                 sonFiltre = f;
                 ozetCiz(d.ozet);
+                // Gider kutusu: paydası olan gider kaynaklarının (komisyon) toplam oranı
+                const giderOranli = gorunenKaynaklar(d).filter(k => k.tip === 'gider' && (d.kaynakTop[k.kod] || {}).baz != null);
+                const gPay = giderOranli.reduce((a, k) => a + Number(d.kaynakTop[k.kod].tutar || 0), 0);
+                const gBaz = giderOranli.reduce((a, k) => a + Number(d.kaynakTop[k.kod].baz || 0), 0);
+                $('#ibGiderAlt').text(giderOranli.length ? 'Kom. / Tutar: ' + oranYazi(gPay, gBaz) : '');
                 atlananCiz(d.atlanan);
                 grafikCiz(d.aylar);
                 tabloCiz(d);
                 kirilimCiz(d, Object.assign({}, f, {
-                    firma_ad:    $('#fFirma option:selected').text() || 'Tüm firmalar',
-                    platform_ad: $('#fPlatform option:selected').text() || 'Tümü'
+                    firma_ad: $('#fFirma option:selected').text() || 'Tüm firmalar'
                 }));
+                komisyonsuzYukle(f, d.ozet.gelir, no);
             }, 'json')
             .fail(() => showToast('Sunucu hatası', 'error'))
             .always(() => { if (no === raporIstekNo) $('#btnFiltrele').prop('disabled', false); });
@@ -2329,7 +2093,7 @@ $platformlar = platformListesi();
 
         // ---------------------------------------------------------------
         $('#btnFiltrele').on('click', raporYukle);
-        $('#fFirma, #fPlatform').on('change', raporYukle);
+        $('#fFirma').on('change', raporYukle);
 
         // Çoklu seçimde her tıklama change üretir: kısa bekleme ile tek istek
         let kirilimZaman = null;
@@ -2342,7 +2106,6 @@ $platformlar = platformListesi();
             const $ilk = $('#fFirma option:first');
             clearTimeout(kirilimZaman);
             $('#fFirma').val($ilk.val()).trigger('change.select2');
-            $('#fPlatform').val('').trigger('change.select2');
             $('#fKirilim').val(null).trigger('change.select2');
             varsayilanTarihler();
             raporYukle();
@@ -2376,32 +2139,9 @@ $platformlar = platformListesi();
         });
 
         // ===============================================================
-        // Kırılım detayı (server-side) + Ayarlar (kurallar, kaynaklar)
+        // Kırılım detayı (server-side) + Ayarlar (kaynaklar)
         // ===============================================================
         const AYAR_YETKI = <?= $ayarYetki ? 'true' : 'false' ?>;
-        const s2Dil = { noResults: () => 'Sonuç bulunamadı', searching: () => 'Aranıyor...' };
-
-        function s2(sec, ebeveyn) {
-            $(sec).each(function () {
-                if ($(this).hasClass('select2-hidden-accessible')) $(this).select2('destroy');
-                $(this).select2({ theme: 'bootstrap-5', width: '100%', minimumResultsForSearch: 0, language: s2Dil,
-                                  dropdownParent: $(ebeveyn) });
-            });
-        }
-
-        const tipRozet = (tip) => tip === 'haric'
-            ? '<span class="badge text-bg-warning">Hariç</span>'
-            : '<span class="badge text-bg-success">Dahil</span>';
-
-        /** Açıklamanın ilk 40 karakterinden desen önerisi: rakam ve %_[ temizlenir */
-        const desenOneri = (a) => {
-            const s = String(a || '').slice(0, 40).replace(/[0-9%_\[]/g, '').replace(/\s+/g, ' ').trim();
-            return '%' + s + '%';
-        };
-
-        // Üst üste açılan modal: arkadaki modal karartılsın, kapanınca kaydırma kilidi geri gelsin
-        $(document).on('shown.bs.modal', '#kuralModal', () => $('.modal-backdrop').last().css('z-index', 1060));
-        $(document).on('hidden.bs.modal', '.modal', () => { if ($('.modal.show').length) $('body').addClass('modal-open'); });
 
         // ---------------------------------------------------------------
         // Kırılım detayı: tür → kolonlar. Kolon sırası sunucudaki siralama whitelist index'iyle aynıdır
@@ -2427,9 +2167,10 @@ $platformlar = platformListesi();
                       render: (v) => v ? v.split(' ¦ ').map((u) => '<div>' + kacis(u) + '</div>').join('') : '—' },
                     { title: 'Durum', data: 'durum', render: (v) => '<span class="badge text-bg-light border">' + kacis(v || '-') + '</span>' },
                     { title: 'Kalem', data: 'kalem', orderable: false, className: 'text-end', render: sayi },
-                    { title: 'Komisyon', data: 'komisyon', orderable: false, className: 'text-end tutar text-danger',
+                    { title: 'Komisyon (KDV Dahil)', data: 'komisyon', orderable: false, className: 'text-end tutar text-danger',
                       render: (v) => v === null ? '<span class="text-muted" title="Komisyon henüz yok: pazaryeri teslim sonrası bildirir">—</span>' : para(v) },
-                    { title: 'Tutar', data: 'tutar', className: 'text-end tutar', render: para }
+                    { title: 'Tutar (KDV Dahil)', data: 'tutar', className: 'text-end tutar', render: para },
+                    { title: '<span title="' + ORAN_IPUCU + '">Kom. / Tutar</span>', data: 'komisyon_yuzde', orderable: false, className: 'text-end', render: yuzde }
                 ]
             },
             komisyon_pazaryeri: {
@@ -2443,10 +2184,11 @@ $platformlar = platformListesi();
                     { title: 'Barkod', data: 'barkod', render: metin },
                     { title: 'Miktar', data: 'miktar', className: 'text-end', render: sayi },
                     { title: 'Kalem Tutarı', data: 'kalem_tutar', className: 'text-end tutar', render: para },
-                    { title: 'Komisyon Oranı', data: 'komisyon_oran', className: 'text-end', render: yuzde },
+                    { title: '<span title="Pazaryerinin bildirdiği oran (KDV hariç)">Komisyon Oranı</span>', data: 'komisyon_oran', className: 'text-end', render: yuzde },
                     { title: 'Komisyon (KDV Hariç)', data: 'komisyon_kdvsiz', orderable: false, className: 'text-end tutar', render: (v) => v === null ? '—' : para(v) },
                     { title: 'KDV', data: 'komisyon_kdv_oran', orderable: false, className: 'text-end', render: yuzde },
-                    { title: 'Komisyon (KDV Dahil)', data: 'komisyon_tutar', className: 'text-end tutar', render: (v) => v === null ? '—' : para(v) }
+                    { title: 'Komisyon (KDV Dahil)', data: 'komisyon_tutar', className: 'text-end tutar', render: (v) => v === null ? '—' : para(v) },
+                    { title: '<span title="' + ORAN_IPUCU + '">Kom. / Tutar</span>', data: 'etkin_oran', orderable: false, className: 'text-end fw-semibold', render: yuzde }
                 ],
                 // Komisyonu henüz gelmemiş kalem: soluk satır
                 satirSinif: (tr, r) => {
@@ -2455,45 +2197,23 @@ $platformlar = platformListesi();
                     }
                 }
             },
-            banka: {
-                ikon: 'bi-bank', ara: 'Açıklamada ara', birim: 'hareket',
+            komisyonsuz: {
+                ikon: 'bi-hourglass-split', ara: 'Sipariş no / ürün adı / barkod', birim: 'sipariş',
                 kolonlar: [
-                    { title: 'Tarih', data: 'tarih', render: metin },
-                    { title: 'Banka / IBAN', data: 'banka', render: (v, t, r) => kacis(v) + '<br><small class="text-muted">' + kacis(r.iban) + '</small>' },
-                    { title: 'Açıklama', data: 'aciklama', className: 'aciklama-hucre', render: metin },
-                    { title: 'Tutar', data: 'tutar', className: 'text-end tutar', render: para },
-                    { title: 'Kaynak', data: 'kural_desen', orderable: false, render: (v, t, r) => r.cost === 1
-                        ? '<span class="badge text-bg-secondary">Banka işareti</span>'
-                        : '<code>' + kacis(v) + '</code>' },
-                    { title: 'İşlem', data: null, orderable: false, className: 'text-center', render: (v, t, r) => {
-                        if (!AYAR_YETKI) return '';
-                        if (r.cost === 1) {
-                            return '<small class="text-muted" title="Banka entegrasyonunun işaretlediği satırlara hariç kuralı uygulanmaz">'
-                                 + '<i class="bi bi-info-circle"></i> Banka işaretli</small>';
-                        }
-                        return '<button type="button" class="btn btn-sm btn-outline-warning py-0 btn-haric-tut" title="Bu açıklama için hariç kuralı oluştur">'
-                             + '<i class="bi bi-slash-circle"></i> Hariç tut</button>';
-                    } }
-                ]
-            },
-            kargo: {
-                ikon: 'bi-truck', ara: 'Takip no / gönderici / alıcı', birim: 'gönderi',
-                kolonlar: [
-                    { title: 'Çıkış Tarihi', data: 'tarih', render: metin },
-                    { title: 'Yön', data: 'yon', render: (v) => v === 'GIDEN'
-                        ? '<span class="badge text-bg-primary">Giden</span>' : '<span class="badge text-bg-info">Gelen</span>' },
-                    { title: 'Takip No', data: 'takip_no', render: metin },
-                    { title: 'Gönderici', data: 'gonderici', render: metin },
-                    { title: 'Alıcı', data: 'alici', render: metin },
-                    { title: 'Alıcı İl', data: 'alici_il', render: metin },
-                    { title: 'Ödeme Tipi', data: 'odeme_tipi', render: metin },
-                    { title: 'Durum', data: 'durum', className: 'aciklama-hucre', render: metin },
-                    { title: 'Tutar', data: 'tutar', className: 'text-end tutar', render: para }
+                    { title: 'Sipariş Tarihi', data: 'tarih', render: metin },
+                    { title: 'Sipariş No', data: 'siparis_no', render: metin },
+                    { title: 'Pazaryeri', data: 'pazaryeri', render: metin },
+                    { title: 'Firma', data: 'firma', render: metin },
+                    { title: 'Ürün Adı', data: 'urun', className: 'aciklama-hucre', render: metin },
+                    { title: 'Barkod', data: 'barkod', render: metin },
+                    { title: 'Miktar', data: 'miktar', className: 'text-end', render: sayi },
+                    { title: 'Durum', data: 'durum', render: (v) => '<span class="badge text-bg-light border">' + kacis(v || '-') + '</span>' },
+                    { title: 'Kalem Tutarı', data: 'kalem_tutar', className: 'text-end tutar', render: para }
                 ]
             }
         };
 
-        let detayParam = null;   // {tur, anahtarlar, satir_firma_id, firma_id, platform, bas_tarih, bit_tarih}
+        let detayParam = null;   // {tur, anahtarlar, satir_firma_id, firma_id, bas_tarih, bit_tarih}
         let detayKayit = null;   // tıklanan kırılım satırı (başlık / özet metni için)
         let tblDetay   = null;
         let detayAraZaman = null;
@@ -2507,11 +2227,18 @@ $platformlar = platformListesi();
                 s += ' · ' + sayi(o.kalem) + ' kalem';
                 if (o.bos) s += ' <span class="text-muted">(' + sayi(o.bos) + ' kalemde komisyon henüz yok)</span>';
             }
-            s += ' · <b class="tutar">' + para(o.toplam) + '</b></span>';
+            s += ' · <b class="tutar">' + para(o.toplam) + '</b>';
+            // Komisyon detayında etkin oran: toplam komisyon / komisyonu gelmiş kalem tutarı
+            if (o.baz !== undefined) {
+                s += ' · <span title="' + ORAN_IPUCU + '">Kom. / Tutar: <b>' + oranYazi(o.toplam, o.baz) + '</b>'
+                   + ' <span class="text-muted">(' + para(o.baz) + ' üzerinden)</span></span>';
+            }
+            s += '</span>';
             if (json.ozet_filtre) {
                 const a = json.ozet_filtre;
                 s += '<span class="ms-3 text-muted">Aramaya uyan: ' + sayi(a.kalem !== undefined ? a.kalem : a.adet) + ' kayıt · '
-                   + '<span class="tutar">' + para(a.toplam) + '</span></span>';
+                   + '<span class="tutar">' + para(a.toplam) + '</span>'
+                   + (a.baz !== undefined ? ' · ' + oranYazi(a.toplam, a.baz) : '') + '</span>';
             }
             // Kırılım kartındaki rakamla aynı olmalı; farklıysa (ör. veri arada değişti) kullanıcı uyarılır
             if (detayKayit && (Number(o.adet) !== Number(detayKayit.adet) || Math.abs(Number(o.toplam) - Number(detayKayit.tutar)) > 0.005)) {
@@ -2566,7 +2293,8 @@ $platformlar = platformListesi();
             detayKayit = p;
             detayParam = {
                 tur: p.tur, anahtarlar: p.anahtarlar, satir_firma_id: p.satir_firma_id,
-                firma_id: f.firma_id, platform: f.platform, bas_tarih: f.bas_tarih, bit_tarih: f.bit_tarih
+                firma_id: f.firma_id, bas_tarih: f.bas_tarih, bit_tarih: f.bit_tarih,
+                kirilim: f.kirilim || []   // komisyonsuz detayı kapsamı kırılım seçiminden alır
             };
             const tanim = DETAY_KOLONLARI[p.tur];
             $('#detayIkon').attr('class', 'bi ' + tanim.ikon + ' me-1');
@@ -2584,7 +2312,7 @@ $platformlar = platformListesi();
             const f = a.filtre;
             detayAcilis = a;
             $('#detayBaslik').text(a.kaynak + ' – ' + a.alt + ' – ' + a.firma + ' (' + f.bas_tarih + ' – ' + f.bit_tarih + ')');
-            $('#detayKapsam').text('Filtre: ' + f.firma_ad + (f.platform ? ' · Platform: ' + f.platform_ad : ''));
+            $('#detayKapsam').text('Filtre: ' + f.firma_ad);
             $('#detaySekmeler').toggleClass('d-none', a.parcalar.length < 2).html(a.parcalar.map((p, i) =>
                 '<li class="nav-item"><button type="button" class="nav-link py-1" data-i="' + i + '">'
                 + '<i class="bi ' + DETAY_KOLONLARI[p.tur].ikon + ' me-1"></i>' + kacis(DETAY_AD[p.tur] || p.tur)
@@ -2607,6 +2335,38 @@ $platformlar = platformListesi();
         // Kaynak toplamı: kart altı Toplam satırı ve aylık tablodaki Genel Toplam hücresi
         $('#kirilimKartlari, #tblAylik').on('click', '.kaynak-toplam', function () {
             detayAc(kaynakToplamlari[$(this).data('kod')]);
+        });
+
+        /**
+         * InfoBox → detay modalı. gelir / gider: o tipteki kaynakların toplam parçaları (aynı tür birleşir),
+         * net: gelir + gider sekmeleri, komisyonsuz: anahtarsız tek parça (kapsam rapor filtresinden).
+         */
+        $('.ib-detay').on('click', function () {
+            if (!ibFiltre) { showToast('Rapor henüz yüklenmedi', 'warning'); return; }
+            const ib = $(this).data('ib');
+            const f = ibFiltre;
+
+            if (ib === 'komisyonsuz') {
+                if (!ibKomisyonsuz) { showToast('Özet henüz yüklenmedi', 'warning'); return; }
+                if (!ibKomisyonsuz.kalem) { showToast('Komisyonu hesaplanmamış kalem yok', 'info'); return; }
+                detayAc({ kaynak: 'Komisyonu Hesaplanmamış Ciro', alt: 'Tümü', firma: f.firma_ad, filtre: f,
+                          parcalar: [{ tur: 'komisyonsuz', anahtarlar: [], satir_firma_id: '',
+                                       adet: ibKomisyonsuz.siparis, tutar: ibKomisyonsuz.tutar }] });
+                return;
+            }
+
+            const tipler = ib === 'net' ? ['gelir', 'gider'] : [ib];
+            const parcalar = {};
+            Object.values(kaynakToplamlari).filter(t => tipler.includes(t.tip)).forEach(t => t.parcalar.forEach(p => {
+                const h = parcalar[p.tur] ??= { tur: p.tur, anahtarlar: [], satir_firma_id: '', adet: 0, tutar: 0 };
+                p.anahtarlar.forEach(a => { if (!h.anahtarlar.includes(a)) h.anahtarlar.push(a); });
+                h.adet  += p.adet;
+                h.tutar += p.tutar;
+            }));
+            const liste = Object.values(parcalar);
+            if (!liste.length) { showToast('Detay gösterilecek kayıt yok', 'info'); return; }
+            const ad = { gelir: 'Toplam Gelir', gider: 'Toplam Gider', net: 'Gelir ve Gider' }[ib];
+            detayAc({ kaynak: ad, alt: 'Tümü', firma: f.firma_ad, filtre: f, parcalar: liste });
         });
 
         // Tablo modal görünür olunca kurulur: scrollX kolon genişlikleri doğru hesaplanır
@@ -2638,13 +2398,6 @@ $platformlar = platformListesi();
             detayAraZaman = setTimeout(() => tblDetay && tblDetay.ajax.reload(), 400);
         });
 
-        $('#tblDetay').on('click', '.btn-haric-tut', function () {
-            const r = tblDetay.row($(this).closest('tr')).data();
-            if (!r) return;
-            kuralFormAc({ id: 0, desen: desenOneri(r.aciklama), tip: 'haric', banka_id: r.banka_id, banka_adi: r.banka,
-                          aciklama: '', durum: 1 });
-        });
-
         // ---------------------------------------------------------------
         // Ayarlar
         if (!AYAR_YETKI) {
@@ -2653,33 +2406,14 @@ $platformlar = platformListesi();
             return;
         }
 
-        let ayar = null;   // {kurallar, bankalar, kaynaklar}
+        let ayar = null;   // {kaynaklar}
 
         function ayarYukle() {
             return $.post('', { action: 'ayar_liste' }, null, 'json').then(function (res) {
                 if (!res.success) { showToast(res.message || 'Ayarlar alınamadı', 'error'); return $.Deferred().reject(); }
                 ayar = res.data;
-                kurallarCiz();
                 kaynaklarCiz();
             }, function () { showToast('Sunucu hatası', 'error'); });
-        }
-
-        function kurallarCiz() {
-            const liste = ayar.kurallar || [];
-            $('#tblKurallar tbody').html(liste.length ? liste.map(r =>
-                '<tr data-id="' + Number(r.id) + '">'
-                + '<td><code>' + kacis(r.desen) + '</code></td>'
-                + '<td>' + tipRozet(r.tip) + '</td>'
-                + '<td>' + (r.banka_id ? kacis(r.banka_adi || ('#' + r.banka_id)) : '<span class="text-muted">Tüm bankalar</span>') + '</td>'
-                + '<td><small>' + kacis(r.aciklama) + '</small></td>'
-                + '<td><div class="form-check form-switch d-flex justify-content-center">'
-                + '<input class="form-check-input kural-durum" type="checkbox" role="switch" id="kd_' + Number(r.id) + '"' + (Number(r.durum) ? ' checked' : '') + '>'
-                + '<label class="form-check-label" for="kd_' + Number(r.id) + '"></label></div></td>'
-                + '<td class="text-end text-nowrap">'
-                + '<button type="button" class="btn btn-sm btn-outline-primary py-0 btn-kural-duzenle" title="Düzenle"><i class="bi bi-pencil"></i></button> '
-                + '<button type="button" class="btn btn-sm btn-outline-danger py-0 btn-kural-sil" title="Sil"><i class="bi bi-trash"></i></button>'
-                + '</td></tr>').join('')
-                : '<tr><td colspan="6" class="text-center text-muted">Kural yok</td></tr>');
         }
 
         const renkHex = (r) => {
@@ -2724,128 +2458,6 @@ $platformlar = platformListesi();
             if (tblDetay && $('#detayModal').hasClass('show')) tblDetay.ajax.reload(null, false);
             raporYukle();
         }
-
-        // ---- Kural formu
-        s2('#kTip', '#kuralModal');
-
-        function bankaSecenekleri(seciliId, seciliAd) {
-            const $b = $('#kBanka').empty().append(new Option('Tüm bankalar', '', false, false));
-            (ayar.bankalar || []).forEach(b => $b.append(new Option(b.ad, b.id, false, false)));
-            // Pasif bankaya bağlı kural / hareket: listede yoksa eklenir ki değer kaybolmasın
-            if (seciliId && !$b.find('option[value="' + Number(seciliId) + '"]').length) {
-                $b.append(new Option((seciliAd || ('#' + seciliId)) + ' (pasif)', seciliId, false, false));
-            }
-            $b.val(seciliId ? String(seciliId) : '');
-            s2('#kBanka', '#kuralModal');
-        }
-
-        function kuralFormAc(k) {
-            const ac = () => {
-                $('#kId').val(k.id || 0);
-                $('#kDesen').val(k.desen || '');
-                $('#kTip').val(k.tip === 'haric' ? 'haric' : 'dahil').trigger('change.select2');
-                bankaSecenekleri(k.banka_id || '', k.banka_adi || '');
-                $('#kAciklama').val(k.aciklama || '');
-                $('#kDurum').prop('checked', k.durum === undefined ? true : !!Number(k.durum));
-                $('#kuralBaslik').text(k.id ? 'Kuralı Düzenle' : 'Yeni Kural');
-                $('#onizleSonuc').empty();
-                $('#onizleKapsam').text('');
-                bootstrap.Modal.getOrCreateInstance('#kuralModal').show();
-            };
-            // Detaydan açılırken banka listesi henüz yüklenmemiş olabilir
-            if (ayar) { ac(); } else { ayarYukle().then(ac); }
-        }
-
-        function kuralFormVerisi() {
-            return {
-                id:       $('#kId').val() || 0,
-                desen:    $.trim($('#kDesen').val()),
-                tip:      $('#kTip').val(),
-                banka_id: $('#kBanka').val() || '',
-                aciklama: $.trim($('#kAciklama').val()),
-                durum:    $('#kDurum').is(':checked') ? 1 : 0
-            };
-        }
-
-        function kuralFormGecerli(k) {
-            if (!k.desen) { showToast('Desen zorunludur', 'warning'); return false; }
-            if (k.desen.length > 200) { showToast('Desen en fazla 200 karakter olabilir', 'warning'); return false; }
-            if (k.desen.indexOf('%') === -1 && k.desen.length < 3) { showToast('Desen en az bir % içermeli veya en az 3 karakter olmalı', 'warning'); return false; }
-            return true;
-        }
-
-        $('#btnYeniKural').on('click', () => kuralFormAc({ id: 0, tip: 'dahil', durum: 1 }));
-
-        $('#tblKurallar').on('click', '.btn-kural-duzenle', function () {
-            const id = Number($(this).closest('tr').data('id'));
-            const r = (ayar.kurallar || []).find(x => Number(x.id) === id);
-            if (r) kuralFormAc(r);
-        });
-
-        $('#tblKurallar').on('click', '.btn-kural-sil', function () {
-            const id = Number($(this).closest('tr').data('id'));
-            const r = (ayar.kurallar || []).find(x => Number(x.id) === id);
-            if (!r || !confirm('"' + r.desen + '" kuralı kalıcı olarak silinecek. Emin misiniz?')) return;
-            $.post('', { action: 'kural_sil', id: id }, function (res) {
-                showToast(res.message || (res.success ? 'Silindi' : 'Silinemedi'), res.success ? 'success' : 'error');
-                if (res.success) degisiklikSonrasi();
-            }, 'json').fail(() => showToast('Sunucu hatası', 'error'));
-        });
-
-        $('#tblKurallar').on('change', '.kural-durum', function () {
-            const $c = $(this);
-            const durum = $c.is(':checked') ? 1 : 0;
-            $.post('', { action: 'kural_durum', id: $c.closest('tr').data('id'), durum: durum }, function (res) {
-                showToast(res.message || '', res.success ? 'success' : 'error');
-                if (res.success) { degisiklikSonrasi(); } else { $c.prop('checked', !durum); }
-            }, 'json').fail(() => { $c.prop('checked', !durum); showToast('Sunucu hatası', 'error'); });
-        });
-
-        $('#btnOnizle').on('click', function () {
-            const k = kuralFormVerisi();
-            const f = filtreVerisi();
-            if (!kuralFormGecerli(k) || !filtreGecerli(f)) return;
-
-            const $btn = $(this).prop('disabled', true);
-            $('#onizleKapsam').text(f.bas_tarih + ' – ' + f.bit_tarih + ' · ' + ($('#fFirma option:selected').text() || 'Tüm firmalar'));
-            $('#onizleSonuc').html('<div class="text-muted small">Hesaplanıyor...</div>');
-            $.post('', Object.assign({ action: 'kural_onizle' }, f, k), function (res) {
-                if (!res.success) { $('#onizleSonuc').empty(); showToast(res.message || 'Önizleme alınamadı', 'error'); return; }
-                const d = res.data;
-                const dahil = d.tip === 'dahil';
-                const ozet = '<div class="alert ' + (dahil ? 'alert-success' : 'alert-warning') + ' py-2 small mb-2">'
-                    + '<i class="bi ' + (dahil ? 'bi-plus-circle' : 'bi-dash-circle') + ' me-1"></i>'
-                    + 'Bu kural ile <b>' + Number(d.adet).toLocaleString('tr-TR') + '</b> hareket (<b>' + para(d.toplam) + '</b>) '
-                    + (dahil ? 'masrafa <b>eklenecek</b>.' : 'masraftan <b>çıkarılacak</b>.')
-                    + (d.adet > d.satirlar.length ? ' En büyük ' + d.satirlar.length + ' tanesi listelenir.' : '')
-                    + '</div>';
-                const tablo = d.satirlar.length
-                    ? '<div class="table-responsive"><table class="table table-sm table-striped mb-0 kirilim-tablo"><thead><tr>'
-                      + '<th>Tarih</th><th>Banka</th><th>Açıklama</th><th class="text-end">Tutar</th></tr></thead><tbody>'
-                      + d.satirlar.map(s => '<tr><td class="text-nowrap">' + kacis(s.tarih) + '</td>'
-                          + '<td>' + kacis(s.banka) + '<br><small class="text-muted">' + kacis(s.iban) + '</small></td>'
-                          + '<td>' + kacis(s.aciklama) + '</td><td class="text-end tutar">' + para(s.tutar) + '</td></tr>').join('')
-                      + '</tbody></table></div>'
-                    : '';
-                $('#onizleSonuc').html(ozet + tablo);
-            }, 'json')
-            .fail(() => { $('#onizleSonuc').empty(); showToast('Sunucu hatası', 'error'); })
-            .always(() => $btn.prop('disabled', false));
-        });
-
-        $('#btnKuralKaydet').on('click', function () {
-            const k = kuralFormVerisi();
-            if (!kuralFormGecerli(k)) return;
-            const $btn = $(this).prop('disabled', true);
-            $.post('', Object.assign({ action: 'kural_kaydet' }, k), function (res) {
-                showToast(res.message || '', res.success ? 'success' : 'error');
-                if (!res.success) return;
-                bootstrap.Modal.getOrCreateInstance('#kuralModal').hide();
-                degisiklikSonrasi();
-            }, 'json')
-            .fail(() => showToast('Sunucu hatası', 'error'))
-            .always(() => $btn.prop('disabled', false));
-        });
 
         // ---- Kaynaklar
         $('#tblKaynaklar').on('input', '.k-ikon', function () {
