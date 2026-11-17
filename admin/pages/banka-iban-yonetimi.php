@@ -282,8 +282,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             
             if ($search) {
-                $whereConditions[] = "(h.bankaHesap_iban LIKE ? OR h.bankaHesap_no LIKE ? OR h.bankaHesap_sube_adi LIKE ?)";
-                $params[] = "%$search%";
+                // IBAN boşluklu/boşluksuz yazılsa da bulunur
+                $ibanArama = strtoupper(preg_replace('/\s+/', '', $search));
+                $whereConditions[] = "(REPLACE(h.bankaHesap_iban, ' ', '') LIKE ? OR h.bankaHesap_no LIKE ? OR h.bankaHesap_sube_adi LIKE ?)";
+                $params[] = "%$ibanArama%";
                 $params[] = "%$search%";
                 $params[] = "%$search%";
             }
@@ -338,7 +340,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $firma_id = !empty($_POST['firma_id']) ? intval($_POST['firma_id']) : null;
             $apiKimlik_id = !empty($_POST['apiKimlik_id']) ? intval($_POST['apiKimlik_id']) : null;
             $swift = trim($_POST['swift'] ?? '');
-            $iban = trim($_POST['iban'] ?? '');
+            // IBAN tek biçimde saklanır: boşluksuz, büyük harf
+            $iban = strtoupper(preg_replace('/\s+/', '', $_POST['iban'] ?? ''));
             $hesap_no = trim($_POST['hesap_no'] ?? '');
             $sube_adi = trim($_POST['sube_adi'] ?? '');
             $sube_kodu = trim($_POST['sube_kodu'] ?? '');
@@ -354,12 +357,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new Exception('IBAN zorunludur');
             }
             
-            // Mükerrer IBAN kontrolü
+            // Mükerrer IBAN kontrolü (boşluk ve harf büyüklüğünden bağımsız)
             $ibanKontrol = $db->fetchOne(
-                "SELECT bankaHesap_id FROM Banka_Hesap WHERE bankaHesap_iban = ? AND bankaHesap_id != ?",
+                "SELECT TOP 1 bankaHesap_id, bankaHesap_durum FROM Banka_Hesap
+                 WHERE UPPER(REPLACE(bankaHesap_iban, ' ', '')) = ? AND bankaHesap_id != ?",
                 [$iban, $id]
             );
             if ($ibanKontrol) {
+                if ((int)$ibanKontrol['bankaHesap_durum'] === 0) {
+                    throw new Exception('Bu IBAN pasif olarak kayıtlı (Hesap ID: ' . $ibanKontrol['bankaHesap_id'] . '). '
+                        . 'Yeni kayıt açmak yerine listede "Durum: Pasif" filtresiyle bulup mevcut kaydı aktifleştirin.');
+                }
                 throw new Exception('Bu IBAN zaten kayıtlı! (Hesap ID: ' . $ibanKontrol['bankaHesap_id'] . ')');
             }
             
