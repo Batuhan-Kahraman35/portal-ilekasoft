@@ -273,6 +273,8 @@ class FaturaEslestirme
      *             o fatura başka bir siparişin tam adayı değil
      *   3. Zorunlu: siparişin tek adayı var; o faturayı paylaşan diğer siparişlerin
      *             hepsinin başka adayı var (fatura bu siparişe verilmezse sipariş açıkta kalır)
+     *   4. Grup:  tekil kural kalmayınca, aynı ürünlü N sipariş ↔ yalnız onlara ait N fatura
+     *             sırayla bağlanır (bkz. grupBagla)
      * Bağlanan fatura diğer siparişlerin adaylarından düşer; kalanlarda yeni
      * tekiller oluşabildiği için tur, yeni bağlama kalmayana kadar tekrarlanır.
      *
@@ -316,6 +318,10 @@ class FaturaEslestirme
             ", array_merge($params, [$this->userId, date('Y-m-d H:i:s')]));
 
             $adet = count($bagli ?: []);
+            if ($adet === 0) {
+                // Tekil kural kalmadı: birbirinin yerine geçebilen sipariş/fatura grupları
+                $adet = $this->grupBagla($kanalIdler);
+            }
             $toplam += $adet;
             if ($adet === 0) { break; }
         }
@@ -324,6 +330,106 @@ class FaturaEslestirme
             'eslesen'  => $toplam,
             'belirsiz' => $this->belirsizSayisi($kanalIdler),
         ];
+    }
+
+    /**
+     * Birbirinin yerine geçebilen siparişler (grup kuralı).
+     *
+     * Aynı müşterinin aynı ürün ve tutardaki N siparişi ile N faturası tekil kurallarla
+     * ayrılamaz (faturalarda sipariş no yok; ör. Örnek Holding panelinden kesilen e-Arşiv).
+     * Şu şartlarda grup sırayla bağlanır (en eski sipariş ↔ en küçük fatura no):
+     *   - Gruptaki her siparişin aday kümesi aynı N fatura
+     *   - Bu faturalar yalnız bu N siparişin adayı (fid_aday = N, dışarıya pay yok)
+     *   - Siparişlerin ürünleri (stok kodu/ad + miktar) birebir aynı
+     * Hangi faturanın hangi siparişe gittiği içerik olarak fark etmez; her sipariş bir
+     * fatura alır, hiçbir fatura iki kez kullanılmaz.
+     *
+     * @return int Bağlanan sipariş sayısı
+     */
+    private function grupBagla(array $kanalIdler)
+    {
+        [$cte, $params] = $this->adayCte($kanalIdler);
+        $satirlar = $this->db->fetchAll($cte . "
+            SELECT t.sid, t.fid, t.sid_aday, t.fid_aday,
+                   CONVERT(VARCHAR(19), s.PazaryeriSiparisleri_SiparisTarihi, 120) AS sip_trh,
+                   f.Faturalar_FaturaNo AS fno
+            FROM say t
+            INNER JOIN dbo.PazaryeriSiparisleri s ON s.PazaryeriSiparisleri_id = t.sid
+            INNER JOIN dbo.Faturalar f            ON f.Faturalar_id = t.fid
+            WHERE t.sid_aday > 1
+            " . self::IPUCU, $params) ?: [];
+        if (!$satirlar) { return 0; }
+
+        // Sipariş → aday faturalar (tam küme); aday kümesi anahtarına göre gruplar
+        $sipFat  = [];
+        $sipTrh  = [];
+        $fatNo   = [];
+        $fatAday = [];
+        foreach ($satirlar as $r) {
+            $sipFat[(int)$r['sid']][] = (int)$r['fid'];
+            $sipTrh[(int)$r['sid']]   = (string)$r['sip_trh'];
+            $fatNo[(int)$r['fid']]    = (string)$r['fno'];
+            $fatAday[(int)$r['fid']]  = (int)$r['fid_aday'];
+        }
+        $gruplar = [];
+        foreach ($sipFat as $sid => $fidler) {
+            sort($fidler);
+            // Kümedeki her fatura yalnız N siparişin adayı olmalı (gruba dışarıdan pay yok)
+            $n = count($fidler);
+            if (array_filter($fidler, fn($f) => $fatAday[$f] !== $n)) { continue; }
+            $gruplar[implode(',', $fidler)][] = $sid;
+        }
+        if (!$gruplar) { return 0; }
+
+        // Ürün imzası (aynı ürün/miktar şartı)
+        $imza = [];
+        $tumSid = array_merge(...array_values($gruplar));
+        foreach ($this->db->fetchAll("
+            SELECT PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id AS sid,
+                   ISNULL(NULLIF(LTRIM(RTRIM(PazaryeriSiparisKalemleri_StokKodu)), ''), PazaryeriSiparisKalemleri_UrunAdi) AS urun,
+                   PazaryeriSiparisKalemleri_Miktar AS miktar
+            FROM dbo.PazaryeriSiparisKalemleri
+            WHERE PazaryeriSiparisKalemleri_Durum = 1
+              AND PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id IN (" . implode(',', $tumSid) . ")
+        ") ?: [] as $k) {
+            $imza[(int)$k['sid']][] = mb_strtoupper(trim((string)$k['urun'])) . '×' . (float)$k['miktar'];
+        }
+
+        $bagli = 0;
+        foreach ($gruplar as $anahtar => $sidler) {
+            $fidler = array_map('intval', explode(',', $anahtar));
+            if (count($sidler) !== count($fidler)) { continue; }
+
+            $imzalar = [];
+            foreach ($sidler as $sid) {
+                $i = $imza[$sid] ?? [];
+                sort($i);
+                $imzalar[implode('|', $i)] = true;
+            }
+            if (count($imzalar) !== 1 || array_key_first($imzalar) === '') { continue; }
+
+            usort($sidler, fn($a, $b) => [$sipTrh[$a], $a] <=> [$sipTrh[$b], $b]);
+            usort($fidler, fn($a, $b) => [$fatNo[$a], $a] <=> [$fatNo[$b], $b]);
+
+            foreach ($sidler as $i => $sid) {
+                // bagla() ile aynı koruma: sipariş hâlâ faturasız, fatura hâlâ boşta
+                $ok = $this->db->fetchOne("
+                    UPDATE s
+                       SET s.PazaryeriSiparisleri_Faturalar_id         = ?,
+                           s.PazaryeriSiparisleri_GuncelleyenKullanici = ?,
+                           s.PazaryeriSiparisleri_GuncellemeTarihi     = ?
+                    OUTPUT inserted.PazaryeriSiparisleri_id
+                    FROM dbo.PazaryeriSiparisleri s
+                    LEFT JOIN dbo.Faturalar mf ON mf.Faturalar_id = s.PazaryeriSiparisleri_Faturalar_id
+                    WHERE s.PazaryeriSiparisleri_id = ?
+                      AND (mf.Faturalar_id IS NULL OR mf.Faturalar_IptalDurumu = 1)
+                      AND NOT EXISTS (SELECT 1 FROM dbo.PazaryeriSiparisleri p
+                                      WHERE p.PazaryeriSiparisleri_Faturalar_id = ?)
+                ", [$fidler[$i], $this->userId, date('Y-m-d H:i:s'), $sid, $fidler[$i]]);
+                if ($ok) { $bagli++; }
+            }
+        }
+        return $bagli;
     }
 
     /**

@@ -574,16 +574,49 @@ class HepsiburadaApi extends PazaryeriApi
      * NOT: Alan adları canlı veriyle doğrulanmamıştır (mağazada iade yoktu);
      * birden fazla olası ad denenerek yazılmıştır.
      */
+    /**
+     * Hepsiburada talebi → nötr iade
+     *
+     * Yanıt yapısı [CANLI 17.11.2026]: talep başına TEK kalem, düz alanlar —
+     * status, claimType, quantity, priceAmount, totalPriceAmount, refundAmount,
+     * Reason, explanation, MerchantSku, sku, customerName. Barkod / ürün adı yok.
+     *
+     * claimType iade olmayan talepleri de kapsar: MissingInvoice (eksik fatura),
+     * MissingItem (eksik ürün), RenewProduct (değişim). Bunlarda iade adedi ve tutarı
+     * 0 / boş yazılır; aksi halde sipariş "tamamen iade" sayılırdı
+     * (FaturaKesim::iadeDurumSql adet ve tutara bakar).
+     */
     private function iadeNotrle(array $i)
     {
+        $tur    = (string)($i['claimType'] ?? '');
+        $iadeMi = in_array($tur, ['Return', 'UndeliveredProduct'], true);
+        $durum  = $this->iadeDurumKodu($i['status'] ?? '');
+        $adet   = (int)($i['quantity'] ?? 1);
+        $sebep  = $i['Reason'] ?? ($i['claimReason'] ?? ($i['reason'] ?? null));
+        $toplam = $this->tutar($i['totalPriceAmount'] ?? ($i['totalPrice'] ?? null));
+
         $kalemler = [];
-        foreach ($i['items'] ?? ($i['claimItems'] ?? []) as $it) {
+        if (!empty($i['items']) || !empty($i['claimItems'])) {
+            // Eski / farklı yanıt biçimi
+            foreach (!empty($i['items']) ? $i['items'] : $i['claimItems'] as $it) {
+                $kalemler[] = [
+                    'barkod'  => $it['productBarcode'] ?? ($it['barcode'] ?? null),
+                    'urunAdi' => $it['productName']    ?? null,
+                    'miktar'  => $iadeMi ? (int)($it['quantity'] ?? 1) : 0,
+                    'talep'   => (int)($it['quantity'] ?? 1),
+                    'fiyat'   => $this->tutar($it['price'] ?? null),
+                    'sebep'   => $it['claimReason'] ?? ($it['reason'] ?? null)
+                ];
+            }
+        } else {
             $kalemler[] = [
-                'barkod'  => $it['productBarcode'] ?? ($it['barcode'] ?? null),
-                'urunAdi' => $it['productName']    ?? null,
-                'miktar'  => (int)($it['quantity'] ?? 1),
-                'fiyat'   => $this->tutar($it['price'] ?? null),
-                'sebep'   => $it['claimReason'] ?? ($it['reason'] ?? null)
+                'barkod'  => $i['MerchantSku'] ?? ($i['sku'] ?? null),
+                'urunAdi' => null,
+                'miktar'  => $iadeMi ? $adet : 0,   // iade adedi (iade olmayan talep türünde 0)
+                'talep'   => $adet,
+                'fiyat'   => $this->tutar($i['priceAmount'] ?? null),
+                'sebep'   => $sebep,
+                'tur'     => $tur ?: null
             ];
         }
 
@@ -591,27 +624,32 @@ class HepsiburadaApi extends PazaryeriApi
             'disId'      => (string)($i['id'] ?? ($i['claimId'] ?? '')),
             'siparisNo'  => (string)($i['orderNumber'] ?? ''),
             'paketNo'    => (string)($i['packageNumber'] ?? ''),
-            'durumKod'   => $this->iadeDurumKodu($i['status'] ?? ''),
-            'hamDurum'   => $i['status'] ?? null,
-            'sebep'      => $i['claimReason'] ?? ($i['reason'] ?? null),
-            'aciklama'   => $i['customerNote'] ?? ($i['description'] ?? null),
+            'durumKod'   => $durum,
+            'hamDurum'   => trim(($i['status'] ?? '') . ($tur !== '' && $tur !== 'Return' ? ' · ' . $tur : '')) ?: null,
+            'sebep'      => $sebep,
+            'aciklama'   => $i['explanation'] ?? ($i['customerNote'] ?? ($i['description'] ?? null)),
             'musteriAdi' => $i['customerName'] ?? null,
-            'tutar'      => $this->tutar($i['totalPrice'] ?? ($i['price'] ?? null)),
-            'iadeTarihi' => $this->isoTarih($i['createdDate'] ?? ($i['claimDate'] ?? null)),
+            'tutar'      => $iadeMi ? $toplam : null,
+            'iadeTarihi' => $this->isoTarih($i['claimDate'] ?? ($i['createdDate'] ?? null)),
             'kalemler'   => $kalemler,
             'ham'        => $i
         ];
     }
 
+    /**
+     * status → nötr kod. Hepsiburada: NewRequest, AwaitingAction (açık) ·
+     * Accepted, Refunded (onaylandı) · Rejected · Cancelled
+     */
     private function iadeDurumKodu($durum)
     {
         $d = strtolower((string)$durum);
-        if (strpos($d, 'open') !== false || strpos($d, 'waiting') !== false
-            || strpos($d, 'created') !== false)                  return 'acik';
-        if (strpos($d, 'approve') !== false
+        if (strpos($d, 'refund')  !== false || strpos($d, 'approve') !== false
             || strpos($d, 'accept') !== false)                   return 'onaylandi';
         if (strpos($d, 'reject') !== false)                      return 'reddedildi';
         if (strpos($d, 'cancel') !== false)                      return 'iptal';
+        if (strpos($d, 'open') !== false || strpos($d, 'waiting') !== false
+            || strpos($d, 'awaiting') !== false || strpos($d, 'new') !== false
+            || strpos($d, 'created') !== false)                  return 'acik';
         return 'diger';
     }
 

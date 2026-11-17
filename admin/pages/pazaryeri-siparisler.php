@@ -118,7 +118,7 @@ function tarihGecerli($t)
 /**
  * Fatura filtresi → SQL koşulu (alias: s). Liste filtresi ve InfoBox sayımı aynı koşulu kullanır.
  * Faturalar_KesimDurumu: senkronla bağlanmış eski faturalarda boş, Durum = 1.
- *   yok          → iptal/iade dışı, geçerli (iptal edilmemiş) faturası olmayan
+ *   yok          → iptal/iade dışı (pazaryeri iade kaydıyla tam iade dahil), geçerli faturası olmayan
  *   taslak       → taslak fatura
  *   kesildi      → kesinleşmiş/gönderilmiş fatura
  *   hata         → hatalı ya da sonucu belirsiz kesim
@@ -131,9 +131,11 @@ function faturaFiltreSql($tur)
                           WHERE fa.Faturalar_id = s.PazaryeriSiparisleri_Faturalar_id AND %s)";
     switch ($tur) {
         case 'yok':
+            // Pazaryeri iade kaydıyla tamamen iade edilenler de hariç (sipariş durumu "teslim" kalır)
             return "(ISNULL(s.PazaryeriSiparisleri_DurumKod, '') NOT IN ('iptal', 'iade')
                      AND (s.PazaryeriSiparisleri_Faturalar_id IS NULL OR NOT "
-                 . sprintf($faturaVar, "fa.Faturalar_Durum = 1 AND fa.Faturalar_IptalDurumu = 0") . "))";
+                 . sprintf($faturaVar, "fa.Faturalar_Durum = 1 AND fa.Faturalar_IptalDurumu = 0") . ")
+                     AND ISNULL(" . FaturaKesim::iadeDurumSql('s') . ", '') <> 'tam')";
         case 'taslak':
             return sprintf($faturaVar, "fa.Faturalar_KesimDurumu = 'TASLAK'");
         case 'kesildi':
@@ -154,7 +156,8 @@ function faturaFiltreSql($tur)
                                    AND fa.Faturalar_FaturaNo LIKE '[A-Z0-9][A-Z0-9][A-Z0-9]' + REPLICATE('[0-9]', 13)
                                    AND RIGHT(fa.Faturalar_FaturaNo, 9) <> '000000000'))") . "
                      AND NOT (ISJSON(s.PazaryeriSiparisleri_HamVeri) = 1
-                              AND NULLIF(JSON_VALUE(s.PazaryeriSiparisleri_HamVeri, '$.invoiceLink'), '') IS NOT NULL))";
+                              AND NULLIF(JSON_VALUE(s.PazaryeriSiparisleri_HamVeri, '$.invoiceLink'), '') IS NOT NULL)
+                     AND ISNULL(" . FaturaKesim::iadeDurumSql('s') . ", '') <> 'tam')";
     }
     return '';
 }
@@ -385,6 +388,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         hv.PyFaturaLink,
                         hv.PyFaturaAlanVar,
                         pfi.PyFaturaIptal,
+                        -- Pazaryeri iade kaydı: tam | kismi | acik | NULL (yalnız sayfa satırları)
+                        " . FaturaKesim::iadeDurumSql('s') . " AS IadeDurum,
                         k.EntegrasyonKanallari_Ad,
                         p.Pazaryerleri_Ad,
                         p.Pazaryerleri_Renk,
@@ -445,7 +450,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     unset($r['Pazaryerleri_Yetenekler']);
                     $kesin = $r['Faturalar_Durum'] !== null && FaturaKesim::kesinlesmisMi($r);
                     $r['fatura_kesinlesmis'] = $kesin;
-                    $r['fatura_kesilebilir'] = !$kesin && $r['PazaryeriSiparisleri_DurumKod'] !== 'iptal';
+                    $tamIade = $r['IadeDurum'] === 'tam';
+                    $r['fatura_kesilebilir'] = !$kesin && $r['PazaryeriSiparisleri_DurumKod'] !== 'iptal' && !$tamIade;
 
                     // Pazaryerine fatura bildirimi:
                     //   evet       → portal bildirdi ya da pazaryeri kaydında fatura linki var
@@ -457,11 +463,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $r['bildirim_durum'] = null;
                     $yet = (array)$r['yetenekler'];
                     if (!empty($yet['faturaBildirim'])) {
-                        if ($bildirimVar && (int)($r['PyFaturaIptal'] ?? 0) === 1) {
+                        $aktifFatura = $r['Faturalar_Durum'] !== null && (int)$r['Faturalar_IptalDurumu'] === 0;
+                        if ($tamIade && !$aktifFatura) {
+                            // İade edilen siparişte bildirim beklenmez; duran link iade öncesine ait
+                            $r['bildirim_durum'] = $bildirimVar ? 'iade' : null;
+                        } elseif ($bildirimVar && (int)($r['PyFaturaIptal'] ?? 0) === 1) {
                             $r['bildirim_durum'] = 'iptal';
                         } elseif ($bildirimVar) {
                             $r['bildirim_durum'] = 'evet';
-                        } elseif ($kesin && $r['PazaryeriSiparisleri_DurumKod'] !== 'iptal') {
+                        } elseif ($kesin && $r['PazaryeriSiparisleri_DurumKod'] !== 'iptal' && !$tamIade) {
                             $r['bildirim_durum'] = ((int)$r['PyFaturaAlanVar'] === 1 || !empty($r['PazaryeriSiparisleri_FaturaBildirimHata']))
                                 ? 'hayir' : 'bilinmiyor';
                         }
@@ -1438,6 +1448,15 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                     ? '<a href="' + kacis(r.PyFaturaLink) + '" target="_blank" rel="noopener" class="text-decoration-none">' + rozet + '</a>'
                     : rozet;
             }
+            if (d === 'iade') {
+                // İade edilen sipariş: pazaryerindeki link iade öncesi (iptal edilmiş) faturaya ait
+                const rozet = '<span class="badge text-bg-secondary durum-rozet" title="'
+                    + kacis('Sipariş iade edildi; pazaryerindeki fatura linki iade öncesine ait' + (r.PyFaturaNo ? ' (' + r.PyFaturaNo + ')' : '')
+                            + '. Bildirim gerekmez.') + '">B</span>';
+                return /^https?:\/\//i.test(r.PyFaturaLink || '')
+                    ? '<a href="' + kacis(r.PyFaturaLink) + '" target="_blank" rel="noopener" class="text-decoration-none">' + rozet + '</a>'
+                    : rozet;
+            }
             const tikla = BILDIREBILIR ? ' — tıklayın: pazaryerine bildir' : '';
             if (d === 'iptal') {
                 return bildirLinki(r, '<span class="badge durum-rozet bildirim-yok" title="'
@@ -1506,8 +1525,25 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                 }
             }
             const b = bildirimRozeti(r, no);
-            if (!ust && !b) return '<span class="text-muted small">-</span>';
-            return '<span class="d-inline-flex gap-1 align-middle">' + ust + b + '</span>' + alt;
+            // Pazaryeri iade kaydı (sipariş durumu "teslim" kalsa da)
+            const IADE = {
+                tam:   ['text-bg-danger',  'İade',   'Sipariş iade edildi (pazaryerinde onaylandı); fatura kesilmez'],
+                kismi: ['text-bg-warning', 'K.İade', 'Kısmi iade onaylandı; iade edilen kalemler için iade faturası gerekebilir'],
+                acik:  ['text-bg-light border', 'İade?', 'Sonuçlanmamış iade talebi var']
+            };
+            let iade = '';
+            const ih = IADE[r.IadeDurum];
+            if (ih) {
+                let t = ih[2];
+                // Tam iade edilen siparişte iptal edilmemiş fatura duruyorsa iptal / iade faturası gerekir
+                if (r.IadeDurum === 'tam' && r.PazaryeriSiparisleri_Faturalar_id && r.Faturalar_Durum !== null
+                    && String(r.Faturalar_IptalDurumu) !== '1') {
+                    t = 'Sipariş iade edildi; fatura (' + (no || '-') + ') aktif. İadenin muhasebe kaydı (fatura iptali / iade belgesi) kontrol edilmeli';
+                }
+                iade = '<span class="badge ' + ih[0] + ' durum-rozet" title="' + kacis(t) + '">' + ih[1] + '</span>';
+            }
+            if (!ust && !b && !iade) return '<span class="text-muted small">-</span>';
+            return '<span class="d-inline-flex gap-1 align-middle">' + iade + ust + b + '</span>' + alt;
         }
 
         // Toplu taslak seçimi: id → {no, musteri}; sayfalar arası korunur, filtre değişince temizlenir
@@ -1971,8 +2007,11 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
         initSelect2('#faturaTbKanal', { dropdownParent: $('#faturaModal'), minimumResultsForSearch: 0, allowClear: false });
 
         function faturaButonlari(durum) {
-            // durum: 'yukleniyor' | 'hazir' | 'belirsiz' | 'kapali'
-            $('#btnFaturaTaslak, #btnFaturaKes').prop('disabled', durum !== 'hazir');
+            // durum: 'yukleniyor' | 'hazir' | 'engelli' | 'belirsiz' | 'kapali'
+            // engelli: sipariş başka yerden kesin faturalanmış / kontrol yapılamadı → yalnız taslak
+            $('#btnFaturaTaslak').prop('disabled', durum !== 'hazir' && durum !== 'engelli');
+            $('#btnFaturaKes').prop('disabled', durum !== 'hazir')
+                .attr('title', durum === 'engelli' ? 'Çift fatura kontrolü kesin kesime izin vermiyor' : '');
             $('#btnFaturaTekrar').toggleClass('d-none', durum !== 'belirsiz');
             $tbKanal.prop('disabled', durum === 'yukleniyor');
         }
@@ -2040,6 +2079,12 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                         + kacis(m.aciklama || '-') + '</div>';
                 }
             }
+            // Sunucu kesin kesimi bu durumlarda zaten reddeder; buton baştan kapatılır
+            const cift = o.cift || {};
+            if (durum === 'hazir' && !(o.kanal && o.kanal.test)) {
+                if (cift.durum === 'iade') durum = 'kapali';          // tamamen iade: taslak da yok
+                else if (cift.durum === 'kesin' || cift.durum === 'hata') durum = 'engelli';
+            }
             if (v.uyarilar.length) {
                 html += '<div class="alert alert-warning py-2"><ul class="mb-0 ps-3">'
                     + v.uyarilar.map(u => '<li>' + kacis(u) + '</li>').join('') + '</ul></div>';
@@ -2090,7 +2135,7 @@ $duzenleyebilir = !empty($pagePermissions['can_edit']);
                         $('#faturaIsleniyor').remove();
                         faturaButonlari('hazir');
                         const liste = ((res.cift && res.cift.faturalar) || []).map(f =>
-                            '<li><b>' + kacis(f.no || '?') + '</b> ' + kacis(f.tarih || '') + ' · ' + kacis(f.unvan || '')
+                            '<li><b>' + kacis(f.no || 'numarasız') + '</b> ' + kacis(f.tarih || '') + ' · ' + kacis(f.unvan || '')
                             + (f.tutar !== null && f.tutar !== undefined ? ' · ' + paraFormat(f.tutar, v.para) : '')
                             + ' <span class="text-muted small">(' + kacis(f.kaynak || '') + ')</span></li>').join('');
                         Swal.fire({

@@ -431,7 +431,7 @@ class FaturaKesim
         // o durumda kendi faturası Örnek Holding'de oluşmuş olabilir)
         if (!$taslak && !$belirsizTekrar && !$api->testMi()) {
             $cift = $this->ciftFaturaKontrol($belge);
-            if ($cift['durum'] === 'kesin' || $cift['durum'] === 'hata') {
+            if (in_array($cift['durum'], ['kesin', 'iade', 'hata'], true)) {
                 return ['success' => false, 'cift' => $cift, 'message' => $cift['mesaj']];
             }
             if ($cift['durum'] === 'olasi' && !$ciftOnay) {
@@ -805,6 +805,75 @@ class FaturaKesim
     }
 
     /**
+     * Siparişin iade durumu (pazaryeri iade kayıtlarından, PazaryeriIadeler) — SQL ifadesi.
+     * Sipariş durumu iadeyi göstermez (Trendyol iade edilen siparişte de "Delivered" kalır).
+     *
+     *   'tam'   → onaylanmış iade adedi ≥ sipariş adedi (ya da iade tutarı ≥ sipariş tutarı)
+     *   'kismi' → onaylanmış iade var, siparişin tamamı değil
+     *   'acik'  → yalnız sonuçlanmamış iade talebi
+     *   NULL    → iade yok (iptal / reddedilen talepler sayılmaz)
+     *
+     * Adet iade kalemlerinin nötr "miktar" alanından (iptal / reddedilen hariç) okunur.
+     *
+     * @param string $s Sipariş tablosunun takma adı
+     */
+    public static function iadeDurumSql($s = 's')
+    {
+        return "(SELECT CASE
+                    WHEN ia.onay_adet > 0 AND (
+                            (sk.adet > 0 AND ia.onay_adet >= sk.adet)
+                         OR ($s.PazaryeriSiparisleri_ToplamTutar > 0
+                             AND ia.onay_tutar >= $s.PazaryeriSiparisleri_ToplamTutar - " . self::TOPLAM_TOLERANS . "))
+                        THEN 'tam'
+                    WHEN ia.onay_adet > 0 THEN 'kismi'
+                    WHEN ia.acik > 0      THEN 'acik'
+                 END
+                 FROM (
+                     SELECT SUM(CASE WHEN i.PazaryeriIadeler_DurumKod = 'onaylandi' THEN ISNULL(q.adet, 0) END) AS onay_adet,
+                            SUM(CASE WHEN i.PazaryeriIadeler_DurumKod = 'onaylandi' THEN ISNULL(i.PazaryeriIadeler_Tutar, 0) END) AS onay_tutar,
+                            SUM(CASE WHEN i.PazaryeriIadeler_DurumKod = 'acik' THEN 1 ELSE 0 END) AS acik
+                     FROM dbo.PazaryeriIadeler i
+                     OUTER APPLY (
+                         SELECT SUM(TRY_CAST(JSON_VALUE(u.value, '$.miktar') AS DECIMAL(18, 3))) AS adet
+                         FROM OPENJSON(CASE WHEN ISJSON(i.PazaryeriIadeler_Urunler) = 1 THEN i.PazaryeriIadeler_Urunler ELSE '[]' END) u
+                     ) q
+                     WHERE i.PazaryeriIadeler_EntegrasyonKanallari_id = $s.PazaryeriSiparisleri_EntegrasyonKanallari_id
+                       AND i.PazaryeriIadeler_SiparisNo = $s.PazaryeriSiparisleri_SiparisNo
+                       AND i.PazaryeriIadeler_Durum = 1
+                 ) ia
+                 CROSS APPLY (
+                     SELECT SUM(kk.PazaryeriSiparisKalemleri_Miktar) AS adet
+                     FROM dbo.PazaryeriSiparisKalemleri kk
+                     WHERE kk.PazaryeriSiparisKalemleri_PazaryeriSiparisleri_id = $s.PazaryeriSiparisleri_id
+                       AND kk.PazaryeriSiparisKalemleri_Durum = 1
+                 ) sk)";
+    }
+
+    /** Siparişin iade durumu: 'tam' | 'kismi' | 'acik' | null (bkz. iadeDurumSql) */
+    public function iadeDurumu($siparisId)
+    {
+        $r = $this->db->fetchOne("SELECT " . self::iadeDurumSql('s') . " AS d
+                                  FROM dbo.PazaryeriSiparisleri s WHERE s.PazaryeriSiparisleri_id = ?", [(int)$siparisId]);
+        return $r['d'] ?? null;
+    }
+
+    /** Siparişin son onaylanmış iadesi (sebep, tarih) — mesajlar için */
+    public function sonIade($siparisId)
+    {
+        return $this->db->fetchOne("
+            SELECT TOP 1 i.PazaryeriIadeler_Sebep AS sebep,
+                   CONVERT(VARCHAR(10), i.PazaryeriIadeler_IadeTarihi, 120) AS tarih
+            FROM dbo.PazaryeriSiparisleri s
+            INNER JOIN dbo.PazaryeriIadeler i
+                    ON i.PazaryeriIadeler_EntegrasyonKanallari_id = s.PazaryeriSiparisleri_EntegrasyonKanallari_id
+                   AND i.PazaryeriIadeler_SiparisNo = s.PazaryeriSiparisleri_SiparisNo
+            WHERE s.PazaryeriSiparisleri_id = ? AND i.PazaryeriIadeler_Durum = 1
+              AND i.PazaryeriIadeler_DurumKod = 'onaylandi'
+            ORDER BY i.PazaryeriIadeler_IadeTarihi DESC
+        ", [(int)$siparisId]) ?: null;
+    }
+
+    /**
      * Kayıt kesinleşmiş bir fatura mı (yeniden kesime kapalı).
      * Taslak, Örnek Holding'de onaylanıp gerçek numara aldıysa (senkron yazar) kesinleşmiş sayılır.
      */
@@ -1002,10 +1071,19 @@ class FaturaKesim
      *      aynı ad + tutar → XML'de OrderReference = sipariş no ise kesin, değilse olası
      * Siparişin kendi fatura kaydı (ETTN) ve taslaklar sayılmaz.
      *
-     * @return array ['durum' => temiz|olasi|kesin|hata, 'mesaj' => string, 'faturalar' => [[no, tarih, unvan, tutar, kaynak]]]
+     * @return array ['durum' => temiz|olasi|kesin|iade|hata, 'mesaj' => string, 'faturalar' => [[no, tarih, unvan, tutar, kaynak]]]
      */
     public function ciftFaturaKontrol(array $belge)
     {
+        // 0) Sipariş tamamen iade edilmiş (pazaryeri iade kaydı, onaylandı): fatura kesilmez
+        if ($this->iadeDurumu((int)$belge['kaynak_id']) === 'tam') {
+            $iade = $this->sonIade((int)$belge['kaynak_id']) ?: [];
+            return ['durum' => 'iade', 'faturalar' => [],
+                    'mesaj' => 'Sipariş iade edilmiş (pazaryerinde onaylandı'
+                             . (!empty($iade['tarih']) ? ', ' . $iade['tarih'] : '')
+                             . (!empty($iade['sebep']) ? ' · ' . $iade['sebep'] : '') . '). Fatura kesilmez.'];
+        }
+
         $s = $this->db->fetchOne("
             SELECT s.PazaryeriSiparisleri_HamVeri AS ham, s.PazaryeriSiparisleri_FaturaBildirimTarihi AS bildirim,
                    fa.Faturalar_ETTN AS kendi_ettn, fa.Faturalar_FaturaNo AS kendi_no
@@ -1031,8 +1109,10 @@ class FaturaKesim
         $pyLink = is_array($ham) ? trim((string)($ham['invoiceLink'] ?? '')) : '';
         if ($pyLink !== '' && empty($s['bildirim'])) {
             $kesin = true;
-            $bulunan[] = ['no' => (string)($ham['invoiceNumber'] ?? ''), 'tarih' => '', 'unvan' => '',
-                          'tutar' => null, 'kaynak' => 'pazaryerinde fatura linki var'];
+            // Trendyol linki verip numarayı çoğu zaman boş döndürür
+            $pyNo = trim((string)($ham['invoiceNumber'] ?? ''));
+            $bulunan[] = ['no' => $pyNo, 'tarih' => '', 'unvan' => '', 'tutar' => null, 'link' => $pyLink,
+                          'kaynak' => 'pazaryerinde fatura linki var' . ($pyNo === '' ? ' (numara bildirilmemiş)' : '')];
         }
 
         // 2) Portal kaydı (senkronla gelen giden faturalar, tüm firmalar)
@@ -1108,8 +1188,11 @@ class FaturaKesim
 
     private static function faturaOzet(array $f)
     {
-        return implode(', ', array_map(fn($x) => trim(($x['no'] ?: '?') . ($x['tarih'] ? ' ' . $x['tarih'] : '')
-                                                       . ' — ' . $x['kaynak']), $f));
+        // Numarası olmayan kayıtta (pazaryeri linki) yalnız kaynak yazılır
+        return implode(', ', array_map(function ($x) {
+            $bas = trim((string)$x['no'] . ($x['tarih'] ? ' ' . $x['tarih'] : ''));
+            return $bas !== '' ? $bas . ' — ' . $x['kaynak'] : ucfirst($x['kaynak']);
+        }, $f));
     }
 
     // =================================================================
@@ -1241,6 +1324,8 @@ class FaturaKesim
                    OR (LEN(fa.Faturalar_FaturaNo) = 16 AND RIGHT(fa.Faturalar_FaturaNo, 9) <> '000000000'))
               AND NOT (ISJSON(s.PazaryeriSiparisleri_HamVeri) = 1
                        AND NULLIF(JSON_VALUE(s.PazaryeriSiparisleri_HamVeri, '$.invoiceLink'), '') IS NOT NULL)
+              -- Tamamen iade edilmiş siparişe fatura bildirilmez
+              AND ISNULL(" . self::iadeDurumSql('s') . ", '') <> 'tam'
               $kanalSql
             ORDER BY s.PazaryeriSiparisleri_SiparisTarihi
         ", $params) ?: [];

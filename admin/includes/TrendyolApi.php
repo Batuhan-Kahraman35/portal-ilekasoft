@@ -615,48 +615,105 @@ class TrendyolApi extends PazaryeriApi
         return ['basarili' => true, 'hata' => '', 'adet' => $toplam];
     }
 
-    /** Trendyol iadesi → nötr iade */
+    /**
+     * Trendyol iadesi → nötr iade
+     *
+     * Yanıt yapısı [CANLI 17.11.2026]: items[] → { orderLine{barcode, productName, price},
+     * claimItems[] → { claimItemStatus{name}, customerClaimItemReason{name}, customerNote } }.
+     * Her claimItem iade edilen BİR adettir. Eski yapı (üstte claimItems[]) yedek olarak okunur.
+     *
+     * Durum kalemlerden toplanır (bkz. iadeDurumTopla); tutar ve miktar iptal / reddedilen
+     * kalemler hariç hesaplanır (sipariş "tam iade mi" kararı bunlara dayanır).
+     */
     private function iadeNotrle(array $i)
     {
+        $gruplar = [];
+        foreach ($i['items'] ?? [] as $it) {
+            $gruplar[] = [$it['orderLine'] ?? [], $it['claimItems'] ?? []];
+        }
+        if (!$gruplar && !empty($i['claimItems'])) {
+            foreach ($i['claimItems'] as $ci) {
+                $gruplar[] = [$ci['orderLine'] ?? $ci, [$ci]];
+            }
+        }
+
         $kalemler = [];
-        foreach ($i['claimItems'] ?? [] as $item) {
+        $durumlar = [];
+        $tutar    = 0.0;
+        $sebep    = null;
+        $aciklama = null;
+        $ilkDurum = null;
+        foreach ($gruplar as [$satir, $ciler]) {
+            $gecerli = 0;
+            $kalemSebep = null;
+            foreach ($ciler as $ci) {
+                $ham = $ci['claimItemStatus']['name'] ?? null;
+                $kod = $this->iadeDurumKodu($ham);
+                $durumlar[] = $kod;
+                $ilkDurum   = $ilkDurum ?? $ham;
+                $r = $ci['customerClaimItemReason'] ?? ($ci['trendyolClaimItemReason'] ?? ($ci['claimReason'] ?? null));
+                $kalemSebep = $kalemSebep ?? (is_array($r) ? ($r['name'] ?? null) : $r);
+                $not = trim((string)($ci['customerNote'] ?? ($ci['customerExplanation'] ?? '')));
+                if ($aciklama === null && $not !== '') { $aciklama = $not; }
+                if (!in_array($kod, ['iptal', 'reddedildi'], true)) { $gecerli++; }
+            }
+            $fiyat = isset($satir['price']) ? (float)$satir['price'] : null;
+            $sebep = $sebep ?? $kalemSebep;
+            $tutar += (float)$fiyat * $gecerli;
             $kalemler[] = [
-                'barkod'  => $item['barcode']     ?? ($item['orderLine']['barcode'] ?? null),
-                'urunAdi' => $item['productName'] ?? ($item['orderLine']['productName'] ?? null),
-                'miktar'  => (int)($item['quantity'] ?? 1),
-                'fiyat'   => $item['price'] ?? ($item['orderLine']['price'] ?? null),
-                'sebep'   => $item['claimReason']['name'] ?? ($item['claimReason'] ?? null)
+                'barkod'  => $satir['barcode']     ?? null,
+                'urunAdi' => $satir['productName'] ?? null,
+                'miktar'  => $gecerli,              // iptal / reddedilen hariç iade adedi
+                'talep'   => count($ciler),         // talep edilen adet
+                'fiyat'   => $fiyat,
+                'sebep'   => $kalemSebep
             ];
         }
 
-        $ilk     = $i['claimItems'][0] ?? [];
-        $musteri = trim(($i['customerFirstName'] ?? '') . ' ' . ($i['customerLastName'] ?? ''));
+        $durumKod = $this->iadeDurumTopla($durumlar);
+        $musteri  = trim(($i['customerFirstName'] ?? '') . ' ' . ($i['customerLastName'] ?? ''));
 
         return [
             'disId'      => (string)($i['id'] ?? ($i['claimId'] ?? '')),
             'siparisNo'  => (string)($i['orderNumber'] ?? ''),
             'paketNo'    => (string)($i['orderShipmentPackageId'] ?? ''),
-            'durumKod'   => $this->iadeDurumKodu($i['claimItems'][0]['claimItemStatus']['name'] ?? ($i['status'] ?? '')),
-            'hamDurum'   => $i['claimItems'][0]['claimItemStatus']['name'] ?? ($i['status'] ?? null),
-            'sebep'      => is_array($ilk['claimReason'] ?? null)
-                                ? ($ilk['claimReason']['name'] ?? null)
-                                : ($ilk['claimReason'] ?? null),
-            'aciklama'   => $ilk['customerNote'] ?? ($ilk['customerExplanation'] ?? null),
+            'durumKod'   => $durumKod,
+            'hamDurum'   => $ilkDurum ?? ($i['status'] ?? null),
+            'sebep'      => $sebep,
+            'aciklama'   => $aciklama,
             'musteriAdi' => $musteri ?: null,
-            'tutar'      => $ilk['price'] ?? null,
+            'tutar'      => $gruplar ? round($tutar, 2) : null,
             'iadeTarihi' => $this->msTarih($i['claimDate'] ?? ($i['createdDate'] ?? null)),
             'kalemler'   => $kalemler,
             'ham'        => $i
         ];
     }
 
+    /**
+     * Kalem durumlarından iade durumu: biri açıksa açık; değilse biri onaylandıysa
+     * onaylandı; değilse reddedildi; hepsi iptalse iptal.
+     */
+    private function iadeDurumTopla(array $kodlar)
+    {
+        foreach (['acik', 'onaylandi', 'reddedildi', 'iptal'] as $k) {
+            if (in_array($k, $kodlar, true)) return $k;
+        }
+        return 'diger';
+    }
+
+    /**
+     * claimItemStatus.name → nötr kod. Trendyol durumları: Created, WaitingInAction,
+     * WaitingFraudCheck, InAnalysis, Unresolved (açık) · Accepted · Rejected · Cancelled
+     */
     private function iadeDurumKodu($durum)
     {
         $d = strtolower((string)$durum);
-        if (strpos($d, 'waiting') !== false || strpos($d, 'created') !== false) return 'acik';
+        if ($d === '') return 'diger';
         if (strpos($d, 'accept')  !== false || strpos($d, 'approved') !== false) return 'onaylandi';
         if (strpos($d, 'reject')  !== false)                                     return 'reddedildi';
         if (strpos($d, 'cancel')  !== false)                                     return 'iptal';
+        if (strpos($d, 'waiting') !== false || strpos($d, 'created') !== false
+            || strpos($d, 'analysis') !== false || strpos($d, 'unresolved') !== false) return 'acik';
         return 'diger';
     }
 }
