@@ -57,16 +57,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $toplamHesap = $db->fetchOne("SELECT COUNT(*) as sayi FROM banka_Hesap WHERE bankaHesap_durum = 1")['sayi'] ?? 0;
                 $aktifHesap = $db->fetchOne("SELECT COUNT(*) as sayi FROM banka_Hesap WHERE bankaHesap_durum = 1 AND bankaHesap_otomatik = 1")['sayi'] ?? 0;
                 
-                // TL toplam bakiye (yeni kolon öncelikli, yoksa eski yöntem)
+                // TL toplam bakiye (bankadan gelen öncelikli, yoksa son hareket; 7 gündür senkronlanmayan hesabın hareket bakiyesi toplama girmez)
                 $tlBakiye = $db->fetchOne("
                     SELECT ISNULL(SUM(CAST(COALESCE(h.bankaHesap_bakiye, sub.bakiye) AS DECIMAL(18,2))), 0) as toplam
                     FROM banka_Hesap h
                     OUTER APPLY (
                         SELECT TOP 1 banka_HesapHareketleriRemainingBalance as bakiye
-                        FROM banka_HesapHareketleri 
-                        WHERE banka_HesapId = h.bankaHesap_id 
+                        FROM banka_HesapHareketleri
+                        WHERE h.bankaHesap_bakiye IS NULL
+                          AND h.bankaHesap_sonSenkronTarihi >= DATEADD(DAY, -7, GETDATE())
+                          AND banka_HesapId = h.bankaHesap_id
                           AND banka_HesapHareketleriCurrencyType = 'TRY'
-                        ORDER BY banka_HesapHareketleriDateTime DESC
+                        ORDER BY banka_HesapHareketleriDateTime DESC, banka_HesapHareketleriID DESC
                     ) sub
                     WHERE h.bankaHesap_durum = 1
                       AND (h.bankaHesap_bakiye IS NOT NULL OR sub.bakiye IS NOT NULL)
@@ -129,6 +131,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         b.banka_logo_url,
                         f.firma_adi,
                         gb.guncel_bakiye,
+                        gb.bakiye_kaynak,
+                        gb.bakiye_hareket_tarihi,
+                        gb.bakiye_eski,
                         CASE
                             WHEN gb.guncel_bakiye IS NULL THEN NULL
                             WHEN h.bankaHesap_kmhLimit IS NOT NULL
@@ -139,13 +144,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     INNER JOIN bankalar b ON h.bankaHesap_banka_id = b.banka_id
                     LEFT JOIN Firmalar f ON h.bankaHesap_firma_id = f.firma_id
                     OUTER APPLY (
-                        SELECT COALESCE(
-                            h.bankaHesap_bakiye,
-                            (SELECT TOP 1 CAST(hh.banka_HesapHareketleriRemainingBalance AS DECIMAL(18,2))
-                             FROM banka_HesapHareketleri hh
-                             WHERE hh.banka_HesapId = h.bankaHesap_id
-                             ORDER BY hh.banka_HesapHareketleriDateTime DESC, hh.banka_HesapHareketleriID DESC)
-                        ) as guncel_bakiye
+                        SELECT TOP 1 CAST(hh.banka_HesapHareketleriRemainingBalance AS DECIMAL(18,2)) as bakiye,
+                               hh.banka_HesapHareketleriDateTime as tarih
+                        FROM banka_HesapHareketleri hh
+                        WHERE h.bankaHesap_bakiye IS NULL
+                          AND hh.banka_HesapId = h.bankaHesap_id
+                        ORDER BY hh.banka_HesapHareketleriDateTime DESC, hh.banka_HesapHareketleriID DESC
+                    ) sh
+                    OUTER APPLY (
+                        SELECT COALESCE(h.bankaHesap_bakiye, sh.bakiye) as guncel_bakiye,
+                               CASE WHEN h.bankaHesap_bakiye IS NOT NULL THEN 'BANKA'
+                                    WHEN sh.bakiye IS NOT NULL THEN 'HAREKET' END as bakiye_kaynak,
+                               CONVERT(VARCHAR(10), sh.tarih, 120) as bakiye_hareket_tarihi,
+                               -- Senkron güncelse hareketsiz hesabın son hareket bakiyesi hâlâ geçerlidir
+                               CASE WHEN h.bankaHesap_bakiye IS NULL AND sh.bakiye IS NOT NULL
+                                         AND (h.bankaHesap_sonSenkronTarihi IS NULL OR h.bankaHesap_sonSenkronTarihi < DATEADD(DAY, -7, GETDATE()))
+                                    THEN 1 ELSE 0 END as bakiye_eski
                     ) gb
                     WHERE h.bankaHesap_durum = 1
                 ";
@@ -668,7 +682,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         render: function(data, type, row) {
                             const kullanilabilir = parseFloat(data) || 0;
                             if (type === 'sort' || type === 'type') return kullanilabilir;
-                            if (data === null) return '<span class="text-muted">-</span>';
+                            if (data === null || parseInt(row.bakiye_eski) === 1) return '<span class="text-muted">-</span>';
                             let cls = 'bakiye-sifir';
                             if (kullanilabilir > 0) cls = 'bakiye-pozitif';
                             else if (kullanilabilir < 0) cls = 'bakiye-negatif';
@@ -715,7 +729,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             let bakiyeClass = 'bakiye-sifir';
                             if (bakiye > 0) bakiyeClass = 'bakiye-pozitif';
                             else if (bakiye < 0) bakiyeClass = 'bakiye-negatif';
-                            let html = '<span class="' + bakiyeClass + '">' + formatMoney(bakiye) + ' ₺</span>';
+                            const eski = parseInt(row.bakiye_eski) === 1;
+                            let html = '<span class="' + (eski ? 'text-muted text-decoration-line-through' : bakiyeClass) + '">' + formatMoney(bakiye) + ' ₺</span>';
+
+                            // Banka bakiyesi yoksa son hareketten gösterilir; eskiyse güncel değildir
+                            if (row.bakiye_kaynak === 'HAREKET') {
+                                const tarih = row.bakiye_hareket_tarihi ? row.bakiye_hareket_tarihi.split('-').reverse().join('.') : '-';
+                                html += eski
+                                    ? ' <span class="badge text-bg-secondary" title="Hesap 7 gündür senkronlanmadı; son hareketteki bakiye güncel olmayabilir, toplama dahil edilmez">Eski</span>'
+                                      + '<br><small class="text-danger">Son hareket: ' + tarih + '</small>'
+                                    : '<br><small class="text-muted">Son hareketten (' + tarih + ')</small>';
+                                if (eski) return html;
+                            }
 
                             // Eksi bakiye: KMH kullanımı
                             if (bakiye < 0) {
