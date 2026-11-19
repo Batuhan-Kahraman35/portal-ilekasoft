@@ -247,12 +247,18 @@ class AkbankService extends BaseBankaService
                 $tutar = -abs($tutar);
             }
             
+            // SonBakiye işaretsiz gelir; işaret SonBakiyeBorcAlacak alanındadır ('-' = eksi bakiye, KMH)
+            $sonBakiye = abs($this->parseFloat($getNodeValue($detay, 'SonBakiye')));
+            if ($getNodeValue($detay, 'SonBakiyeBorcAlacak') === '-') {
+                $sonBakiye = -$sonBakiye;
+            }
+
             $hareketler[] = [
                 'valorTarihi' => $getNodeValue($detay, 'ValorTarihi'),  // YYYYMMDD
                 'islemTarihi' => $getNodeValue($detay, 'IslemTarihi'),  // YYYYMMDD
                 'tarih' => $this->parseDate($getNodeValue($detay, 'IslemTarihi')), // Y-m-d
                 'tutar' => $tutar,
-                'bakiye' => $this->parseFloat($getNodeValue($detay, 'SonBakiye')),
+                'bakiye' => $sonBakiye,
                 'borcAlacak' => $borcAlacak, // + veya -
                 'tip' => $borcAlacak === '+' ? 'Giriş' : 'Çıkış',
                 'aciklama' => $getNodeValue($detay, 'Aciklama'),
