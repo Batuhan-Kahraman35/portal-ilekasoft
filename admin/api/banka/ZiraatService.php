@@ -356,6 +356,25 @@ class ZiraatService extends BaseBankaService
                 }
             }
             
+            // Bakiyeyi son hareketin kalan bakiyesinden yaz.
+            // NOT: GetirHesapDetayBilgileri (bakiye/bloke/KMH) WSDL'de var ama banka tarafında
+            // uygulanmamış: "The method or operation is not implemented" (18.11.2026). KMH limiti Ziraat'ten alınamıyor.
+            $sonHareket = $this->db->fetchOne("
+                SELECT TOP 1 banka_HesapHareketleriRemainingBalance AS bakiye
+                FROM banka_HesapHareketleri
+                WHERE banka_HesapId = ?
+                ORDER BY banka_HesapHareketleriDateTime DESC, banka_HesapHareketleriID DESC
+            ", [$hesapId]);
+            if ($sonHareket && $sonHareket['bakiye'] !== null) {
+                $this->db->execute("
+                    UPDATE banka_Hesap SET
+                        bankaHesap_bakiye = ?,
+                        bankaHesap_kullanilabilirBakiye = ?,
+                        bankaHesap_guncelleme_tarihi = GETDATE()
+                    WHERE bankaHesap_id = ?
+                ", [(string)$sonHareket['bakiye'], (string)$sonHareket['bakiye'], $hesapId]);
+            }
+
             // Son senkron tarihini güncelle
             // API başarılı döndüyse (0 kayıt dahil) tarihi güncelle, aksi halde bir sonraki çalışmada
             // aynı tarih aralığı sorgulanmaya devam eder ve tarih ilerlemez

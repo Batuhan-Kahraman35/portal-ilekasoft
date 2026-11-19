@@ -413,4 +413,73 @@ abstract class BaseBankaService implements BankaServiceInterface
             WHERE bankaHesap_apiKimlik_id = ? AND bankaHesap_durum = 1
         ", [$this->apiKimlik['apiKimlik_id']]);
     }
+
+    /**
+     * Banka tutar metnini sayıya çevir.
+     * "+1.050.000,00" / "-993400,00" / "1050000.00" / 1050000 biçimlerini kabul eder.
+     * Boş / çözülemeyen değerde null döner.
+     */
+    protected function tutarCoz($deger): ?float
+    {
+        if ($deger === null) {
+            return null;
+        }
+        if (is_int($deger) || is_float($deger)) {
+            return (float)$deger;
+        }
+
+        $s = str_replace([' ', '+', '₺'], '', trim((string)$deger));
+        if ($s === '') {
+            return null;
+        }
+
+        if (strpos($s, ',') !== false) {
+            // Türkçe biçim: nokta binlik, virgül ondalık
+            $s = str_replace(['.', ','], ['', '.'], $s);
+        } elseif (substr_count($s, '.') > 1) {
+            // Yalnız binlik noktaları: 1.050.000
+            $s = str_replace('.', '', $s);
+        }
+
+        return is_numeric($s) ? (float)$s : null;
+    }
+
+    /**
+     * Bankadan gelen KMH limitini yaz.
+     *
+     * - $limit > 0: limit yazılır, kaynak 'API' olur (elle girilen değer ezilir).
+     * - $limit <= 0 ve $sifirKaldirir: banka "limit yok" diyor; yalnız kaynağı 'API' olan limit kaldırılır.
+     * - $limit null: banka bilgi vermedi; mevcut değere dokunulmaz.
+     *
+     * Tutar string olarak bağlanır (float bağlama sqlsrv'de 6 haneye yuvarlanıyor).
+     */
+    protected function kmhLimitYaz(int $hesapId, ?float $limit, bool $sifirKaldirir = false): void
+    {
+        if ($limit === null) {
+            return;
+        }
+
+        try {
+            if ($limit > 0) {
+                $this->db->execute("
+                    UPDATE banka_Hesap SET
+                        bankaHesap_kmhLimit = ?,
+                        bankaHesap_kmhLimitKaynak = 'API',
+                        bankaHesap_kmhLimitTarihi = GETDATE()
+                    WHERE bankaHesap_id = ?
+                ", [number_format($limit, 2, '.', ''), $hesapId]);
+            } elseif ($sifirKaldirir) {
+                $this->db->execute("
+                    UPDATE banka_Hesap SET
+                        bankaHesap_kmhLimit = NULL,
+                        bankaHesap_kmhLimitKaynak = NULL,
+                        bankaHesap_kmhLimitTarihi = GETDATE()
+                    WHERE bankaHesap_id = ? AND bankaHesap_kmhLimitKaynak = 'API'
+                ", [$hesapId]);
+            }
+        } catch (\Throwable $e) {
+            // Limit yazımı senkronu durdurmamalı
+            error_log('KMH limit yazma hatası (hesap ' . $hesapId . '): ' . $e->getMessage());
+        }
+    }
 }

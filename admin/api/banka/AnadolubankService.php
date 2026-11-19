@@ -346,6 +346,14 @@ class AnadolubankService extends BaseBankaService
                     $hesapId,
                 ]);
 
+                // KMH: kullanılabilir bakiyeden büyükse fark KMH limitidir (bloke bilgisi gelmiyor).
+                // Fark yoksa limite dokunulmaz (kullanılabilir alanının KMH içerdiği teyit edilmedi).
+                $kmhFark = round($n['kullanilabilirBakiye'] - $n['bakiye'], 2);
+                if ($kmhFark > 0.01) {
+                    $this->kmhLimitYaz($hesapId, $kmhFark);
+                }
+                $n['kmhFark'] = $kmhFark;
+
                 $n['dbId'] = $hesapId;
                 $hesaplar[] = $n;
             }

@@ -307,15 +307,29 @@ class HalkbankService extends BaseBankaService
             
             // Bakiyeyi güncelle
             $hesapBakiye = (float)str_replace(['+', ','], ['', '.'], $hesapBilgi->Bakiye ?? '0');
-            
-            $this->logBasarili($logId, count($hareketler), json_encode(['hareket_sayisi' => count($hareketler), 'bakiye' => $hesapBakiye]));
-            
+
+            // KMH / bloke bilgisi (WSDL Hesap tipi: KrediLimit, KullanilabilirBakiye, BlokeMeblag)
+            $krediLimit     = $this->tutarCoz($hesapBilgi->KrediLimit ?? null);
+            $kullanilabilir = $this->tutarCoz($hesapBilgi->KullanilabilirBakiye ?? null);
+            $bloke          = $this->tutarCoz($hesapBilgi->BlokeMeblag ?? null);
+
+            $this->logBasarili($logId, count($hareketler), json_encode([
+                'hareket_sayisi' => count($hareketler),
+                'bakiye'         => $hesapBakiye,
+                'kmh_limit'      => $krediLimit,
+                'kullanilabilir' => $kullanilabilir,
+                'bloke'          => $bloke
+            ]));
+
             return [
                 'success' => true,
                 'message' => count($hareketler) . ' hareket bulundu.',
                 'data' => $hareketler,
                 'count' => count($hareketler),
-                'bakiye' => $hesapBakiye
+                'bakiye' => $hesapBakiye,
+                'kmhLimit' => $krediLimit,
+                'kullanilabilir' => $kullanilabilir,
+                'bloke' => $bloke
             ];
             
         } catch (\SoapFault $e) {
@@ -401,13 +415,24 @@ class HalkbankService extends BaseBankaService
             
             // Bakiyeyi DB'ye yaz (API'den gelen hesap bakiyesi)
             if (isset($result['bakiye']) && $result['bakiye'] !== null) {
+                // Kullanılabilir (KMH hariç) ve bloke bankadan geliyorsa onlar, yoksa bakiye
+                $kullanilabilir = $result['kullanilabilir'] ?? $result['bakiye'];
                 $this->db->execute("
-                    UPDATE banka_Hesap SET 
+                    UPDATE banka_Hesap SET
                         bankaHesap_bakiye = ?,
                         bankaHesap_kullanilabilirBakiye = ?,
+                        bankaHesap_bloke = COALESCE(?, bankaHesap_bloke),
                         bankaHesap_guncelleme_tarihi = GETDATE()
                     WHERE bankaHesap_id = ?
-                ", [$result['bakiye'], $result['bakiye'], $hesapId]);
+                ", [
+                    number_format((float)$result['bakiye'], 2, '.', ''),
+                    number_format((float)$kullanilabilir, 2, '.', ''),
+                    $result['bloke'] !== null ? number_format((float)$result['bloke'], 2, '.', '') : null,
+                    $hesapId
+                ]);
+
+                // KMH limiti (0 gelirse API kaynaklı limit kaldırılır)
+                $this->kmhLimitYaz($hesapId, $result['kmhLimit'] ?? null, true);
             }
 
             // Son senkron tarihini güncelle (başarılı API cevabında, 0 kayıt dahil)

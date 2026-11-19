@@ -217,7 +217,11 @@ class AkbankService extends BaseBankaService
         }
         
         $hesapNode = $hesapNodes->item(0);
-        
+
+        // NOT (18.11.2026): GetExtre Hesap düğümünde KMH/limit alanı yok; Akbank KMH limiti elle girilir.
+        // Alanlar: SqlID, HesapTuruAdi, HesapNo, URF, SubeKodu, SubeAdi, DovizKodu, IBAN, AcilisIlkBakiye,
+        // AcilisGunBakiye, CariBakiye, Bakiye, BlokeMeblag, HesapAcilisTarihi, SonHareketTarihi,
+        // HesapTuruKodu, LastTmSt, AktifFlag, DetayFlag, DekontBilgiFlag, VadeliHareketlerIslensin
         $hesap = [
             'hesapNo' => $getNodeValue($hesapNode, 'HesapNo'),
             'subeKodu' => $getNodeValue($hesapNode, 'SubeKodu'),

@@ -17,8 +17,11 @@ $sql = "SELECT
             bh.bankaHesap_aciklama,
             bh.bankaHesap_sube_adi,
             bh.bankaHesap_bakiye,
-            bh.bankaHesap_kullanilabilirBakiye,
+            CASE WHEN bh.bankaHesap_kmhLimit IS NOT NULL AND bh.bankaHesap_bakiye IS NOT NULL
+                 THEN bh.bankaHesap_bakiye - ISNULL(bh.bankaHesap_bloke, 0) + bh.bankaHesap_kmhLimit
+                 ELSE bh.bankaHesap_kullanilabilirBakiye END AS bankaHesap_kullanilabilirBakiye,
             bh.bankaHesap_bloke,
+            bh.bankaHesap_kmhLimit,
             CONVERT(VARCHAR(19), bh.bankaHesap_sonSenkronTarihi, 126) AS son_senkron,
             f.firma_id, f.firma_adi,
             b.banka_id, b.banka_adi
@@ -53,6 +56,7 @@ Yanit::basarili(array_map(fn($s) => [
     'bakiye'               => $s['bankaHesap_bakiye'] !== null ? (float) $s['bankaHesap_bakiye'] : null,
     'kullanilabilir_bakiye'=> $s['bankaHesap_kullanilabilirBakiye'] !== null ? (float) $s['bankaHesap_kullanilabilirBakiye'] : null,
     'bloke'                => $s['bankaHesap_bloke'] !== null ? (float) $s['bankaHesap_bloke'] : null,
+    'kmh_limit'            => $s['bankaHesap_kmhLimit'] !== null ? (float) $s['bankaHesap_kmhLimit'] : null,
     'son_senkron'          => $s['son_senkron'],
     'firma'                => ['id' => (int) $s['firma_id'], 'ad' => $s['firma_adi']],
     'banka'                => ['id' => (int) $s['banka_id'], 'ad' => $s['banka_adi']],

@@ -78,17 +78,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     FROM banka_Hesap WHERE bankaHesap_durum = 1
                 ")['toplam'] ?? 0;
                 
-                // Toplam kullanılabilir bakiye
-                $toplamKullanilabilir = $db->fetchOne("
-                    SELECT ISNULL(SUM(COALESCE(bankaHesap_kullanilabilirBakiye, bankaHesap_bakiye, 0)), 0) as toplam
+                // Toplam kullanılabilir bakiye (KMH limiti tanımlı hesaplarda: bakiye - bloke + limit)
+                $kullanilabilirSatir = $db->fetchOne("
+                    SELECT
+                        ISNULL(SUM(CASE WHEN bankaHesap_kmhLimit IS NOT NULL
+                                        THEN ISNULL(bankaHesap_bakiye, 0) - ISNULL(bankaHesap_bloke, 0) + bankaHesap_kmhLimit
+                                        ELSE COALESCE(bankaHesap_kullanilabilirBakiye, bankaHesap_bakiye, 0) END), 0) AS toplam,
+                        ISNULL(SUM(bankaHesap_kmhLimit), 0) AS kmh_limit,
+                        ISNULL(SUM(CASE WHEN bankaHesap_bakiye < 0 THEN -bankaHesap_bakiye ELSE 0 END), 0) AS kmh_kullanilan
                     FROM banka_Hesap WHERE bankaHesap_durum = 1
-                ")['toplam'] ?? 0;
+                ");
+                $toplamKullanilabilir = $kullanilabilirSatir['toplam'] ?? 0;
 
                 $stats = [
                     'toplam_hesap' => $toplamHesap,
                     'toplam_bakiye' => number_format($tlBakiye, 2, ',', '.'),
                     'toplam_bloke' => number_format($toplamBloke, 2, ',', '.'),
-                    'toplam_kullanilabilir' => number_format($toplamKullanilabilir, 2, ',', '.')
+                    'toplam_kullanilabilir' => number_format($toplamKullanilabilir, 2, ',', '.'),
+                    'kmh_kullanilan' => number_format($kullanilabilirSatir['kmh_kullanilan'] ?? 0, 2, ',', '.'),
+                    'kmh_limit' => number_format($kullanilabilirSatir['kmh_limit'] ?? 0, 2, ',', '.')
                 ];
                 echo json_encode(['success' => true, 'data' => $stats]);
                 break;
@@ -112,21 +120,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         h.bankaHesap_bakiye,
                         h.bankaHesap_bloke,
                         h.bankaHesap_kullanilabilirBakiye,
+                        h.bankaHesap_kmhLimit,
+                        h.bankaHesap_kmhLimitKaynak,
+                        CONVERT(VARCHAR(19), h.bankaHesap_kmhLimitTarihi, 120) as bankaHesap_kmhLimitTarihi,
                         CONVERT(VARCHAR(19), h.bankaHesap_sonSenkronTarihi, 120) as bankaHesap_sonSenkronTarihi,
                         b.banka_id,
                         b.banka_adi,
                         b.banka_logo_url,
                         f.firma_adi,
-                        COALESCE(
-                            h.bankaHesap_bakiye,
-                            (SELECT TOP 1 CAST(banka_HesapHareketleriRemainingBalance AS DECIMAL(18,2))
-                             FROM banka_HesapHareketleri hh 
-                             WHERE hh.banka_HesapId = h.bankaHesap_id 
-                             ORDER BY hh.banka_HesapHareketleriDateTime DESC)
-                        ) as guncel_bakiye
+                        gb.guncel_bakiye,
+                        CASE
+                            WHEN gb.guncel_bakiye IS NULL THEN NULL
+                            WHEN h.bankaHesap_kmhLimit IS NOT NULL
+                                THEN gb.guncel_bakiye - ISNULL(h.bankaHesap_bloke, 0) + h.bankaHesap_kmhLimit
+                            ELSE COALESCE(h.bankaHesap_kullanilabilirBakiye, gb.guncel_bakiye - ISNULL(h.bankaHesap_bloke, 0))
+                        END as hesap_kullanilabilir
                     FROM banka_Hesap h
                     INNER JOIN bankalar b ON h.bankaHesap_banka_id = b.banka_id
                     LEFT JOIN Firmalar f ON h.bankaHesap_firma_id = f.firma_id
+                    OUTER APPLY (
+                        SELECT COALESCE(
+                            h.bankaHesap_bakiye,
+                            (SELECT TOP 1 CAST(hh.banka_HesapHareketleriRemainingBalance AS DECIMAL(18,2))
+                             FROM banka_HesapHareketleri hh
+                             WHERE hh.banka_HesapId = h.bankaHesap_id
+                             ORDER BY hh.banka_HesapHareketleriDateTime DESC, hh.banka_HesapHareketleriID DESC)
+                        ) as guncel_bakiye
+                    ) gb
                     WHERE h.bankaHesap_durum = 1
                 ";
                 $params = [];
@@ -158,6 +178,68 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(['success' => true, 'data' => $data, 'count' => count($data)]);
                 break;
                 
+            case 'kmh_kaydet':
+                // KMH limitini kaydet (boş = KMH yok)
+                if (!$pagePermissions['can_edit'] && !$pagePermissions['is_admin']) {
+                    echo json_encode(['success' => false, 'message' => 'Düzenleme yetkiniz bulunmamaktadır.']);
+                    break;
+                }
+
+                $hesapId = (int)($_POST['hesap_id'] ?? 0);
+                $limitHam = trim((string)($_POST['kmh_limit'] ?? ''));
+
+                if ($hesapId <= 0) {
+                    echo json_encode(['success' => false, 'message' => 'Geçersiz hesap.']);
+                    break;
+                }
+
+                $limit = null;
+                if ($limitHam !== '') {
+                    // 1.050.000,00 / 1050000,00 / 1050000.00 biçimlerini kabul et
+                    $normal = str_replace([' ', '₺'], '', $limitHam);
+                    if (strpos($normal, ',') !== false) {
+                        $normal = str_replace(['.', ','], ['', '.'], $normal);
+                    } elseif (substr_count($normal, '.') > 1) {
+                        $normal = str_replace('.', '', $normal);
+                    }
+                    if (!is_numeric($normal) || (float)$normal < 0) {
+                        echo json_encode(['success' => false, 'message' => 'KMH limiti sıfır veya pozitif bir tutar olmalıdır (örn. 500.000,00).']);
+                        break;
+                    }
+                    $limit = round((float)$normal, 2);
+                }
+
+                $mevcut = $db->fetchOne("SELECT bankaHesap_id, bankaHesap_kmhLimitKaynak FROM banka_Hesap WHERE bankaHesap_id = ?", [$hesapId]);
+                if (!$mevcut) {
+                    echo json_encode(['success' => false, 'message' => 'Hesap bulunamadı.']);
+                    break;
+                }
+                if (($mevcut['bankaHesap_kmhLimitKaynak'] ?? null) === 'API') {
+                    echo json_encode(['success' => false, 'message' => 'Bu hesabın KMH limiti bankadan otomatik alınıyor, elle değiştirilemez.']);
+                    break;
+                }
+
+                $db->execute("
+                    UPDATE banka_Hesap SET
+                        bankaHesap_kmhLimit = ?,
+                        bankaHesap_kmhLimitKaynak = ?,
+                        bankaHesap_kmhLimitTarihi = GETDATE(),
+                        bankaHesap_guncelleyen_kullanici_id = ?,
+                        bankaHesap_guncelleme_tarihi = GETDATE()
+                    WHERE bankaHesap_id = ?
+                ", [
+                    $limit === null ? null : number_format($limit, 2, '.', ''),
+                    $limit === null ? null : 'MANUEL',
+                    $user['kullanici_id'],
+                    $hesapId
+                ]);
+
+                echo json_encode([
+                    'success' => true,
+                    'message' => $limit === null ? 'KMH limiti kaldırıldı.' : 'KMH limiti kaydedildi.'
+                ]);
+                break;
+
             case 'sync':
                 // Bakiyeleri güncelle - Cron mekanizmasını kullan
                 require_once __DIR__ . '/../api/banka/BankaServiceFactory.php';
@@ -285,6 +367,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         .bakiye-pozitif { color: #198754; font-weight: 600; }
         .bakiye-negatif { color: #dc3545; font-weight: 600; }
         .bakiye-sifir { color: #6c757d; }
+
+        /* KMH kullanım çubuğu */
+        .kmh-progress { height: 4px; min-width: 90px; margin-top: 3px; }
         
         /* Banka logosu */
         .banka-logo {
@@ -333,7 +418,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     
                     <!-- Info Boxes -->
                     <div class="row mb-3">
-                        <div class="col-12 col-sm-6 col-md-3">
+                        <div class="col-12 col-sm-6 col-lg">
                             <div class="info-box">
                                 <span class="info-box-icon text-bg-primary shadow-sm">
                                     <i class="bi bi-bank"></i>
@@ -345,7 +430,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             </div>
                         </div>
                         
-                        <div class="col-12 col-sm-6 col-md-3">
+                        <div class="col-12 col-sm-6 col-lg">
                             <div class="info-box">
                                 <span class="info-box-icon text-bg-info shadow-sm">
                                     <i class="bi bi-currency-lira"></i>
@@ -357,7 +442,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             </div>
                         </div>
                         
-                        <div class="col-12 col-sm-6 col-md-3">
+                        <div class="col-12 col-sm-6 col-lg">
                             <div class="info-box">
                                 <span class="info-box-icon text-bg-danger shadow-sm">
                                     <i class="bi bi-lock-fill"></i>
@@ -369,7 +454,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             </div>
                         </div>
                         
-                        <div class="col-12 col-sm-6 col-md-3">
+                        <div class="col-12 col-sm-6 col-lg">
                             <div class="info-box">
                                 <span class="info-box-icon text-bg-success shadow-sm">
                                     <i class="bi bi-wallet2"></i>
@@ -377,6 +462,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 <div class="info-box-content">
                                     <span class="info-box-text">Kullanılabilir Bakiye</span>
                                     <span class="info-box-number" id="stat-toplam-kullanilabilir">0,00</span>
+                                    <small class="text-muted">KMH limiti dahil</small>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="col-12 col-sm-6 col-lg">
+                            <div class="info-box">
+                                <span class="info-box-icon text-bg-warning shadow-sm">
+                                    <i class="bi bi-credit-card-2-back"></i>
+                                </span>
+                                <div class="info-box-content">
+                                    <span class="info-box-text">KMH Kullanımı</span>
+                                    <span class="info-box-number" id="stat-kmh-kullanilan">0,00</span>
+                                    <small class="text-muted">Limit: <span id="stat-kmh-limit">0,00</span> ₺</small>
                                 </div>
                             </div>
                         </div>
@@ -464,6 +563,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                             <th>Firma</th>
                                             <th>Bakiye</th>
                                             <th>Bloke</th>
+                                            <th>KMH Limiti</th>
                                             <th>Son Senkron</th>
                                         </tr>
                                     </thead>
@@ -501,6 +601,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $('#stat-toplam-bakiye').text(response.data.toplam_bakiye + ' ₺');
                     $('#stat-toplam-bloke').text(response.data.toplam_bloke + ' ₺');
                     $('#stat-toplam-kullanilabilir').text(response.data.toplam_kullanilabilir + ' ₺');
+                    $('#stat-kmh-kullanilan').text(response.data.kmh_kullanilan + ' ₺');
+                    $('#stat-kmh-limit').text(response.data.kmh_limit);
                 }
             });
         }
@@ -562,18 +664,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 columns: [
                     { data: 'bankaHesap_id' },
                     {
-                        data: 'bankaHesap_kullanilabilirBakiye',
+                        data: 'hesap_kullanilabilir',
                         render: function(data, type, row) {
-                            let kullanilabilir = parseFloat(data) || 0;
-                            if (!data && row.guncel_bakiye) {
-                                kullanilabilir = (parseFloat(row.guncel_bakiye) || 0) - (parseFloat(row.bankaHesap_bloke) || 0);
-                            }
+                            const kullanilabilir = parseFloat(data) || 0;
                             if (type === 'sort' || type === 'type') return kullanilabilir;
-                            if (!data && !row.guncel_bakiye) return '<span class="text-muted">-</span>';
+                            if (data === null) return '<span class="text-muted">-</span>';
                             let cls = 'bakiye-sifir';
                             if (kullanilabilir > 0) cls = 'bakiye-pozitif';
                             else if (kullanilabilir < 0) cls = 'bakiye-negatif';
-                            return '<span class="' + cls + '">' + formatMoney(kullanilabilir) + ' ₺</span>';
+                            let html = '<span class="' + cls + '">' + formatMoney(kullanilabilir) + ' ₺</span>';
+                            if (row.bankaHesap_kmhLimit !== null) {
+                                html += '<br><small class="text-muted">KMH dahil</small>';
+                            }
+                            return html;
                         }
                     },
                     {
@@ -612,16 +715,58 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             let bakiyeClass = 'bakiye-sifir';
                             if (bakiye > 0) bakiyeClass = 'bakiye-pozitif';
                             else if (bakiye < 0) bakiyeClass = 'bakiye-negatif';
-                            return '<span class="' + bakiyeClass + '">' + formatMoney(bakiye) + ' ₺</span>';
+                            let html = '<span class="' + bakiyeClass + '">' + formatMoney(bakiye) + ' ₺</span>';
+
+                            // Eksi bakiye: KMH kullanımı
+                            if (bakiye < 0) {
+                                const limit = row.bankaHesap_kmhLimit !== null ? parseFloat(row.bankaHesap_kmhLimit) : null;
+                                html += ' <span class="badge text-bg-warning" title="Kredili Mevduat Hesabı kullanımı">KMH</span>';
+                                if (limit && limit > 0) {
+                                    const oran = Math.min(100, Math.round(Math.abs(bakiye) / limit * 100));
+                                    const renk = oran >= 90 ? 'bg-danger' : (oran >= 70 ? 'bg-warning' : 'bg-info');
+                                    html += '<div class="progress kmh-progress" title="Limitin %' + oran + '\'i kullanıldı">'
+                                          + '<div class="progress-bar ' + renk + '" style="width:' + oran + '%"></div></div>'
+                                          + '<small class="text-muted">%' + oran + ' kullanıldı</small>';
+                                } else {
+                                    html += '<br><small class="text-danger">KMH limiti girilmemiş</small>';
+                                }
+                            }
+                            return html;
                         }
                     },
-                    { 
+                    {
                         data: 'bankaHesap_bloke',
                         render: function(data, type) {
                             const bloke = parseFloat(data) || 0;
                             if (type === 'sort' || type === 'type') return bloke;
                             if (bloke <= 0) return '<span class="text-muted">-</span>';
                             return '<span class="text-danger fw-semibold">' + formatMoney(bloke) + ' ₺</span>';
+                        }
+                    },
+                    {
+                        data: 'bankaHesap_kmhLimit',
+                        render: function(data, type, row) {
+                            const limit = data !== null ? parseFloat(data) : null;
+                            if (type === 'sort' || type === 'type') return limit || 0;
+                            const kaynak = row.bankaHesap_kmhLimitKaynak;
+                            let html = limit !== null
+                                ? '<span class="fw-semibold">' + formatMoney(limit) + ' ₺</span>'
+                                : '<span class="text-muted">-</span>';
+                            if (kaynak === 'API') {
+                                html += '<br><span class="badge text-bg-success" title="Bankadan alındı: ' + formatDate(row.bankaHesap_kmhLimitTarihi) + '">'
+                                      + '<i class="bi bi-bank"></i> Bankadan</span>';
+                                return html;
+                            }
+                            if (kaynak === 'MANUEL') {
+                                html += '<br><span class="badge text-bg-secondary" title="Elle girildi: ' + formatDate(row.bankaHesap_kmhLimitTarihi) + '">'
+                                      + '<i class="bi bi-pencil"></i> Elle</span>';
+                            }
+                            if (permissions.can_edit || permissions.is_admin) {
+                                html += ' <button type="button" class="btn btn-sm btn-link p-0 ms-1" title="KMH limitini düzenle"'
+                                      + ' onclick="kmhLimitDuzenle(' + row.bankaHesap_id + ', ' + (limit !== null ? limit : 'null') + ')">'
+                                      + '<i class="bi bi-pencil-square"></i></button>';
+                            }
+                            return html;
                         }
                     },
                     {
@@ -670,6 +815,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             showToast('Filtreler temizlendi', 'info');
         });
         
+        // KMH limitini düzenle (boş bırakılırsa limit kaldırılır)
+        function kmhLimitDuzenle(hesapId, mevcutLimit) {
+            Swal.fire({
+                title: 'KMH Limiti',
+                html: '<small class="text-muted">Bankadan teyit edilen limiti girin. KMH yoksa boş bırakın.</small>',
+                input: 'text',
+                inputValue: mevcutLimit !== null ? formatMoney(mevcutLimit) : '',
+                inputPlaceholder: 'örn. 500.000,00',
+                showCancelButton: true,
+                confirmButtonText: 'Kaydet',
+                cancelButtonText: 'Vazgeç',
+                showLoaderOnConfirm: true,
+                preConfirm: (deger) => {
+                    return $.post('', { action: 'kmh_kaydet', hesap_id: hesapId, kmh_limit: deger })
+                        .then(response => {
+                            if (!response.success) {
+                                Swal.showValidationMessage(response.message || 'Kaydedilemedi');
+                            }
+                            return response;
+                        })
+                        .catch(() => Swal.showValidationMessage('Sunucuya bağlanılamadı!'));
+                },
+                allowOutsideClick: () => !Swal.isLoading()
+            }).then(result => {
+                if (result.isConfirmed && result.value && result.value.success) {
+                    showToast(result.value.message, 'success');
+                    loadStats();
+                    table.ajax.reload(null, false);
+                }
+            });
+        }
+
         // Bakiyeleri güncelle (senkronizasyon)
         function syncBakiyeler() {
             const btn = document.getElementById('btnSyncBakiye');

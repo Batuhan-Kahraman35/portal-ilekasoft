@@ -406,6 +406,13 @@ class SekerBankService extends BaseBankaService
                     $guncelBakiye['bloke'],
                     $hesapId,
                 ]);
+
+                // KMH: kullanılabilir, (bakiye - bloke)'den büyükse fark KMH limitidir.
+                // Fark yoksa limite dokunulmaz (kullanılabilir alanının KMH içerdiği teyit edilmedi).
+                $kmhFark = round($guncelBakiye['kullanilabilir'] - ($guncelBakiye['bakiye'] - $guncelBakiye['bloke']), 2);
+                if ($kmhFark > 0.01) {
+                    $this->kmhLimitYaz($hesapId, $kmhFark);
+                }
             }
 
             $inserted = $skipped = 0;
@@ -418,8 +425,9 @@ class SekerBankService extends BaseBankaService
                 }
             }
 
-            // Bakiyeyi son hareketten güncelle
-            if (!empty($hareketResult['data'])) {
+            // Bakiyeyi son hareketten güncelle (yalnız başlıktan bakiye gelmediyse;
+            // aksi halde bankanın verdiği kullanılabilir / bloke değerleri ezilir)
+            if ($guncelBakiye === null && !empty($hareketResult['data'])) {
                 $sonHareket = end($hareketResult['data']);
                 if (($sonHareket['bakiye'] ?? null) !== null && $sonHareket['bakiye'] > 0) {
                     $this->db->execute("

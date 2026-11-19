@@ -352,7 +352,8 @@ class QnbService extends BaseBankaService
             }
             
             $normalizedHesaplar = [];
-            
+            $kmhOzet = [];
+
             foreach ($dbHesaplar as $hesap) {
                 $iban = str_replace(' ', '', $hesap['bankaHesap_iban'] ?? '');
                 
@@ -392,12 +393,25 @@ class QnbService extends BaseBankaService
                         $bakiye = floatval($info->accountBalance ?? 0);
                         $updateData[] = "bankaHesap_bakiye = " . $bakiye;
                         $updateData[] = "bankaHesap_kullanilabilirBakiye = " . $bakiye;
-                        
+
                         if (!empty($updateData)) {
                             $this->db->execute(
                                 "UPDATE banka_Hesap SET " . implode(', ', $updateData) . ", bankaHesap_guncelleme_tarihi = GETDATE() WHERE bankaHesap_id = ?",
                                 [$hesap['bankaHesap_id']]
                             );
+                        }
+
+                        // KMH: usableOVDPLimit = kalan kullanılabilir KMH; toplam limit = kalan + kullanılan (eksi bakiye)
+                        // Alan boş/0 gelirse limite dokunulmaz (QNB bu alanları her zaman doldurmuyor)
+                        $kmhKalan = $this->tutarCoz($info->usableOVDPLimit ?? null);
+                        $kmhOzet[] = [
+                            'hesap' => (int)$hesap['bankaHesap_id'],
+                            'bakiye' => $bakiye,
+                            'usableOVDPLimit' => $kmhKalan,
+                            'usableTotalAmount' => $this->tutarCoz($info->usableTotalAmount ?? null)
+                        ];
+                        if ($kmhKalan !== null && $kmhKalan > 0) {
+                            $this->kmhLimitYaz((int)$hesap['bankaHesap_id'], round($kmhKalan + max(0, -$bakiye), 2));
                         }
                         
                         $normalizedHesaplar[] = [
@@ -415,7 +429,7 @@ class QnbService extends BaseBankaService
                 }
             }
             
-            $this->logBasarili($logId, count($normalizedHesaplar), count($normalizedHesaplar) . ' hesap listelendi');
+            $this->logBasarili($logId, count($normalizedHesaplar), count($normalizedHesaplar) . ' hesap listelendi ' . json_encode(['kmh' => $kmhOzet]));
             
             return [
                 'success' => true,
