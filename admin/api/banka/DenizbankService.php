@@ -153,12 +153,15 @@ class DenizbankService extends BaseBankaService
             throw new \Exception('Hesabın müşteri no / şube kodu / ek no bilgisi eksik.');
         }
 
+        // Doküman IBAN'ı opsiyonel gösterse de UAT boş IBAN'da 201001 (Hesap bulunamadı) döner
+        $iban = strtoupper(str_replace(' ', '', (string)($hesap['bankaHesap_iban'] ?? '')));
+
         return [
             'CustomerNo'        => $musteriNo,
             'AccountBranchCode' => (int)$sube,
             'AccountSuffix'     => (int)$ekNo,
             'AssociationCode'   => ' ',
-            'IBANNumber'        => ' ',
+            'IBANNumber'        => $iban !== '' ? $iban : ' ',
         ];
     }
 
@@ -206,18 +209,83 @@ class DenizbankService extends BaseBankaService
         return $ts ? date('Y-m-d H:i:s', $ts) : date('Y-m-d H:i:s');
     }
 
-    /**
-     * TransactionDetail alanlarından karşı taraf IBAN'ını bul
-     * (işlem tipine göre farklı alanda, "@@@" veya boşlukla birleşik gelebilir)
-     */
-    private function karsiIban(array $t): ?string
+    /** Alan değerinden ilk IBAN'ı çıkar (boşluk/"@@@" birleşik gelebilir); kendi IBAN'ımız hariç */
+    private function ibanBul(?string $deger, string $kendiIban): ?string
     {
-        foreach (['TransactionDetail2', 'TransactionDetail1', 'TransactionDetail5', 'DestinationAccount'] as $alan) {
-            if (preg_match('/TR\d{24}/', str_replace(' ', '', (string)($t[$alan] ?? '')), $m)) {
-                return $m[0];
+        if (preg_match_all('/TR\d{24}/', strtoupper(str_replace(' ', '', (string)$deger)), $m)) {
+            foreach ($m[0] as $iban) {
+                if ($iban !== $kendiIban) {
+                    return $iban;
+                }
             }
         }
         return null;
+    }
+
+    private function ibanMi(?string $deger): bool
+    {
+        return (bool)preg_match('/^TR\d{24}$/', strtoupper(str_replace(' ', '', (string)$deger)));
+    }
+
+    /** "@@@" ile birleşik alanda ilk dolu parçayı döndür, boşsa null */
+    private function temiz(?string $deger): ?string
+    {
+        foreach (explode('@@@', (string)$deger) as $parca) {
+            if (($p = trim($parca)) !== '') {
+                return $p;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Karşı taraf IBAN / unvan / VKN-TCKN bilgisini işlem yönüne göre çöz.
+     *
+     * Doküman (TransactionDetail tablosu) - Virman / EFT / Havale / FAST:
+     *   Detail1: Gönderen TCKN/VKN      Detail2: Alıcı IBAN @@@ Alıcı hesap
+     *   Detail3: Muhasebe açıklaması    Detail4: Gönderen adı   Detail5: Alıcı adı
+     * DestinationAccountIdendityNumber: "Gönderen@@@Gönderen@@@Alıcı" (EFT)
+     * DestinationAccountTitle: doküman unvan der, UAT'ta karşı IBAN döndüğü görüldü.
+     * Diğer işlem tiplerinde (çek, vergi, kurum) Detail alanları başka anlam taşır, kullanılmaz.
+     *
+     * @return array{iban:?string, unvan:?string, vkn:?string}
+     */
+    private function karsiTaraf(array $t, string $borcAlacak, string $kendiIban): array
+    {
+        $transfer = in_array(strtoupper(trim((string)($t['TransactionCode'] ?? ''))), ['TRF', 'VRM', 'EFT', 'FST'], true);
+        $baslik   = $this->temiz($t['DestinationAccountTitle'] ?? null);
+        $baslikIban = $this->ibanMi($baslik);
+        $kimlik   = array_values(array_filter(array_map('trim', explode('@@@', (string)($t['DestinationAccountIdendityNumber'] ?? ''))), 'strlen'));
+
+        if ($borcAlacak === 'A') {
+            // Gelen: karşı taraf gönderen
+            $iban  = ($baslikIban ? $this->ibanBul($baslik, $kendiIban) : null)
+                ?? ($transfer ? $this->ibanBul(($t['TransactionDetail2'] ?? '') . ' ' . ($t['TransactionDetail1'] ?? ''), $kendiIban) : null)
+                ?? $this->ibanBul($t['DestinationAccount'] ?? null, $kendiIban);
+            $unvan = $transfer ? $this->temiz($t['TransactionDetail4'] ?? null) : null;
+            $vkn   = ($transfer ? $this->temiz($t['TransactionDetail1'] ?? null) : null) ?? ($kimlik[0] ?? null);
+        } else {
+            // Giden: karşı taraf alıcı
+            // FAST'te alıcı IBAN Detail1'de ("0-0-0@@@TR..") gelebiliyor
+            $iban  = ($transfer ? $this->ibanBul(explode('@@@', (string)($t['TransactionDetail2'] ?? ''))[0], $kendiIban) : null)
+                ?? ($transfer ? $this->ibanBul($t['TransactionDetail1'] ?? null, $kendiIban) : null)
+                ?? ($baslikIban ? $this->ibanBul($baslik, $kendiIban) : null)
+                ?? $this->ibanBul($t['DestinationAccount'] ?? null, $kendiIban);
+            $unvan = $transfer ? $this->temiz($t['TransactionDetail5'] ?? null) : null;
+            $vkn   = $kimlik ? end($kimlik) : null;
+        }
+
+        // Unvan alanı dolu ve IBAN değilse dokümandaki anlamıyla (karşı hesap unvanı) önceliklidir
+        if ($baslik !== null && !$baslikIban) {
+            $unvan = $baslik;
+        }
+
+        // VKN/TCKN yalnız rakamsa kabul
+        if ($vkn !== null && !preg_match('/^\d{10,11}$/', $vkn)) {
+            $vkn = null;
+        }
+
+        return ['iban' => $iban, 'unvan' => $unvan, 'vkn' => $vkn];
     }
 
     /** OnlineAccountTransactionDetail -> banka_HesapHareketleri normalize formatı */
@@ -236,9 +304,8 @@ class DenizbankService extends BaseBankaService
         $aciklama = trim((string)($t['BankDescription'] ?? ''))
             ?: trim((string)($t['TransactionName'] ?? ''));
 
-        // EFT: "Gönderen VKN@@@Gönderen VKN@@@Alıcı VKN" -> karşı tarafın kimliği
-        $kimlik = explode('@@@', (string)($t['DestinationAccountIdendityNumber'] ?? ''));
-        $vknTckn = trim($borcAlacak === 'A' ? ($kimlik[0] ?? '') : (end($kimlik) ?: ''));
+        $kendiIban = strtoupper(str_replace(' ', '', (string)($hesapBilgisi['IBANNumber'] ?? '')));
+        $karsi = $this->karsiTaraf($t, $borcAlacak, $kendiIban);
 
         $doviz = trim((string)($hesapBilgisi['AccountCurrencyCode'] ?? 'TRY'));
 
@@ -248,9 +315,9 @@ class DenizbankService extends BaseBankaService
             'tutar'             => abs($tutar),
             'borcAlacak'        => $borcAlacak,
             'aciklama'          => $aciklama,
-            'karsiTarafIban'    => $this->karsiIban($t),
-            'karsiTarafAdUnvan' => trim((string)($t['DestinationAccountTitle'] ?? '')) ?: null,
-            'vknTckn'           => $vknTckn !== '' ? $vknTckn : null,
+            'karsiTarafIban'    => $karsi['iban'],
+            'karsiTarafAdUnvan' => $karsi['unvan'],
+            'vknTckn'           => $karsi['vkn'],
             'bakiye'            => floatval($t['BalanceAfterTransaction'] ?? 0),
             'dovizKodu'         => in_array($doviz, ['', 'TL'], true) ? 'TRY' : $doviz,
             'receiptNo'         => $t['ReceiptNumber'] ?? null,
